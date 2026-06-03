@@ -1,0 +1,32 @@
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Outputs / experiments
+RAE/output/
+RAEv2/output/
+RAE/wandb/
+RAEv2/wandb/
+comparison_results/
+
+# Data
+data/
+RAE/models/
+RAEv2/pretrained_models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+
+# HuggingFace cache
+.cache/
+**/.cache/
+
+# Misc
+.DS_Store
+*.log
