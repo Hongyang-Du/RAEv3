@@ -32,6 +32,7 @@ DISC_START=1             # epoch to start GAN (disc uses half-batch to save memo
 CKPT_EVERY=1             # save every epoch, always overwrites ckpt_latest.pt
 VAL_EVERY=500            # log val images every N steps
 LOG_EVERY=50
+VAL_IMAGE=../RAE/assets/parrot.png  # fixed image to track reconstruction quality
 
 WANDB=true
 WANDB_PROJECT=raev3
@@ -68,6 +69,7 @@ ${TORCHRUN} --nproc_per_node=${NGPU} "${SCRIPT}" \
     --ckpt-every  "${CKPT_EVERY}" \
     --val-every   "${VAL_EVERY}" \
     --log-every   "${LOG_EVERY}" \
+    --val-image   "${VAL_IMAGE}" \
     ${WANDB_ARGS}
 
 echo ""

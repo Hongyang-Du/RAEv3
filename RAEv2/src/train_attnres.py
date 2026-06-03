@@ -111,6 +111,8 @@ def main():
     parser.add_argument("--disc-ckpt",    type=str,
                         default="pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth")
     parser.add_argument("--ema-decay",    type=float, default=0.9995)
+    parser.add_argument("--val-image",    type=str,   default=None,
+                        help="Fixed image to reconstruct every epoch for visual tracking")
     parser.add_argument("--clip-grad",    type=float, default=1.0)
     # model
     parser.add_argument("--layers",       type=int, nargs="+",
@@ -176,6 +178,28 @@ def main():
 
     enc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
     enc_std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+
+    # ── Pre-encode fixed val image (encoder frozen, do once) ─────────────────
+    val_patches_fixed = None
+    val_img_orig      = None
+    if args.val_image and is_main and os.path.exists(args.val_image):
+        from torchvision import transforms
+        from PIL import Image as PILImage
+        _t = transforms.Compose([
+            transforms.Resize(args.image_size + 32),
+            transforms.CenterCrop(args.image_size),
+            transforms.ToTensor(),
+        ])
+        val_img_orig = _t(PILImage.open(args.val_image).convert("RGB")
+                         ).unsqueeze(0).to(device)
+        with torch.no_grad():
+            _norm = (val_img_orig - enc_mean) / enc_std
+            val_patches_fixed = encoder.model.get_intermediate_layers(
+                _norm, n=args.layers, return_class_token=False
+            )
+            val_patches_fixed = [p.detach() for p in val_patches_fixed]
+        if is_main:
+            print(f"Val image pre-encoded: {args.val_image}", flush=True)
 
     # ── Decoder (fine-tune from pretrained) ───────────────────────────────────
     from omegaconf import OmegaConf
@@ -384,41 +408,29 @@ def main():
                         "train/lr":     lr,
                     }, step=global_step)
 
-            # ── val images ────────────────────────────────────────────────────
-            if is_main and global_step % args.val_every == 0:
-                attn_res_ddp.eval(); decoder_ddp.eval()
-                with torch.no_grad():
-                    val_imgs = imgs[:8]
-                    val_norm = (val_imgs - enc_mean) / enc_std
-                    val_out  = encoder.model.get_intermediate_layers(
-                        val_norm, n=args.layers, return_class_token=False
-                    )
-                    val_z   = ema_attn(list(val_out))
-                    val_dec = ema_dec(val_z, drop_cls_token=False).logits
-                    val_rec = (ema_dec.unpatchify(val_dec)
-                               * enc_std + enc_mean).clamp(0, 1)
-                    panel = torch.cat([val_imgs, val_rec], dim=0)
-                    out_path = os.path.join(
-                        args.out_dir, f"val_s{global_step:07d}.png"
-                    )
-                    save_image(panel, out_path, nrow=8)
-                    # keep only last 3 val PNGs to save disk
-                    old_pngs = sorted(glob.glob(
-                        os.path.join(args.out_dir, "val_s*.png")))
-                    for old in old_pngs[:-3]:
-                        os.remove(old)
-                    print(f"  Saved {out_path}", flush=True)
-                    if args.wandb:
-                        import wandb
-                        wandb.log({"val/images": wandb.Image(
-                            out_path,
-                            caption=f"top=orig  bot=recon  step={global_step}"
-                        )}, step=global_step)
-                attn_res_ddp.train(); decoder_ddp.train()
 
         if is_main:
             print(f"Epoch {epoch+1}/{args.epochs}  "
                   f"time={time.time()-t0:.0f}s", flush=True)
+
+        # ── fixed val image reconstruction (one per epoch) ───────────────────
+        if is_main and val_patches_fixed is not None:
+            attn_res_ddp.eval(); decoder_ddp.eval()
+            with torch.no_grad():
+                val_z   = ema_attn(val_patches_fixed)
+                val_dec = ema_dec(val_z, drop_cls_token=False).logits
+                val_rec = (ema_dec.unpatchify(val_dec)
+                           * enc_std + enc_mean).clamp(0, 1)
+            panel = torch.cat([val_img_orig, val_rec], dim=-1)  # side by side
+            out_path = os.path.join(args.out_dir, f"val_ep{epoch+1:03d}.png")
+            save_image(panel.squeeze(0), out_path)
+            print(f"  Val image → {out_path}", flush=True)
+            if args.wandb:
+                import wandb
+                wandb.log({"val/recon": wandb.Image(
+                    out_path, caption=f"left=orig  right=recon  ep={epoch+1}"
+                )}, step=global_step)
+            attn_res_ddp.train(); decoder_ddp.train()
 
         # ── checkpoint ────────────────────────────────────────────────────────
         if is_main and (epoch + 1) % args.ckpt_every == 0:
