@@ -19,7 +19,7 @@ NGPU=8
 DATA=/home/colligo/data/imagenet-256/imagenet-256
 OUT_DIR=output/train_attnres
 
-EPOCHS=20
+EPOCHS=10
 BATCH=64                 # per GPU; global = BATCH × NGPU
 LR=2e-4
 PRECISION=bf16           # bf16 saves ~50% memory, same accuracy on A100
@@ -32,7 +32,7 @@ DISC_START=1             # epoch to start GAN (disc uses half-batch to save memo
 CKPT_EVERY=1             # save every epoch, always overwrites ckpt_latest.pt
 VAL_EVERY=500            # log val images every N steps
 LOG_EVERY=50
-VAL_IMAGE=../RAE/assets/parrot.png  # fixed image to track reconstruction quality
+VAL_IMAGE=assets/samples/sample_1.png  # fixed image to track reconstruction quality
 
 WANDB=true
 WANDB_PROJECT=raev3
