@@ -15,11 +15,11 @@ SCRIPT=$(dirname "$(realpath "$0")")/src/train_attnres.py
 cd "$(dirname "$(realpath "$0")")"
 
 # ── config ───────────────────────────────────────────────────
-NGPU=8
+NGPU=2
 DATA=/home/colligo/data/imagenet-256/imagenet-256
 OUT_DIR=output/train_attnres
 
-EPOCHS=10
+EPOCHS=100
 BATCH=64                 # per GPU; global = BATCH × NGPU
 LR=2e-4
 PRECISION=bf16           # bf16 saves ~50% memory, same accuracy on A100
@@ -29,12 +29,14 @@ LPIPS_W=1.0
 DISC_WEIGHT=0.75
 DISC_START=1             # epoch to start GAN (disc uses half-batch to save memory)
 
-CKPT_EVERY=1             # save every epoch, always overwrites ckpt_latest.pt
+CKPT_EVERY=20            # save every 20 epochs, keep all
 VAL_EVERY=500            # log val images every N steps
 LOG_EVERY=50
 VAL_IMAGE=assets/samples/sample_1.png  # fixed image to track reconstruction quality
 
 WANDB=true
+export WANDB_BASE_URL=https://adobesensei.wandb.io
+export WANDB_API_KEY=$(grep -A2 'adobesensei.wandb.io' ~/.netrc | grep password | awk '{print $2}')
 WANDB_PROJECT=raev3
 WANDB_ENTITY=hongyangd
 # ─────────────────────────────────────────────────────────────
@@ -55,7 +57,7 @@ if [[ "${WANDB}" == "true" ]]; then
     WANDB_ARGS="--wandb --wandb-project ${WANDB_PROJECT} --wandb-entity ${WANDB_ENTITY}"
 fi
 
-${TORCHRUN} --nproc_per_node=${NGPU} "${SCRIPT}" \
+PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU} "${SCRIPT}" \
     --data        "${DATA}" \
     --out-dir     "${OUT_DIR}" \
     --epochs      "${EPOCHS}" \

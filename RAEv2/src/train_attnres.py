@@ -143,6 +143,7 @@ def main():
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed + rank)
     is_main = (rank == 0)
+    torch.backends.cudnn.benchmark = True
 
     if is_main:
         os.makedirs(args.out_dir, exist_ok=True)
@@ -201,7 +202,7 @@ def main():
         if is_main:
             print(f"Val image pre-encoded: {args.val_image}", flush=True)
 
-    # ── Decoder (fine-tune from pretrained) ───────────────────────────────────
+    # ── Decoder (train from scratch) ──────────────────────────────────────────
     from omegaconf import OmegaConf
     from stage1.rae import _load_decoder
     s1 = OmegaConf.load(
@@ -212,7 +213,7 @@ def main():
         hidden_size=args.latent_dim,
         patch_size=16,
         num_patches=256,
-        pretrained_path=s1.pretrained_decoder_path,
+        pretrained_path=None,
     ).to(device)
 
     # ── SpatialAttnRes (learned) ───────────────────────────────────────────────
@@ -220,13 +221,16 @@ def main():
         dim=1024, out_dim=args.latent_dim, gate_init=-5.0
     ).to(device)
 
+    # SyncBatchNorm: sync BN stats across GPUs (BatchNorm in SpatialAttnRes)
+    attn_res = torch.nn.SyncBatchNorm.convert_sync_batchnorm(attn_res)
+
     # DDP wrap
     attn_res_ddp = DDP(attn_res, device_ids=[local_rank])
     decoder_ddp  = DDP(decoder,  device_ids=[local_rank])
 
-    # EMA
-    ema_attn = deepcopy(attn_res); ema_attn.requires_grad_(False)
-    ema_dec  = deepcopy(decoder);  ema_dec.requires_grad_(False)
+    # EMA — always in eval mode (no backprop, no BN communication needed)
+    ema_attn = deepcopy(attn_res); ema_attn.requires_grad_(False); ema_attn.eval()
+    ema_dec  = deepcopy(decoder);  ema_dec.requires_grad_(False); ema_dec.eval()
 
     trainable = (list(attn_res.parameters()) + list(decoder.parameters()))
     if is_main:
@@ -316,7 +320,7 @@ def main():
                 layer_out = encoder.model.get_intermediate_layers(
                     imgs_norm, n=args.layers, return_class_token=False
                 )
-                patches_list = [p.detach() for p in layer_out]
+                patches_list = list(layer_out)   # already no-grad inside torch.no_grad()
                 # each: [B, 256, 1024]
 
             use_gan = (global_step >= disc_start_step) and (args.disc_weight > 0)
@@ -337,7 +341,6 @@ def main():
 
             loss_gan = torch.zeros(1, device=device)
             if use_gan:
-                torch.cuda.empty_cache()
                 disc_ddp.eval()
                 half = max(1, x_rec.shape[0] // 2)
                 with autocast_ctx:
@@ -413,27 +416,34 @@ def main():
             print(f"Epoch {epoch+1}/{args.epochs}  "
                   f"time={time.time()-t0:.0f}s", flush=True)
 
-        # ── fixed val image reconstruction (one per epoch) ───────────────────
+        # ── fixed val image reconstruction ───────────────────────────────────
         if is_main and val_patches_fixed is not None:
-            attn_res_ddp.eval(); decoder_ddp.eval()
             with torch.no_grad():
                 val_z   = ema_attn(val_patches_fixed)
                 val_dec = ema_dec(val_z, drop_cls_token=False).logits
                 val_rec = (ema_dec.unpatchify(val_dec)
                            * enc_std + enc_mean).clamp(0, 1)
-            panel = torch.cat([val_img_orig, val_rec], dim=-1)  # side by side
-            out_path = os.path.join(args.out_dir, f"val_ep{epoch+1:03d}.png")
-            save_image(panel.squeeze(0), out_path)
-            print(f"  Val image → {out_path}", flush=True)
-            if args.wandb:
-                import wandb
-                wandb.log({"val/recon": wandb.Image(
-                    out_path, caption=f"left=orig  right=recon  ep={epoch+1}"
-                )}, step=global_step)
-            attn_res_ddp.train(); decoder_ddp.train()
+
+            recon_dir = os.path.join(args.out_dir, "val_recon")
+            os.makedirs(recon_dir, exist_ok=True)
+
+            # always overwrite latest
+            latest_path = os.path.join(args.out_dir, "recon_latest.png")
+            save_image(val_rec.squeeze(0), latest_path)
+
+            # keep permanent copy every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                out_path = os.path.join(recon_dir, f"epoch_{epoch+1}.png")
+                save_image(val_rec.squeeze(0), out_path)
+                print(f"  Val recon → {out_path}", flush=True)
+                if args.wandb:
+                    import wandb
+                    wandb.log({"val/recon": wandb.Image(
+                        out_path, caption=f"ep={epoch+1}"
+                    )}, step=global_step)
 
         # ── checkpoint ────────────────────────────────────────────────────────
-        if is_main and (epoch + 1) % args.ckpt_every == 0:
+        if is_main:
             ckpt = {
                 "epoch":        epoch + 1,
                 "global_step":  global_step,
@@ -446,11 +456,15 @@ def main():
                 "disc_optimizer": disc_optimizer.state_dict(),
                 "layers":       args.layers,
             }
-            import shutil
-            # save directly to ckpt_latest.pt — no epoch file kept on disk
-            latest = os.path.join(args.out_dir, "ckpt_latest.pt")
-            torch.save(ckpt, latest)
-            print(f"  Saved {latest}", flush=True)
+            # always overwrite latest (for resume)
+            torch.save(ckpt, os.path.join(args.out_dir, "ckpt_latest.pt"))
+            # keep permanent copy every ckpt_every epochs
+            if (epoch + 1) % args.ckpt_every == 0:
+                ckpt_path = os.path.join(args.out_dir, f"ckpt_ep{epoch+1:03d}.pt")
+                torch.save(ckpt, ckpt_path)
+                print(f"  Saved {ckpt_path}", flush=True)
+            else:
+                print(f"  Saved ckpt_latest.pt (ep{epoch+1})", flush=True)
 
     if args.wandb and is_main:
         import wandb; wandb.finish()

@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Read(//home/**)",
+      "Read(//home/colligo/**)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:rae-dit.github.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "Bash(curl -fsSL -o miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh)",
+      "Bash(conda info *)",
+      "Bash(conda activate *)",
+      "Bash(pip list *)",
+      "Bash(python3 -c *)",
+      "Bash(find /home /opt /usr -name *)",
+      "Bash(/home/colligo/miniconda3/bin/conda env *)",
+      "Bash(/home/colligo/miniconda3/envs/rae/bin/python *)",
+      "Bash(/home/colligo/miniconda3/envs/rae/bin/pip install *)",
+      "Bash(/home/colligo/miniconda3/envs/rae/bin/torchrun *)",
+      "Bash(tee /tmp/overfit_run.log)",
+      "Bash(nvidia-smi *)",
+      "Bash(chmod +x /home/colligo/raev3/RAE/run_overfit_sweep.sh)"
+    ]
+  }
+}
