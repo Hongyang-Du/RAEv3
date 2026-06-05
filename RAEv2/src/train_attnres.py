@@ -180,10 +180,11 @@ def main():
     enc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
     enc_std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
 
-    # ── Pre-encode fixed val image (encoder frozen, do once) ─────────────────
+    # ── Pre-encode fixed val images (encoder frozen, do once) ────────────────
     val_patches_fixed = None
     val_img_orig      = None
-    if args.val_image and is_main and os.path.exists(args.val_image):
+    if args.val_image and is_main:
+        import glob as _glob
         from torchvision import transforms
         from PIL import Image as PILImage
         _t = transforms.Compose([
@@ -191,16 +192,21 @@ def main():
             transforms.CenterCrop(args.image_size),
             transforms.ToTensor(),
         ])
-        val_img_orig = _t(PILImage.open(args.val_image).convert("RGB")
-                         ).unsqueeze(0).to(device)
+        val_dir   = os.path.dirname(os.path.abspath(args.val_image))
+        val_paths = sorted(_glob.glob(os.path.join(val_dir, "*.png")) +
+                           _glob.glob(os.path.join(val_dir, "*.jpg")))
+        if not val_paths:
+            val_paths = [args.val_image]
+        imgs = [_t(PILImage.open(p).convert("RGB")) for p in val_paths]
+        val_img_orig = torch.stack(imgs).to(device)          # [N, 3, H, W]
+
         with torch.no_grad():
             _norm = (val_img_orig - enc_mean) / enc_std
             val_patches_fixed = encoder.model.get_intermediate_layers(
                 _norm, n=args.layers, return_class_token=False
             )
             val_patches_fixed = [p.detach() for p in val_patches_fixed]
-        if is_main:
-            print(f"Val image pre-encoded: {args.val_image}", flush=True)
+        print(f"Val images pre-encoded: {len(val_paths)} from {val_dir}", flush=True)
 
     # ── Decoder (train from scratch) ──────────────────────────────────────────
     from omegaconf import OmegaConf
@@ -416,25 +422,26 @@ def main():
             print(f"Epoch {epoch+1}/{args.epochs}  "
                   f"time={time.time()-t0:.0f}s", flush=True)
 
-        # ── fixed val image reconstruction ───────────────────────────────────
+        # ── fixed val images reconstruction ──────────────────────────────────
         if is_main and val_patches_fixed is not None:
             with torch.no_grad():
                 val_z   = ema_attn(val_patches_fixed)
                 val_dec = ema_dec(val_z, drop_cls_token=False).logits
                 val_rec = (ema_dec.unpatchify(val_dec)
-                           * enc_std + enc_mean).clamp(0, 1)
+                           * enc_std + enc_mean).clamp(0, 1)   # [N, 3, H, W]
 
+            n = val_rec.shape[0]
             recon_dir = os.path.join(args.out_dir, "val_recon")
             os.makedirs(recon_dir, exist_ok=True)
 
             # always overwrite latest
             latest_path = os.path.join(args.out_dir, "recon_latest.png")
-            save_image(val_rec.squeeze(0), latest_path)
+            save_image(val_rec.cpu(), latest_path, nrow=n)
 
             # keep permanent copy every 10 epochs
             if (epoch + 1) % 10 == 0:
                 out_path = os.path.join(recon_dir, f"epoch_{epoch+1}.png")
-                save_image(val_rec.squeeze(0), out_path)
+                save_image(val_rec.cpu(), out_path, nrow=n)
                 print(f"  Val recon → {out_path}", flush=True)
                 if args.wandb:
                     import wandb
