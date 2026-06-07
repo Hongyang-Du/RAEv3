@@ -16,7 +16,10 @@ from .distributional import compute_distributional_metrics, filter_distributiona
 from .dpgbench import DPGEvaluator
 from .geneval import GenEvalEvaluator
 from .lpips import LPIPSEvaluator
-from .vqascore import VQAScoreEvaluator
+try:
+    from .vqascore import VQAScoreEvaluator
+except ImportError:
+    VQAScoreEvaluator = None
 
 
 def evaluate_image_set(
@@ -57,7 +60,11 @@ def _init_evaluators(metrics_to_compute: List[str], condition_type: str, device:
         evaluators['clipscore'] = CLIPScoreEvaluator(device=str(device))
         local_scores['clipscore'] = {'sum': 0.0, 'count': 0}
 
-    if any(elem.startswith('vqascore') for elem in metrics_to_compute) and condition_type == 'text':
+    if (
+        VQAScoreEvaluator is not None
+        and any(elem.startswith('vqascore') for elem in metrics_to_compute)
+        and condition_type == 'text'
+    ):
         vqascore_models = [elem for elem in metrics_to_compute if elem.startswith('vqascore')]
         vqascore_evaluators = {}
         for model_name in vqascore_models:

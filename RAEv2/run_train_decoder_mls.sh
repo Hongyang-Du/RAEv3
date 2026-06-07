@@ -1,48 +1,51 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SpatialAttnRes + SIGReg + GAN  Stage-1 training
+#  raev2 MLS decoder training  (src/train_decoder_mls.py)
 #  Encoder:  DINOv3-L (frozen, layers 11,13,15,17,19,21,23)
-#  Decoder:  ViT-XL (fine-tuned from pretrained)
+#  Combine:  raev2 dinov3mls multi-layer sum (frozen, no params)
+#  Decoder:  ViT-XL (trained from scratch) -- the ONLY trainable module
 #  Dataset:  partial ImageNet-256 (~93K images)
+#
+#  Identical recipe to run_train_attnres.sh, except the multi-layer
+#  combination is raev2's fixed MLS instead of the learned SpatialAttnRes
+#  (so there is no SIGReg and only the decoder trains).
 # ============================================================
 set -euo pipefail
 
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
-PYTHON=${CONDA_ENV}/bin/python
-SCRIPT=$(dirname "$(realpath "$0")")/src/train_attnres.py
+SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls.py
 
 cd "$(dirname "$(realpath "$0")")"
 
-# ── config ───────────────────────────────────────────────────
+# -- config ---------------------------------------------------
 NGPU=8
-DATA=/datasets/imagenet-256-full
-OUT_DIR=output/train_attnres8e-4
+DATA=/datasets/imagenet-256
+OUT_DIR=output/train_decoder_mls
 
 EPOCHS=100
-BATCH=64                 # per GPU; global = BATCH × NGPU
-LR=8e-4
+BATCH=64                 # per GPU; global = BATCH x NGPU
+LR=5e-4
 PRECISION=bf16           # bf16 saves ~50% memory, same accuracy on A100
 
-SIGREG_W=0.1
 LPIPS_W=1.0
 DISC_WEIGHT=0.75
 DISC_START=1             # epoch to start GAN (disc uses half-batch to save memory)
 
-CKPT_EVERY=25            # save every 20 epochs, keep all
+CKPT_EVERY=999           # keep a permanent ckpt every N epochs (ckpt_latest always saved)
 VAL_EVERY=500            # log val images every N steps
 LOG_EVERY=50
-VAL_IMAGE=assets/samples/sample_1.png  # fixed image to track reconstruction quality
+VAL_IMAGE=assets/samples/sample_1.png  # fixed images (dir globbed) to track recon quality
 
 WANDB=true
 export WANDB_BASE_URL=https://api.wandb.ai
 export WANDB_API_KEY=$(grep -A2 'api.wandb.ai' ~/.netrc | grep password | awk '{print $2}')
 WANDB_PROJECT=raev3
 WANDB_ENTITY=uscgvl
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 echo "========================================================"
-echo "  SpatialAttnRes Stage-1 Training"
+echo "  raev2 MLS decoder training"
 echo "  GPUs:      ${NGPU}"
 echo "  Batch:     ${BATCH}/GPU  (global: $((BATCH * NGPU)))"
 echo "  Epochs:    ${EPOCHS}  |  Precision: ${PRECISION}"
@@ -64,7 +67,6 @@ PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU}
     --batch-size  "${BATCH}" \
     --precision   "${PRECISION}" \
     --lr          "${LR}" \
-    --sigreg-w    "${SIGREG_W}" \
     --lpips-w     "${LPIPS_W}" \
     --disc-weight "${DISC_WEIGHT}" \
     --disc-start  "${DISC_START}" \

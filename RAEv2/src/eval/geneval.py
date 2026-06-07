@@ -4,7 +4,6 @@ from typing import List
 
 import numpy as np
 import torch
-from geneval_evaluator import evaluate_pairs, fetch_metadata, load_models
 from PIL import Image
 
 
@@ -17,6 +16,7 @@ class GenEvalEvaluator:
         self.metadata = None
 
     def _ensure_loaded(self):
+        from geneval_evaluator import fetch_metadata, load_models  # lazy: optional T2I-eval dep
         if self.models is None:
             self.models = load_models(device=self.device)
         if self.metadata is None:
@@ -24,6 +24,7 @@ class GenEvalEvaluator:
 
     @torch.no_grad()
     def compute_batch_scores(self, images_np: np.ndarray, prompts: List[str]) -> torch.Tensor:
+        from geneval_evaluator import evaluate_pairs  # lazy: optional T2I-eval dep
         self._ensure_loaded()
 
         # Validate images and filter out invalid ones (zero dimensions)

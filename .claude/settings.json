@@ -21,7 +21,20 @@
       "Bash(/home/colligo/miniconda3/envs/rae/bin/torchrun *)",
       "Bash(tee /tmp/overfit_run.log)",
       "Bash(nvidia-smi *)",
-      "Bash(chmod +x /home/colligo/raev3/RAE/run_overfit_sweep.sh)"
+      "Bash(chmod +x /home/colligo/raev3/RAE/run_overfit_sweep.sh)",
+      "Bash(docker rm *)",
+      "Bash(cd /home/junjie.ye *)",
+      "Read(//datasets/**)",
+      "Read(//root/.cache/torch/hub/facebookresearch_dinov3_94a96ac83c2446f15f9bdcfae23cad3c6a9d4988/dinov3/layers/**)",
+      "Bash(grep -aB8 \"No module named 'matplotlib'\" smoke_test.log)",
+      "Bash(python -c \"import sys\")",
+      "Bash(python -m py_compile src/stage1/engine.py)",
+      "Bash(sed -n '203,225p' src/stage1/engine.py)",
+      "Bash(python3 -)",
+      "Bash(bash -n run_train_stage1.sh)",
+      "Bash(sed -n '1,12p' src/eval/geneval.py)",
+      "Bash(sed -n '1,12p' src/eval/dpgbench.py)",
+      "Bash(bash -n run_train_decoder_mls.sh)"
     ]
   }
 }

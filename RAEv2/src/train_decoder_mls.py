@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-Multi-GPU DDP training: SpatialAttnRes + SIGReg + ViT Decoder on ImageNet.
+Multi-GPU DDP training: raev2 multi-layer-sum (MLS) latent + ViT Decoder on ImageNet.
+
+Identical recipe to train_attnres.py, EXCEPT the multi-layer combination:
+  train_attnres.py : DINOv3 K layers -> SpatialAttnRes (learned) -> z
+  this script      : DINOv3 K layers -> raev2 dinov3mls combine (fixed) -> z
+
+The raev2 combine (DINOv3MultiLayerSimpleAddEncoder.forward_features) is:
+  layers = get_intermediate_layers(norm=True)
+  z      = mean(layers) + mean_over_tokens(last_layer)        # MLS, no params
 
 Architecture:
   DINOv3-L (frozen, layers [11,13,15,17,19,21,23])
-       ↓ patch tokens [B, 7, 256, 1024]
-  SpatialAttnRes (learned: per-position AttnRes + gated FFN)
-       ↓ z [B, 256, 1024]   ← SIGReg (all_gather for multi-GPU)
-  ViT Decoder (fine-tuned from pretrained)
-       ↓ x_rec [B, 3, 256, 256]
+       v  patch tokens [B, 7, 256, 1024]
+  raev2 MLS combine (frozen, no params)
+       v  z [B, 256, 1024]
+  ViT Decoder (trained from scratch)   <-- the ONLY trainable module
+       v  x_rec [B, 3, 256, 256]
 
-Loss: L1 + LPIPS + λ_sig * SIGReg
+Loss: L1 + LPIPS + GAN   (no SIGReg: z is a fixed function of the frozen
+encoder, so SIGReg has no trainable params upstream -> zero gradient.)
 
 Usage:
-    torchrun --nproc_per_node=8 src/train_attnres.py \
-        --data /home/colligo/data/imagenet-256 \
-        --epochs 20 --batch-size 128 --wandb
+    torchrun --nproc_per_node=8 src/train_decoder_mls.py \
+        --data /datasets/imagenet-256 \
+        --epochs 100 --batch-size 64 --wandb
 """
 
 import sys, os, math, argparse, time, glob
@@ -31,13 +40,12 @@ import numpy as np
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from models.spatial_attn_res import SpatialAttnRes, RAEV2_LAYERS
-from overfit_sigreg import sigreg_loss, load_lpips
+from models.spatial_attn_res import RAEV2_LAYERS
 from stage1.disc import DinoDiscriminator, hinge_d_loss, vanilla_g_loss, calculate_adaptive_weight
 from stage1.disc.diffaug import DiffAug
 
 
-# ─── EMA ─────────────────────────────────────────────────────────────────────
+# --- EMA -----------------------------------------------------------------------
 
 def update_ema(ema, model, decay=0.9995):
     with torch.no_grad():
@@ -45,7 +53,7 @@ def update_ema(ema, model, decay=0.9995):
             ep.data.mul_(decay).add_(p.data, alpha=1 - decay)
 
 
-# ─── Data ────────────────────────────────────────────────────────────────────
+# --- Data ----------------------------------------------------------------------
 
 def make_loader(data_dir, split, image_size, batch_size,
                 num_workers=4, world_size=1, rank=0):
@@ -89,7 +97,7 @@ def make_loader(data_dir, split, image_size, batch_size,
     )
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# --- Main ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -97,12 +105,11 @@ def main():
     parser.add_argument("--data",         required=True)
     parser.add_argument("--image-size",   type=int, default=256)
     # training
-    parser.add_argument("--epochs",       type=int, default=20)
-    parser.add_argument("--batch-size",   type=int, default=128,
+    parser.add_argument("--epochs",       type=int, default=100)
+    parser.add_argument("--batch-size",   type=int, default=64,
                         help="Per-GPU batch size")
     parser.add_argument("--lr",           type=float, default=2e-4)
     parser.add_argument("--warmup-epochs",type=int, default=2)
-    parser.add_argument("--sigreg-w",     type=float, default=0.1)
     parser.add_argument("--lpips-w",      type=float, default=1.0)
     # GAN
     parser.add_argument("--disc-weight",  type=float, default=0.75)
@@ -112,7 +119,7 @@ def main():
                         default="pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth")
     parser.add_argument("--ema-decay",    type=float, default=0.9995)
     parser.add_argument("--val-image",    type=str,   default=None,
-                        help="Fixed image to reconstruct every epoch for visual tracking")
+                        help="Fixed image (its dir is globbed) to reconstruct every epoch")
     parser.add_argument("--clip-grad",    type=float, default=1.0)
     # model
     parser.add_argument("--layers",       type=int, nargs="+",
@@ -123,7 +130,7 @@ def main():
     parser.add_argument("--log-every",    type=int, default=50)
     parser.add_argument("--val-every",    type=int, default=500)
     parser.add_argument("--ckpt-every",   type=int, default=2)
-    parser.add_argument("--out-dir",      default="output/train_attnres")
+    parser.add_argument("--out-dir",      default="output/train_decoder_mls")
     parser.add_argument("--wandb",        action="store_true")
     parser.add_argument("--wandb-project",default="raev3")
     parser.add_argument("--wandb-entity", default="hongyangd")
@@ -134,7 +141,7 @@ def main():
                         help="Training precision. bf16 halves memory usage.")
     args = parser.parse_args()
 
-    # ── DDP init ──────────────────────────────────────────────────────────────
+    # -- DDP init --------------------------------------------------------------
     dist.init_process_group("nccl")
     rank       = dist.get_rank()
     world_size = dist.get_world_size()
@@ -151,17 +158,17 @@ def main():
               f"  |  global batch: {args.batch_size * world_size}")
         print(f"Layers: {args.layers}")
 
-    # ── wandb ─────────────────────────────────────────────────────────────────
+    # -- wandb -----------------------------------------------------------------
     if args.wandb and is_main:
         import wandb
         wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
-            name=f"attnres-k{len(args.layers)}-sigreg",
+            name=f"decoder-mls-k{len(args.layers)}",
             config={**vars(args), "global_batch": args.batch_size * world_size},
-            tags=["attnres", "sigreg", "stage1", f"k{len(args.layers)}"],
+            tags=["decoder", "mls", "raev2", "stage1", f"k{len(args.layers)}"],
         )
 
-    # ── Data ──────────────────────────────────────────────────────────────────
+    # -- Data ------------------------------------------------------------------
     train_loader, train_sampler = make_loader(
         args.data, "train", args.image_size, args.batch_size,
         args.num_workers, world_size, rank,
@@ -169,10 +176,13 @@ def main():
     if is_main:
         print(f"Train: {len(train_loader.dataset)} images")
 
-    # ── DINOv3 encoder (frozen) ───────────────────────────────────────────────
+    # -- DINOv3 encoder (frozen) + raev2 MLS combine ---------------------------
+    # Use the dinov3mls encoder: its forward_features() IS raev2's multi-layer
+    # combine (get_intermediate_layers(norm=True) -> mean over layers + final_mean).
     from encoders.vision_encoder import create_encoder
-    encoder = create_encoder("dinov3-vit-l16", device=device,
-                             resolution=args.image_size)
+    layers_str = ".".join(str(l) for l in args.layers)
+    encoder = create_encoder(f"dinov3mls-vit-l16[layers={layers_str}]",
+                             device=device, resolution=args.image_size)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
@@ -180,12 +190,15 @@ def main():
     enc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
     enc_std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
 
-    # ── Pre-encode fixed val images (encoder frozen, do once) ────────────────
-    val_patches_fixed = None
-    val_img_orig      = None
+    def encode_mls(imgs01: torch.Tensor) -> torch.Tensor:
+        """imgs01 in [0,1] -> raev2 MLS latent z [B, 256, latent_dim]."""
+        imgs_norm = (imgs01 - enc_mean) / enc_std
+        return encoder.forward_features(imgs_norm)["x_norm_patchtokens"]
+
+    # -- Pre-encode fixed val images (encoder frozen, do once) -----------------
+    val_z_fixed  = None
+    val_img_orig = None
     if args.val_image and is_main:
-        import glob as _glob
-        from torchvision import transforms
         from PIL import Image as PILImage
         _t = transforms.Compose([
             transforms.Resize(args.image_size + 32),
@@ -194,24 +207,19 @@ def main():
         ])
         val_dir   = os.path.dirname(os.path.abspath(args.val_image))
         val_paths = sorted(
-            p for p in (_glob.glob(os.path.join(val_dir, "*.png")) +
-                        _glob.glob(os.path.join(val_dir, "*.jpg")))
-            if "concat" not in os.path.basename(p).lower()  # skip stitched grids
+            p for p in (glob.glob(os.path.join(val_dir, "*.png")) +
+                        glob.glob(os.path.join(val_dir, "*.jpg")))
+            if "concat" not in os.path.basename(p).lower()   # skip stitched grids
         )
         if not val_paths:
             val_paths = [args.val_image]
         imgs = [_t(PILImage.open(p).convert("RGB")) for p in val_paths]
         val_img_orig = torch.stack(imgs).to(device)          # [N, 3, H, W]
-
         with torch.no_grad():
-            _norm = (val_img_orig - enc_mean) / enc_std
-            val_patches_fixed = encoder.model.get_intermediate_layers(
-                _norm, n=args.layers, return_class_token=False
-            )
-            val_patches_fixed = [p.detach() for p in val_patches_fixed]
+            val_z_fixed = encode_mls(val_img_orig).detach()
         print(f"Val images pre-encoded: {len(val_paths)} from {val_dir}", flush=True)
 
-    # ── Decoder (train from scratch) ──────────────────────────────────────────
+    # -- Decoder (train from scratch) ------------------------------------------
     from omegaconf import OmegaConf
     from stage1.rae import _load_decoder
     s1 = OmegaConf.load(
@@ -225,28 +233,18 @@ def main():
         pretrained_path=None,
     ).to(device)
 
-    # ── SpatialAttnRes (learned) ───────────────────────────────────────────────
-    attn_res = SpatialAttnRes(
-        dim=1024, out_dim=args.latent_dim, gate_init=-5.0
-    ).to(device)
+    # DDP wrap (decoder is the only trainable module)
+    decoder_ddp = DDP(decoder, device_ids=[local_rank])
 
-    # SyncBatchNorm: sync BN stats across GPUs (BatchNorm in SpatialAttnRes)
-    attn_res = torch.nn.SyncBatchNorm.convert_sync_batchnorm(attn_res)
+    # EMA -- always in eval mode (no backprop, no BN communication needed)
+    ema_dec = deepcopy(decoder); ema_dec.requires_grad_(False); ema_dec.eval()
 
-    # DDP wrap
-    attn_res_ddp = DDP(attn_res, device_ids=[local_rank])
-    decoder_ddp  = DDP(decoder,  device_ids=[local_rank])
-
-    # EMA — always in eval mode (no backprop, no BN communication needed)
-    ema_attn = deepcopy(attn_res); ema_attn.requires_grad_(False); ema_attn.eval()
-    ema_dec  = deepcopy(decoder);  ema_dec.requires_grad_(False); ema_dec.eval()
-
-    trainable = (list(attn_res.parameters()) + list(decoder.parameters()))
+    trainable = list(decoder.parameters())
     if is_main:
         n = sum(p.numel() for p in trainable) / 1e6
-        print(f"Trainable: {n:.1f}M  (SpatialAttnRes + decoder)")
+        print(f"Trainable: {n:.1f}M  (decoder only)")
 
-    # ── Optimizer + Scheduler ─────────────────────────────────────────────────
+    # -- Optimizer + Scheduler -------------------------------------------------
     optimizer = torch.optim.AdamW(
         trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0
     )
@@ -261,13 +259,13 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
 
-    # ── LPIPS ─────────────────────────────────────────────────────────────────
+    # -- LPIPS -----------------------------------------------------------------
     from stage1.disc.lpips import LPIPS as LPIPS_
     lpips_all = LPIPS_().to(device).eval()
     for p in lpips_all.parameters():
         p.requires_grad_(False)
 
-    # ── Discriminator ─────────────────────────────────────────────────────────
+    # -- Discriminator ---------------------------------------------------------
     disc = DinoDiscriminator(
         device=device,
         dino_ckpt_path=args.disc_ckpt,
@@ -276,7 +274,7 @@ def main():
         norm_type="bn",
         using_spec_norm=True,
     ).to(device)
-    # Patch crop to handle 256×256 input (disc was designed for 224)
+    # Patch crop to handle 256x256 input (disc was designed for 224)
     from stage1.disc.utils import RandomWindowCrop
     disc.dino_proxy[0].crop = RandomWindowCrop(args.image_size, 224, 9, False)
     disc.dino_proxy[0].original_input_size = args.image_size
@@ -290,15 +288,13 @@ def main():
         n_disc = sum(p.numel() for p in disc.parameters()) / 1e6
         print(f"Discriminator: {n_disc:.1f}M  GAN starts at epoch {args.disc_start}")
 
-    # ── Auto-resume from latest checkpoint ────────────────────────────────────
+    # -- Auto-resume from latest checkpoint ------------------------------------
     start_epoch = 0
     global_step = 0
     latest = os.path.join(args.out_dir, "ckpt_latest.pt")
     if os.path.exists(latest):
         ckpt = torch.load(latest, map_location="cpu")
-        attn_res.load_state_dict(ckpt["attn_res"])
         decoder.load_state_dict(ckpt["decoder"])
-        ema_attn.load_state_dict(ckpt["ema_attn"])
         ema_dec.load_state_dict(ckpt["ema_dec"])
         disc.load_state_dict(ckpt["disc"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -308,44 +304,37 @@ def main():
         if is_main:
             print(f"Resumed from {latest}  (epoch={start_epoch}, step={global_step})")
 
-    # ── Precision ─────────────────────────────────────────────────────────────
+    # -- Precision -------------------------------------------------------------
     use_bf16 = (args.precision == "bf16")
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16)
     if is_main:
         print(f"Precision: {args.precision}")
 
-    # ── Training ──────────────────────────────────────────────────────────────
+    # -- Training --------------------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
-        attn_res_ddp.train(); decoder_ddp.train()
+        decoder_ddp.train()
         t0 = time.time()
 
         for step, (imgs, _) in enumerate(train_loader):
             imgs = imgs.to(device)
 
-            # DINOv3 encode (frozen) — get patch tokens from K layers
+            # DINOv3 encode (frozen) -> raev2 MLS latent
             with torch.no_grad():
-                imgs_norm = (imgs - enc_mean) / enc_std
-                layer_out = encoder.model.get_intermediate_layers(
-                    imgs_norm, n=args.layers, return_class_token=False
-                )
-                patches_list = list(layer_out)   # already no-grad inside torch.no_grad()
-                # each: [B, 256, 1024]
+                z = encode_mls(imgs)                          # [B, 256, 1024]
 
             use_gan = (global_step >= disc_start_step) and (args.disc_weight > 0)
 
-            # ── Step A: Generator (attn_res + decoder) ─────────────────────────
+            # -- Step A: Generator (decoder) -----------------------------------
             optimizer.zero_grad(set_to_none=True)
 
             with autocast_ctx:
-                z = attn_res_ddp(patches_list)                    # [B, 256, 1024]
                 dec_out = decoder_ddp(z, drop_cls_token=False).logits
                 x_rec   = (decoder_ddp.module.unpatchify(dec_out)
                            * enc_std + enc_mean).clamp(0, 1)
 
                 loss_l1    = F.l1_loss(x_rec, imgs)
                 loss_lpips = lpips_all(x_rec * 2 - 1, imgs * 2 - 1).mean()
-            loss_sig   = sigreg_loss(z.float().reshape(-1, args.latent_dim))
             loss_rec   = loss_l1 + args.lpips_w * loss_lpips
 
             loss_gan = torch.zeros(1, device=device)
@@ -353,7 +342,7 @@ def main():
                 disc_ddp.eval()
                 half = max(1, x_rec.shape[0] // 2)
                 with autocast_ctx:
-                    # Generator step: NO detach — need grad for adaptive weight
+                    # Generator step: NO detach -- need grad for adaptive weight
                     fake_aug = disc_aug.aug(x_rec[:half] * 2 - 1)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                 loss_gan = vanilla_g_loss(logits_fake)
@@ -365,7 +354,6 @@ def main():
                 adp_w = torch.tensor(0.0, device=device)
 
             loss = (loss_rec
-                    + args.sigreg_w * loss_sig
                     + args.disc_weight * adp_w * loss_gan)
             loss.backward()
             if args.clip_grad > 0:
@@ -373,7 +361,7 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            # ── Step B: Discriminator ───────────────────────────────────────────
+            # -- Step B: Discriminator -----------------------------------------
             if use_gan:
                 disc_ddp.train()
                 disc_optimizer.zero_grad(set_to_none=True)
@@ -386,25 +374,21 @@ def main():
                 loss_d.backward()
                 disc_optimizer.step()
 
-            update_ema(ema_attn, attn_res, args.ema_decay)
-            update_ema(ema_dec,  decoder,  args.ema_decay)
+            update_ema(ema_dec, decoder, args.ema_decay)
 
             global_step += 1
 
-            # ── logging ───────────────────────────────────────────────────────
+            # -- logging -------------------------------------------------------
             if is_main and global_step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 z_m = z.detach().mean().item()
                 z_s = z.detach().std().item()
-                gate_val = torch.sigmoid(attn_res.gate).mean().item()
                 print(f"  ep{epoch+1} s{global_step}"
                       f"  loss={loss.item():.4e}"
                       f"  l1={loss_l1.item():.4e}"
                       f"  lpips={loss_lpips.item():.4e}"
-                      f"  sig={loss_sig.item():.4e}"
                       f"  gan={loss_gan.item():.4e}"
-                      f"  gate={gate_val:.3f}"
-                      f"  z(μ={z_m:.2f} σ={z_s:.2f})"
+                      f"  z(mu={z_m:.2f} sd={z_s:.2f})"
                       f"  lr={lr:.2e}", flush=True)
                 if args.wandb:
                     import wandb
@@ -412,10 +396,8 @@ def main():
                         "train/loss":   loss.item(),
                         "train/l1":     loss_l1.item(),
                         "train/lpips":  loss_lpips.item(),
-                        "train/sigreg": loss_sig.item(),
                         "train/gan_g":  loss_gan.item(),
                         "train/adp_w":  adp_w.item(),
-                        "train/gate":   gate_val,
                         "train/z_mean": z_m, "train/z_std": z_s,
                         "train/lr":     lr,
                     }, step=global_step)
@@ -425,11 +407,10 @@ def main():
             print(f"Epoch {epoch+1}/{args.epochs}  "
                   f"time={time.time()-t0:.0f}s", flush=True)
 
-        # ── fixed val images reconstruction ──────────────────────────────────
-        if is_main and val_patches_fixed is not None:
+        # -- fixed val images reconstruction -----------------------------------
+        if is_main and val_z_fixed is not None:
             with torch.no_grad():
-                val_z   = ema_attn(val_patches_fixed)
-                val_dec = ema_dec(val_z, drop_cls_token=False).logits
+                val_dec = ema_dec(val_z_fixed, drop_cls_token=False).logits
                 val_rec = (ema_dec.unpatchify(val_dec)
                            * enc_std + enc_mean).clamp(0, 1)   # [N, 3, H, W]
 
@@ -445,26 +426,24 @@ def main():
             if (epoch + 1) % 10 == 0:
                 out_path = os.path.join(recon_dir, f"epoch_{epoch+1}.png")
                 save_image(val_rec.cpu(), out_path, nrow=n)
-                print(f"  Val recon → {out_path}", flush=True)
+                print(f"  Val recon -> {out_path}", flush=True)
                 if args.wandb:
                     import wandb
                     wandb.log({"val/recon": wandb.Image(
                         out_path, caption=f"ep={epoch+1}"
                     )}, step=global_step)
 
-        # ── checkpoint ────────────────────────────────────────────────────────
+        # -- checkpoint --------------------------------------------------------
         if is_main:
             ckpt = {
-                "epoch":        epoch + 1,
-                "global_step":  global_step,
-                "attn_res":     attn_res.state_dict(),
-                "decoder":      decoder.state_dict(),
-                "ema_attn":     ema_attn.state_dict(),
-                "ema_dec":      ema_dec.state_dict(),
-                "disc":         disc.state_dict(),
-                "optimizer":    optimizer.state_dict(),
+                "epoch":          epoch + 1,
+                "global_step":    global_step,
+                "decoder":        decoder.state_dict(),
+                "ema_dec":        ema_dec.state_dict(),
+                "disc":           disc.state_dict(),
+                "optimizer":      optimizer.state_dict(),
                 "disc_optimizer": disc_optimizer.state_dict(),
-                "layers":       args.layers,
+                "layers":         args.layers,
             }
             # always overwrite latest (for resume)
             torch.save(ckpt, os.path.join(args.out_dir, "ckpt_latest.pt"))

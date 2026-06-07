@@ -8,7 +8,7 @@ from typing import Dict, Optional
 
 import torch
 from torch.cuda.amp import autocast
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 
 from .disc import select_gan_losses, calculate_adaptive_weight
 from eval import evaluate_reconstruction_distributed
@@ -205,8 +205,9 @@ def train_one_epoch(
             logger.info("Generating EMA samples...")
             with torch.no_grad():
                 samples = ema_model.decode(ema_model.encode(viz_samples))
-                original_grid = make_grid(viz_samples.cpu().float(), nrow=8)
-                recon_grid = make_grid(samples.cpu().float(), nrow=8)
+                nrow = viz_samples.shape[0]
+                original_grid = make_grid(viz_samples.cpu().float(), nrow=nrow)
+                recon_grid = make_grid(samples.cpu().float(), nrow=nrow)
                 if args.wandb:
                     wandb_utils.log_images({"viz/original": original_grid, "viz/reconstructed": recon_grid}, step=global_step)
             logger.info("Generating EMA samples done.")
@@ -241,6 +242,24 @@ def train_one_epoch(
 
         # update global step
         global_step += 1
+
+    #########################################################
+    # Validation panel every 10 epochs: top row = originals, bottom row = recons
+    # (concat panel, mirrors train_sigreg.py / train_attnres.py val viz)
+    #########################################################
+    if rank == 0 and viz_samples is not None and (epoch + 1) % 10 == 0:
+        logger.info(f"Saving val-recon panel for epoch {epoch + 1}...")
+        n = viz_samples.shape[0]
+        with torch.no_grad():
+            recon = ema_model.decode(ema_model.encode(viz_samples)).clamp(0, 1)
+        panel = torch.cat([viz_samples, recon], dim=0).cpu().float()   # [2N,3,H,W] top=orig, bottom=recon
+        recon_dir = os.path.join(experiment_dir, "val_recon")
+        os.makedirs(recon_dir, exist_ok=True)
+        out_path = os.path.join(recon_dir, f"epoch_{epoch + 1}.png")
+        save_image(panel, out_path, nrow=n, normalize=False)
+        logger.info(f"Val recon panel -> {out_path}")
+        if args.wandb:
+            wandb_utils.log_images({"viz/recon": make_grid(panel, nrow=n)}, step=global_step)
 
     #########################################################
     # Epoch summary

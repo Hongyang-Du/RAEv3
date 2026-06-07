@@ -5,8 +5,6 @@ import numpy as np
 from PIL import Image
 from typing import List
 
-from dpg_evaluator import MPLUG, load_prompt2id, load_dpg_metadata, evaluate_batch
-
 
 class DPGEvaluator:
     """Lazy-loaded DPGBench model for computing image-text alignment scores."""
@@ -18,6 +16,7 @@ class DPGEvaluator:
         self.question_dict = None
 
     def _ensure_loaded(self):
+        from dpg_evaluator import MPLUG, load_dpg_metadata, load_prompt2id  # lazy: optional T2I-eval dep
         if self.model is None:
             self.model = MPLUG(device=self.device)
         if self.prompt2id is None:
@@ -37,6 +36,7 @@ class DPGEvaluator:
         Returns:
             torch.Tensor of shape (B,) containing DPGBench score per sample
         """
+        from dpg_evaluator import evaluate_batch  # lazy: optional T2I-eval dep
         self._ensure_loaded()
 
         # Validate images and filter out invalid ones (zero dimensions)

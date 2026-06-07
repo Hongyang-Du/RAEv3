@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
+import os
 from copy import deepcopy
 
 import torch
@@ -35,6 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--wandb', action='store_true', help='Use W&B for logging.')
     parser.add_argument("--compile", action="store_true", help="Use torch.compile.")
     parser.add_argument("--sync-checkpoints", action="store_true", help="Sync checkpoints to S3.")
+    # Optional overrides so run_train_stage1.sh can set these from bash (like run_train_attnres.sh).
+    parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs.")
+    parser.add_argument("--checkpoint-interval", type=int, default=None,
+                        help="Override training.checkpoint_interval (epochs between checkpoints).")
+    parser.add_argument("--sample-every", type=int, default=None,
+                        help="Override training.sample_every (steps between val-recon dumps).")
+    parser.add_argument("--val-image", type=str, default="assets/samples/sample_1.png",
+                        help="Fixed val image (or any image in its dir) for recon viz, like run_train_attnres.sh.")
     return parser.parse_args()
 
 
@@ -47,6 +57,19 @@ def main():
     rank, world_size, device = setup_distributed()
     config = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(Stage1Config), OmegaConf.load(args.config)))
     validate_stage1_config(config)
+
+    # CLI overrides (let run_train_stage1.sh drive these from bash, like run_train_attnres.sh).
+    if args.epochs is not None:
+        config.training.epochs = args.epochs
+        # Keep cosine decay spanning the full run (YAML convention: decay_end_epoch == epochs).
+        if config.training.scheduler is not None:
+            config.training.scheduler.decay_end_epoch = args.epochs
+        if config.gan.scheduler is not None:
+            config.gan.scheduler.decay_end_epoch = args.epochs
+    if args.checkpoint_interval is not None:
+        config.training.checkpoint_interval = args.checkpoint_interval
+    if args.sample_every is not None:
+        config.training.sample_every = args.sample_every
 
     seed = config.training.global_seed * world_size + rank
     torch.manual_seed(seed)
@@ -141,14 +164,28 @@ def main():
         if rank == 0:
             save_worktree(experiment_dir, config, {"cmd_args": vars(args)})
 
-    # Viz samples from first eval dataset
+    # Fixed validation images for recon viz — same set as run_train_attnres.sh
+    # (assets/samples/*.png, "concat" grids skipped). Encoder normalization is
+    # handled inside RAE.encode, so we feed plain [0, 1] images.
     viz_samples = None
-    if eval_datasets:
-        first_ds = next(iter(eval_datasets.values()))
-        viz_rng = torch.Generator().manual_seed(42)
-        num_viz = min(64, len(first_ds.dataset))
-        viz_indices = torch.randperm(len(first_ds.dataset), generator=viz_rng)[:num_viz].tolist()
-        viz_samples = torch.stack([first_ds.dataset[i][0] for i in viz_indices]).to(device)
+    if args.val_image:
+        from torchvision import transforms
+        from PIL import Image as PILImage
+        val_tf = transforms.Compose([
+            transforms.Resize(config.training.image_size + 32),
+            transforms.CenterCrop(config.training.image_size),
+            transforms.ToTensor(),
+        ])
+        val_dir = os.path.dirname(os.path.abspath(args.val_image))
+        val_paths = sorted(
+            p for p in (glob.glob(os.path.join(val_dir, "*.png")) +
+                        glob.glob(os.path.join(val_dir, "*.jpg")))
+            if "concat" not in os.path.basename(p).lower()
+        )
+        if not val_paths:
+            val_paths = [args.val_image]
+        viz_samples = torch.stack([val_tf(PILImage.open(p).convert("RGB")) for p in val_paths]).to(device)
+        logger.info(f"Loaded {len(val_paths)} fixed val images from {val_dir}")
 
     # Progress bar
     total_steps = config.training.epochs * steps_per_epoch
