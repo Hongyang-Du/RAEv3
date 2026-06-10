@@ -1,39 +1,44 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SpatialAttnRes + SIGReg + GAN  Stage-1 training
+#  raev2 MLS + learnable Projector(SIGReg) + Decoder training
+#  (src/train_decoder_mls_sigreg.py)
+#
 #  Encoder:  DINOv3-L (frozen, layers 11,13,15,17,19,21,23)
-#  Decoder:  ViT-XL (fine-tuned from pretrained)
-#  Dataset:  partial ImageNet-256 (~93K images)
+#  Combine:  raev2 dinov3mls multi-layer sum (frozen, no params)
+#  Project:  learnable per-token residual MLP  <- SIGReg shapes its output
+#  Decoder:  ViT-XL (trained from scratch)
+#  Reg:      SIGReg (1024 random projections, multi-frequency Epps-Pulley)
+#  Loss:     L1 + LPIPS + GAN + sigreg_w * SIGReg
 # ============================================================
 set -euo pipefail
 
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
 PYTHON=${CONDA_ENV}/bin/python
-SCRIPT=$(dirname "$(realpath "$0")")/src/train_attnres.py
+SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls_sigreg.py
 
 cd "$(dirname "$(realpath "$0")")"
 
 # ── config ───────────────────────────────────────────────────
 NGPU=8
-DATA=/datasets/imagenet-256
-OUT_DIR=output/train_attnres8e-4fix
+DATA=/datasets/imagenet-256-full
+OUT_DIR=output/train_decoder_mls_sigreg
 
-EPOCHS=100
+EPOCHS=20
 BATCH=32                # per GPU; global = BATCH × NGPU
 LR=8e-4
-PRECISION=bf16           # bf16 saves ~50% memory, same accuracy on A100
+PRECISION=bf16
 LAYERS="11 13 15 17 19 21 23"   # DINOv3-L layers to combine (K7); e.g. "23" = last layer only
 
-SIGREG_W=1
+SIGREG_W=1              # re-tuned for the 1024-proj / multi-freq SIGReg
 LPIPS_W=1.0
 DISC_WEIGHT=0.75
-DISC_START=1             # epoch to start GAN (disc uses half-batch to save memory)
+DISC_START=1
 
-CKPT_EVERY=20            # save every 20 epochs, keep all
-VAL_EVERY=500            # log val images every N steps
+CKPT_EVERY=20
+VAL_EVERY=500
 LOG_EVERY=50
-VAL_IMAGE=assets/samples/sample_1.png  # fixed image to track reconstruction quality
+VAL_IMAGE=assets/samples/sample_1.png
 
 WANDB=true
 export WANDB_BASE_URL=https://api.wandb.ai
@@ -43,10 +48,9 @@ WANDB_ENTITY=uscgvl
 # ─────────────────────────────────────────────────────────────
 
 echo "========================================================"
-echo "  SpatialAttnRes Stage-1 Training"
-echo "  GPUs:      ${NGPU}"
-echo "  Batch:     ${BATCH}/GPU  (global: $((BATCH * NGPU)))"
-echo "  Epochs:    ${EPOCHS}  |  Precision: ${PRECISION}"
+echo "  MLS + Projector(SIGReg) + Decoder training"
+echo "  GPUs:      ${NGPU}   Batch: ${BATCH}/GPU (global $((BATCH * NGPU)))"
+echo "  Epochs:    ${EPOCHS}  |  Precision: ${PRECISION}  |  sigreg_w: ${SIGREG_W}"
 echo "  Data:      ${DATA}"
 echo "  Output:    ${OUT_DIR}"
 echo "  wandb:     ${WANDB} (${WANDB_ENTITY}/${WANDB_PROJECT})"

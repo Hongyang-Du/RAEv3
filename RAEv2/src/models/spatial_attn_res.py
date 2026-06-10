@@ -6,7 +6,7 @@ For each of 256 spatial positions independently:
   Q = last layer token           (base representation)
   K/V = intermediate layer tokens (layers 0..K-2, NOT last)
   cross_attn = softmax(Q @ K^T / sqrt(d)) @ V
-  gate = sigmoid(learnable)      (init ≈ 0 → fallback to last layer)
+  gate = sigmoid(learnable)      (init 0.5, open & learnable; or randomly open)
   z = last_layer + gate × cross_attn
   z = FFN(z)                     (learn new representation space)
   z = BatchNorm(z)               (compatible with SIGReg)
@@ -23,11 +23,16 @@ RAEV2_LAYERS = [11, 13, 15, 17, 19, 21, 23]   # same as RAEv2 MLS K7
 
 class SpatialAttnRes(nn.Module):
     def __init__(self, dim: int = 1024, out_dim: int = 1024,
-                 gate_init: float = -5.0):
+                 gate_init: float = 0.0, gate_random: bool = False):
         """
-        dim       : DINOv3 hidden dim (1024 for ViT-L)
-        out_dim   : output latent dim
-        gate_init : initial gate value — sigmoid(-5) ≈ 0.007 → almost no injection
+        dim         : DINOv3 hidden dim (1024 for ViT-L)
+        out_dim     : output latent dim
+        gate_init   : initial gate logit. sigmoid(0)=0.5 → open AND at the max-gradient
+                      point of the sigmoid, so the gate is immediately learnable.
+                      (sigmoid(-5)≈0.007 starts ~closed and saturated → barely moves.)
+        gate_random : if True, per-dim logits ~ N(gate_init, 1) — "randomly open",
+                      breaks symmetry across the 1024 gates so each dim starts at a
+                      different openness. Synced across ranks by DDP's init broadcast.
         """
         super().__init__()
         self.scale  = dim ** -0.5
@@ -37,9 +42,11 @@ class SpatialAttnRes(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=False)  # from intermediate layers
         # no v_proj — use intermediate layer outputs directly as values
 
-        # gate: controls how much intermediate info to inject
-        # one scalar per output dim, init to gate_init → sigmoid ≈ 0
-        self.gate = nn.Parameter(torch.full((dim,), gate_init))
+        # gate: one logit per output dim, controls how much intermediate info to inject
+        if gate_random:
+            self.gate = nn.Parameter(torch.randn(dim) + gate_init)   # randomly open
+        else:
+            self.gate = nn.Parameter(torch.full((dim,), gate_init))  # open at sigmoid(gate_init)
 
         # FFN: learns the new representation space on top of fused features
         self.ffn_norm = nn.LayerNorm(dim)

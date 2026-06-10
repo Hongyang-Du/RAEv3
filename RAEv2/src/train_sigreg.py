@@ -34,7 +34,8 @@ import wandb as wb
 
 # reuse modules from overfit script
 from overfit_sigreg import (MLPProjector, TokenUpsampler, SpatialAttnRes,
-                            sigreg_loss, all_gather_with_grad, load_lpips)
+                            sigreg_loss, all_gather_with_grad, load_lpips,
+                            gaussian_diag)
 
 
 # ─── Data ────────────────────────────────────────────────────────────────────
@@ -201,18 +202,24 @@ def main():
             if global_step % args.log_every == 0:
                 avg = np.mean(epoch_losses[-args.log_every:])
                 lr  = optimizer.param_groups[0]["lr"]
-                z_mean = z_reg.detach().mean().item()
-                z_std  = z_reg.detach().std().item()
+                zd = gaussian_diag(z_reg)
                 print(f"  ep{epoch+1} step{global_step}  "
                       f"loss={avg:.4e}  l1={loss_l1.item():.4e}  "
                       f"lpips={loss_lpips.item():.4e}  "
                       f"sig={loss_sig.item():.4e}  "
-                      f"z(μ={z_mean:.2f} σ={z_std:.2f})  lr={lr:.2e}", flush=True)
+                      f"z(μ={zd['mean']:.2f} σ={zd['std']:.2f})  "
+                      f"vard(μ={zd['var_mean']:.2f} σ={zd['var_disp']:.3f}) iso={zd['iso_disp']:.3f}  "
+                      f"sk={zd['skew']:.3f} ku={zd['kurt']:.2f} d={zd['dead']}  lr={lr:.2e}", flush=True)
                 if args.wandb:
                     wb.log({"train/loss": avg, "train/l1": loss_l1.item(),
                             "train/lpips": loss_lpips.item(),
                             "train/sigreg": loss_sig.item(),
-                            "train/z_mean": z_mean, "train/z_std": z_std,
+                            "train/z_mean": zd["mean"], "train/z_std": zd["std"],
+                            "train/z_var_mean": zd["var_mean"],
+                            "train/z_var_disp": zd["var_disp"],
+                            "train/z_iso_disp": zd["iso_disp"],
+                            "train/z_skew": zd["skew"], "train/z_kurt": zd["kurt"],
+                            "train/z_dead": zd["dead"],
                             "train/lr": lr}, step=global_step)
 
             # ── Validation images ──────────────────────────────────────────────

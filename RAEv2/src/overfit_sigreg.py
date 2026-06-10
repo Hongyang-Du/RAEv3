@@ -58,39 +58,127 @@ def all_gather_with_grad(z: torch.Tensor) -> torch.Tensor:
 
 # ─── SIGReg ─────────────────────────────────────────────────────────────────
 
-def sigreg_loss(z: torch.Tensor, n_proj: int = 64) -> torch.Tensor:
-    """
-    Sketched Isotropic Gaussian Regularization (simplified).
-    Pushes the distribution of z toward N(0,I) via random projections
-    and the Epps-Pulley characteristic function test.
+def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
+                max_samples: int = 32768) -> torch.Tensor:
+    """Sketched Isotropic Gaussian Regularization (SIGReg, LeJEPA-style).
 
-    z: [B, N, D] or [B, D] — treated as a batch of D-dim samples.
-    Works best with B >> 1.  For single image, use over augmented views.
+    A distribution is N(0, I) iff every 1D projection is N(0, 1) (Cramér-Wold),
+    so we sketch with `n_proj` random unit directions and, on each, run an
+    Epps-Pulley characteristic-function test over a grid of `n_freq` frequencies.
+    The earlier simplified form used 64 directions and a SINGLE small random t,
+    so its gradient mostly saw the 2nd moment; the frequency grid here lets it
+    actually constrain skew / kurtosis / tails.
+
+    z: [B, N, D] or [B, D] — a batch of D-dim samples (B >> 1). Directions and
+    frequencies are resampled every call, so sphere coverage accumulates over
+    training. Computed PER-RANK (no all-gather): with ~16k local tokens the CF is
+    already low-variance, and DDP averages the gradient across ranks — gathering
+    then subsampling would instead leave only ~max_samples/world_size rows on the
+    autograd graph, diluting the per-step gradient. Samples are capped at
+    `max_samples` to bound the memory of the [M, n_proj] sketch.
     """
     if z.ndim == 3:
         z = z.reshape(-1, z.shape[-1])   # [B*N, D]
-    z = all_gather_with_grad(z)          # gather across GPUs before statistics
+    z = z.float()
     B, D = z.shape
     if B < 4:
-        # Not enough samples for meaningful statistics;
-        # fall back to simple moment matching
+        # Not enough samples for the CF test; fall back to moment matching
         mean_loss = z.mean(0).pow(2).mean()
         var_loss  = (z.var(0, unbiased=False) - 1).pow(2).mean()
         return mean_loss + var_loss
+    if B > max_samples:                  # cap sketch memory (subsample local rows)
+        idx = torch.randperm(B, device=z.device)[:max_samples]
+        z = z[idx]
 
-    # Random unit projections
+    # Random unit projections (1D slices)
     A = F.normalize(torch.randn(D, n_proj, device=z.device), dim=0)  # [D, n_proj]
-    proj = z @ A        # [B, n_proj]
+    proj = z @ A                                                     # [M, n_proj]
 
-    # Characteristic function test: E[exp(i*t*z)] = exp(-t²/2) for N(0,1)
-    # Approximate with cosine terms and random t values
-    t = torch.randn(n_proj, device=z.device)                # [n_proj]
-    cos_emp    = torch.cos(proj * t).mean(0)                # [n_proj]
-    cos_gauss  = torch.exp(-0.5 * t ** 2)                   # [n_proj]
-    sin_emp    = torch.sin(proj * t).mean(0)
-    # For N(0,1), E[sin(tZ)] = 0
-    loss = ((cos_emp - cos_gauss) ** 2 + sin_emp ** 2).mean()
-    return loss
+    # Epps-Pulley test per slice over a Gaussian-weighted frequency grid:
+    #   φ_emp(t) = mean_i exp(i·t·projᵢ);  for N(0,1)  φ(t) = e^{-t²/2}
+    #   penalty  = Σ_t w(t) · |φ_emp(t) - e^{-t²/2}|²,   averaged over slices
+    t = torch.linspace(0.1, 4.0, n_freq, device=z.device)           # [n_freq]
+    w = torch.exp(-0.5 * t ** 2)                                     # weight
+    loss = proj.new_zeros(())
+    for tk, wk in zip(t.unbind(), w.unbind()):                       # loop = low peak mem
+        cos_emp = torch.cos(proj * tk).mean(0)                      # [n_proj]
+        sin_emp = torch.sin(proj * tk).mean(0)                      # [n_proj]
+        cf2     = (cos_emp - torch.exp(-0.5 * tk ** 2)) ** 2 + sin_emp ** 2
+        loss    = loss + wk * cf2.mean()
+    return loss / w.sum()
+
+
+@torch.no_grad()
+def gaussian_diag(z: torch.Tensor, eps: float = 1e-8, n_proj: int = 256) -> dict:
+    """Per-rank Gaussianity diagnostics for a latent z.
+
+    Global (mean, std) only check standardization — they hit (0, 1) trivially
+    and say nothing about whether z is actually N(0, I). These extra moments
+    check the shape SIGReg targets. For a true N(0, I) latent:
+        mean 0 | std 1 | var_mean 1 | var_disp 0 | iso_disp 0 | skew 0 | kurt 0 | dead 0
+
+    z: [B, N, D] or [B, D], treated as (B*N) samples of dim D. Computed locally
+    on the calling rank (no all-gather); call on rank 0 for logging. Returns
+    python floats:
+        var_mean : mean over dims of Var_b(z)          -> isotropic scale  (~1)
+        var_disp : std  over CANONICAL axes of Var_b(z)-> axis-aligned spread
+        iso_disp : std  over RANDOM directions of      -> rotation-invariant
+                   projected variance uᵀΣu                isotropy, ideal 0  (★)
+        skew     : mean over LIVE dims of |skewness|   -> asymmetry, ideal 0
+        kurt     : mean over LIVE dims of |excess kurt|-> tails,     ideal 0
+        dead     : count of collapsed dims (var < eps) -> degeneracy, ideal 0
+
+    var_disp only sees the DIAGONAL of Cov(z): correlated dims (unit diagonal but
+    nonzero off-diagonal) read as isotropic when they are not. iso_disp uses random
+    unit projections (SIGReg's slicing, Cramér-Wold) so it sees the full covariance
+    spectrum and catches rotated/correlated anisotropy that var_disp misses. If
+    iso_disp >> var_disp, the anisotropy lives in correlations, not in the axes.
+
+    Collapsed dims (var≈0) are excluded from skew/kurt: a dead dim otherwise
+    standardizes to 0 and reports skew 0 / |kurt| 3, masking the collapse as a
+    healthy signal. They are surfaced via `dead` instead.
+    """
+    if z.ndim == 3:
+        z = z.reshape(-1, z.shape[-1])
+    z = z.detach().float()                                  # [M, D]
+    zc     = z - z.mean(0)
+    var_d  = (zc * zc).mean(0)                              # [D] per-dim variance
+    alive  = var_d > eps                                    # non-collapsed dims
+    std_d  = var_d.clamp_min(eps).sqrt()
+    zn     = zc / std_d                                     # per-dim standardized
+    skew_d = (zn ** 3).mean(0)                              # [D] per-dim skewness
+    kurt_d = (zn ** 4).mean(0) - 3.0                        # [D] per-dim excess kurtosis
+    if alive.any():
+        skew = skew_d[alive].abs().mean().item()
+        kurt = kurt_d[alive].abs().mean().item()
+    else:
+        skew = kurt = float("nan")
+    # rotation-invariant isotropy: variance along random unit directions
+    # (SIGReg slicing). proj is centered, so mean over rows is ~0 -> .pow(2).mean
+    # is the variance uᵀΣu of each random direction u.
+    A      = F.normalize(torch.randn(z.shape[1], n_proj, device=z.device), dim=0)
+    proj_v = (zc @ A).pow(2).mean(0)                        # [n_proj] var per direction
+    return {
+        "mean":     z.mean().item(),
+        "std":      z.std().item(),
+        "var_mean": var_d.mean().item(),
+        "var_disp": var_d.std(unbiased=False).item(),
+        "iso_disp": proj_v.std(unbiased=False).item(),
+        "skew":     skew,
+        "kurt":     kurt,
+        "dead":     int((~alive).sum().item()),
+    }
+
+
+@torch.no_grad()
+def psnr(x: torch.Tensor, target: torch.Tensor, eps: float = 1e-10) -> float:
+    """Mean PSNR in dB between two [B, C, H, W] images in [0, 1].
+
+    Per-image MSE -> per-image PSNR -> averaged over the batch (the standard
+    reconstruction-quality convention). Higher is better.
+    """
+    mse = ((x.detach().float() - target.detach().float()) ** 2).flatten(1).mean(1)  # [B]
+    return (-10.0 * torch.log10(mse + eps)).mean().item()
 
 
 # ─── Token Upsampler: 4 register tokens → 256 patch positions ────────────────

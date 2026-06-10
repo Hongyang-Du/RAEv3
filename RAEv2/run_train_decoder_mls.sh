@@ -14,6 +14,7 @@ set -euo pipefail
 
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
+PYTHON=${CONDA_ENV}/bin/python
 SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls.py
 
 cd "$(dirname "$(realpath "$0")")"
@@ -21,18 +22,19 @@ cd "$(dirname "$(realpath "$0")")"
 # -- config ---------------------------------------------------
 NGPU=8
 DATA=/datasets/imagenet-256
-OUT_DIR=output/train_decoder_mls
+OUT_DIR=output/train_decoder_mls_raev2
 
-EPOCHS=100
-BATCH=64                 # per GPU; global = BATCH x NGPU
-LR=5e-4
+EPOCHS=50
+BATCH=32                 # per GPU; global = BATCH x NGPU
+LR=8e-4
 PRECISION=bf16           # bf16 saves ~50% memory, same accuracy on A100
+LAYERS="11 13 15 17 19 21 23"   # DINOv3-L layers to combine (K7); e.g. "23" = last layer only
 
 LPIPS_W=1.0
 DISC_WEIGHT=0.75
 DISC_START=1             # epoch to start GAN (disc uses half-batch to save memory)
 
-CKPT_EVERY=999           # keep a permanent ckpt every N epochs (ckpt_latest always saved)
+CKPT_EVERY=10           # keep a permanent ckpt every N epochs (ckpt_latest always saved)
 VAL_EVERY=500            # log val images every N steps
 LOG_EVERY=50
 VAL_IMAGE=assets/samples/sample_1.png  # fixed images (dir globbed) to track recon quality
@@ -60,13 +62,20 @@ if [[ "${WANDB}" == "true" ]]; then
     WANDB_ARGS="--wandb --wandb-project ${WANDB_PROJECT} --wandb-entity ${WANDB_ENTITY}"
 fi
 
-PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU} "${SCRIPT}" \
+# OS-assigned free rendezvous port → avoids EADDRINUSE from a lingering launcher
+MASTER_PORT=$(${PYTHON} -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+echo "Rendezvous port: ${MASTER_PORT}"
+
+PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU} \
+    --master-port="${MASTER_PORT}" \
+    "${SCRIPT}" \
     --data        "${DATA}" \
     --out-dir     "${OUT_DIR}" \
     --epochs      "${EPOCHS}" \
     --batch-size  "${BATCH}" \
     --precision   "${PRECISION}" \
     --lr          "${LR}" \
+    --layers      ${LAYERS} \
     --lpips-w     "${LPIPS_W}" \
     --disc-weight "${DISC_WEIGHT}" \
     --disc-start  "${DISC_START}" \

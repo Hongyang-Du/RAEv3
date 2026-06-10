@@ -41,6 +41,7 @@ from torchvision import transforms
 from torchvision.utils import save_image
 
 from models.spatial_attn_res import RAEV2_LAYERS
+from overfit_sigreg import gaussian_diag, psnr
 from stage1.disc import DinoDiscriminator, hinge_d_loss, vanilla_g_loss, calculate_adaptive_weight
 from stage1.disc.diffaug import DiffAug
 
@@ -381,14 +382,17 @@ def main():
             # -- logging -------------------------------------------------------
             if is_main and global_step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
-                z_m = z.detach().mean().item()
-                z_s = z.detach().std().item()
+                zd = gaussian_diag(z)
+                ps = psnr(x_rec, imgs)
                 print(f"  ep{epoch+1} s{global_step}"
                       f"  loss={loss.item():.4e}"
                       f"  l1={loss_l1.item():.4e}"
                       f"  lpips={loss_lpips.item():.4e}"
+                      f"  psnr={ps:.2f}"
                       f"  gan={loss_gan.item():.4e}"
-                      f"  z(mu={z_m:.2f} sd={z_s:.2f})"
+                      f"  z(mu={zd['mean']:.2f} sd={zd['std']:.2f})"
+                      f"  vard(mu={zd['var_mean']:.2f} sd={zd['var_disp']:.3f}) iso={zd['iso_disp']:.3f}"
+                      f"  sk={zd['skew']:.3f} ku={zd['kurt']:.2f} d={zd['dead']}"
                       f"  lr={lr:.2e}", flush=True)
                 if args.wandb:
                     import wandb
@@ -396,9 +400,15 @@ def main():
                         "train/loss":   loss.item(),
                         "train/l1":     loss_l1.item(),
                         "train/lpips":  loss_lpips.item(),
+                        "train/psnr":   ps,
                         "train/gan_g":  loss_gan.item(),
                         "train/adp_w":  adp_w.item(),
-                        "train/z_mean": z_m, "train/z_std": z_s,
+                        "train/z_mean":     zd["mean"], "train/z_std": zd["std"],
+                        "train/z_var_mean": zd["var_mean"],
+                        "train/z_var_disp": zd["var_disp"],
+                        "train/z_iso_disp": zd["iso_disp"],
+                        "train/z_skew":     zd["skew"], "train/z_kurt": zd["kurt"],
+                        "train/z_dead":     zd["dead"],
                         "train/lr":     lr,
                     }, step=global_step)
 
@@ -413,6 +423,11 @@ def main():
                 val_dec = ema_dec(val_z_fixed, drop_cls_token=False).logits
                 val_rec = (ema_dec.unpatchify(val_dec)
                            * enc_std + enc_mean).clamp(0, 1)   # [N, 3, H, W]
+            val_ps = psnr(val_rec, val_img_orig)
+            print(f"  Val PSNR (EMA): {val_ps:.2f} dB", flush=True)
+            if args.wandb:
+                import wandb
+                wandb.log({"val/psnr": val_ps}, step=global_step)
 
             n = val_rec.shape[0]
             recon_dir = os.path.join(args.out_dir, "val_recon")

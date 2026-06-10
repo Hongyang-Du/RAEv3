@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
-Multi-GPU DDP training: SpatialAttnRes + SIGReg + ViT Decoder on ImageNet.
+Multi-GPU DDP training: raev2 MLS latent -> learnable VAE Projector (KL) -> ViT Decoder.
+
+Same recipe as train_decoder_mls_sigreg.py, but the latent regularizer is a
+VAE-style KL divergence instead of SIGReg. The projector becomes a small
+variational head that emits (mu, logvar); the latent z is reparameterized
+(z = mu + sigma * eps) and KL(N(mu, sigma^2) || N(0, I)) pulls the posterior
+toward a standard normal — the diffusion-VAE / LDM way of getting an N(0, I)
+latent, to contrast against the SIGReg variant.
 
 Architecture:
   DINOv3-L (frozen, layers [11,13,15,17,19,21,23])
-       ↓ patch tokens [B, 7, 256, 1024]
-  SpatialAttnRes (learned: per-position AttnRes + gated FFN)
-       ↓ z [B, 256, 1024]   ← SIGReg (all_gather for multi-GPU)
-  ViT Decoder (fine-tuned from pretrained)
-       ↓ x_rec [B, 3, 256, 256]
+       v
+  raev2 MLS combine (frozen, no params)            z0 [B, 256, 1024]
+       v
+  VAE Projector (learnable) -> (mu, logvar)         [B, 256, latent] x2  <- KL here
+       v  reparameterize: z = mu + exp(.5*logvar)*eps
+  z [B, 256, latent]
+       v
+  ViT Decoder (trained from scratch)               x_rec [B, 3, 256, 256]
 
-Loss: L1 + LPIPS + λ_sig * SIGReg
+Loss: L1 + LPIPS + GAN + kl_w * KL
+  - recon/LPIPS/GAN train projector + decoder (end-to-end)
+  - KL pushes the posterior toward N(0, I); its gradient flows into the
+    projector only (encoder + MLS are frozen/param-free).
+  - val/EMA reconstructions use the posterior mean (deterministic).
 
 Usage:
-    torchrun --nproc_per_node=8 src/train_attnres.py \
-        --data /home/colligo/data/imagenet-256 \
-        --epochs 20 --batch-size 128 --wandb
+    torchrun --nproc_per_node=8 src/train_decoder_mls_kl.py \
+        --data /datasets/imagenet-256 \
+        --epochs 100 --batch-size 64 --kl-w 1e-6 --wandb
 """
 
 import sys, os, math, argparse, time, glob
@@ -31,13 +45,48 @@ import numpy as np
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from models.spatial_attn_res import SpatialAttnRes, RAEV2_LAYERS
-from overfit_sigreg import sigreg_loss, load_lpips, gaussian_diag
+from models.spatial_attn_res import RAEV2_LAYERS
+from overfit_sigreg import gaussian_diag, psnr
 from stage1.disc import DinoDiscriminator, hinge_d_loss, vanilla_g_loss, calculate_adaptive_weight
 from stage1.disc.diffaug import DiffAug
 
 
-# ─── EMA ─────────────────────────────────────────────────────────────────────
+# --- VAE Projector ------------------------------------------------------------
+
+class MLSVAEProjector(nn.Module):
+    """Learnable per-layer gate over the K MLS layers (init half-open) + VAE head.
+
+    Replaces the encoder's frozen unweighted MLS mean: each of the K layers gets an
+    independent sigmoid valve (gate, init 0 -> 0.5), so the model learns how much of
+    each layer reaches the decoder. The gated combine then goes through the mu path
+    (mirrors the SIGReg MLSProjector residual MLP) and a zero-initialized logvar head
+    (sigma = 1 at init). KL pulls the posterior toward N(0, I).
+    """
+    def __init__(self, n_layers: int, dim: int = 1024, out_dim: int = 1024, mult: int = 4):
+        super().__init__()
+        self.out_dim = out_dim
+        self.gate = nn.Parameter(torch.zeros(n_layers))     # per-layer logit, init 0 -> sigmoid 0.5
+        self.skip = nn.Linear(dim, out_dim) if dim != out_dim else nn.Identity()
+        self.norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * mult),
+            nn.GELU(),
+            nn.Linear(dim * mult, out_dim),
+        )
+        self.to_logvar = nn.Linear(out_dim, out_dim)
+        nn.init.zeros_(self.to_logvar.weight)               # logvar = 0 -> sigma = 1 at init
+        nn.init.zeros_(self.to_logvar.bias)
+
+    def forward(self, layer_tokens):                        # K x [B, N, dim] -> (mu, logvar)
+        stk = torch.stack(layer_tokens, dim=0)              # [K, B, N, dim]
+        g = torch.sigmoid(self.gate).view(-1, 1, 1, 1)      # [K,1,1,1]  per-layer openness
+        z0 = (g * stk).sum(0)                               # [B, N, dim]  gated per-layer mix
+        mu = self.skip(z0) + self.ffn(self.norm(z0))        # [B, N, out_dim]  project to new space
+        logvar = self.to_logvar(mu)
+        return mu, logvar
+
+
+# --- EMA ----------------------------------------------------------------------
 
 def update_ema(ema, model, decay=0.9995):
     with torch.no_grad():
@@ -45,15 +94,10 @@ def update_ema(ema, model, decay=0.9995):
             ep.data.mul_(decay).add_(p.data, alpha=1 - decay)
 
 
-# ─── Data ────────────────────────────────────────────────────────────────────
+# --- Data ---------------------------------------------------------------------
 
 def make_loader(data_dir, split, image_size, batch_size,
                 num_workers=4, world_size=1, rank=0):
-    """
-    Supports:
-      1. HuggingFace Arrow (RAEv2 format): data_dir contains imagenet-latents-images/
-      2. ImageFolder (fallback):           data_dir/train/<class>/*.jpg
-    """
     t_train = transforms.Compose([
         transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
         transforms.RandomHorizontalFlip(),
@@ -68,11 +112,9 @@ def make_loader(data_dir, split, image_size, batch_size,
 
     arrow_dir = os.path.join(data_dir, "imagenet-latents-images")
     if os.path.isdir(arrow_dir):
-        # Partial or full HuggingFace Arrow download
         from data.partial_imagenet import PartialImageNetDataset
         ds = PartialImageNetDataset(data_dir, split=split, transform=t)
     else:
-        # Standard ImageFolder (data_dir/train/<class>/...)
         from torchvision.datasets import ImageFolder
         ds = ImageFolder(os.path.join(data_dir, split), transform=t)
 
@@ -89,56 +131,44 @@ def make_loader(data_dir, split, image_size, batch_size,
     )
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    # data
     parser.add_argument("--data",         required=True)
     parser.add_argument("--image-size",   type=int, default=256)
-    # training
-    parser.add_argument("--epochs",       type=int, default=20)
-    parser.add_argument("--batch-size",   type=int, default=128,
-                        help="Per-GPU batch size")
+    parser.add_argument("--epochs",       type=int, default=100)
+    parser.add_argument("--batch-size",   type=int, default=64, help="Per-GPU batch size")
     parser.add_argument("--lr",           type=float, default=2e-4)
     parser.add_argument("--warmup-epochs",type=int, default=2)
-    parser.add_argument("--sigreg-w",     type=float, default=0.1)
+    parser.add_argument("--kl-w",         type=float, default=1e-6,
+                        help="KL weight (LDM-style ~1e-6; re-tune for this latent)")
     parser.add_argument("--lpips-w",      type=float, default=1.0)
-    # GAN
     parser.add_argument("--disc-weight",  type=float, default=0.75)
-    parser.add_argument("--disc-start",   type=int,   default=1,
-                        help="Epoch to start GAN training")
+    parser.add_argument("--disc-start",   type=int,   default=1, help="Epoch to start GAN training")
     parser.add_argument("--disc-ckpt",    type=str,
                         default="pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth")
     parser.add_argument("--ema-decay",    type=float, default=0.9995)
     parser.add_argument("--val-image",    type=str,   default=None,
-                        help="Fixed image to reconstruct every epoch for visual tracking")
+                        help="Fixed image (its dir is globbed) to reconstruct every epoch")
     parser.add_argument("--clip-grad",    type=float, default=1.0)
-    # model
-    parser.add_argument("--layers",       type=int, nargs="+",
-                        default=RAEV2_LAYERS,
+    parser.add_argument("--layers",       type=int, nargs="+", default=RAEV2_LAYERS,
                         help="DINOv3 layer indices (default: RAEv2 K7)")
     parser.add_argument("--latent-dim",   type=int, default=1024)
-    parser.add_argument("--gate-init",    type=float, default=0.0,
-                        help="Initial gate logit; sigmoid(0)=0.5 → open & learnable")
-    parser.add_argument("--gate-random",  action="store_true",
-                        help="Per-dim gate logits ~ N(gate_init, 1): randomly open")
-    # logging
     parser.add_argument("--log-every",    type=int, default=50)
     parser.add_argument("--val-every",    type=int, default=500)
     parser.add_argument("--ckpt-every",   type=int, default=2)
-    parser.add_argument("--out-dir",      default="output/train_attnres")
+    parser.add_argument("--out-dir",      default="output/train_decoder_mls_kl")
     parser.add_argument("--wandb",        action="store_true")
     parser.add_argument("--wandb-project",default="raev3")
     parser.add_argument("--wandb-entity", default="hongyangd")
     parser.add_argument("--num-workers",  type=int, default=4)
     parser.add_argument("--seed",         type=int, default=42)
-    parser.add_argument("--precision",    type=str, default="fp32",
-                        choices=["fp32", "bf16"],
+    parser.add_argument("--precision",    type=str, default="fp32", choices=["fp32", "bf16"],
                         help="Training precision. bf16 halves memory usage.")
     args = parser.parse_args()
 
-    # ── DDP init ──────────────────────────────────────────────────────────────
+    # -- DDP init --------------------------------------------------------------
     dist.init_process_group("nccl")
     rank       = dist.get_rank()
     world_size = dist.get_world_size()
@@ -155,17 +185,17 @@ def main():
               f"  |  global batch: {args.batch_size * world_size}")
         print(f"Layers: {args.layers}")
 
-    # ── wandb ─────────────────────────────────────────────────────────────────
+    # -- wandb -----------------------------------------------------------------
     if args.wandb and is_main:
         import wandb
         wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
-            name=f"attnres-k{len(args.layers)}-sigreg",
+            name=f"decoder-mls-kl-k{len(args.layers)}",
             config={**vars(args), "global_batch": args.batch_size * world_size},
-            tags=["attnres", "sigreg", "stage1", f"k{len(args.layers)}"],
+            tags=["decoder", "mls", "kl", "vae", "raev2", "stage1", f"k{len(args.layers)}"],
         )
 
-    # ── Data ──────────────────────────────────────────────────────────────────
+    # -- Data ------------------------------------------------------------------
     train_loader, train_sampler = make_loader(
         args.data, "train", args.image_size, args.batch_size,
         args.num_workers, world_size, rank,
@@ -173,10 +203,11 @@ def main():
     if is_main:
         print(f"Train: {len(train_loader.dataset)} images")
 
-    # ── DINOv3 encoder (frozen) ───────────────────────────────────────────────
+    # -- DINOv3 encoder (frozen) + raev2 MLS combine ---------------------------
     from encoders.vision_encoder import create_encoder
-    encoder = create_encoder("dinov3-vit-l16", device=device,
-                             resolution=args.image_size)
+    layers_str = ".".join(str(l) for l in args.layers)
+    encoder = create_encoder(f"dinov3mls-vit-l16[layers={layers_str}]",
+                             device=device, resolution=args.image_size)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
@@ -184,12 +215,21 @@ def main():
     enc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
     enc_std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
 
-    # ── Pre-encode fixed val images (encoder frozen, do once) ────────────────
-    val_patches_fixed = None
-    val_img_orig      = None
+    def encode_layers(imgs01: torch.Tensor):
+        """imgs01 in [0,1] -> list of K frozen per-layer patch tokens, each [B, 256, 1024].
+
+        These feed the learnable gate in MLSVAEProjector (replacing the encoder's frozen
+        unweighted MLS mean). Same per-layer extraction the MLS encoder did internally.
+        """
+        imgs_norm = (imgs01 - enc_mean) / enc_std
+        return list(encoder.model.get_intermediate_layers(
+            imgs_norm, n=encoder.layer_indices, reshape=False,
+            return_class_token=False, norm=True))
+
+    # -- Pre-encode fixed val images (encoder frozen, do once) -----------------
+    val_layers_fixed = None
+    val_img_orig = None
     if args.val_image and is_main:
-        import glob as _glob
-        from torchvision import transforms
         from PIL import Image as PILImage
         _t = transforms.Compose([
             transforms.Resize(args.image_size + 32),
@@ -198,29 +238,25 @@ def main():
         ])
         val_dir   = os.path.dirname(os.path.abspath(args.val_image))
         val_paths = sorted(
-            p for p in (_glob.glob(os.path.join(val_dir, "*.png")) +
-                        _glob.glob(os.path.join(val_dir, "*.jpg")))
-            if "concat" not in os.path.basename(p).lower()  # skip stitched grids
+            p for p in (glob.glob(os.path.join(val_dir, "*.png")) +
+                        glob.glob(os.path.join(val_dir, "*.jpg")))
+            if "concat" not in os.path.basename(p).lower()
         )
         if not val_paths:
             val_paths = [args.val_image]
         imgs = [_t(PILImage.open(p).convert("RGB")) for p in val_paths]
-        val_img_orig = torch.stack(imgs).to(device)          # [N, 3, H, W]
-
+        val_img_orig = torch.stack(imgs).to(device)
         with torch.no_grad():
-            _norm = (val_img_orig - enc_mean) / enc_std
-            val_patches_fixed = encoder.model.get_intermediate_layers(
-                _norm, n=args.layers, return_class_token=False
-            )
-            val_patches_fixed = [p.detach() for p in val_patches_fixed]
+            val_layers_fixed = [t.detach() for t in encode_layers(val_img_orig)]
         print(f"Val images pre-encoded: {len(val_paths)} from {val_dir}", flush=True)
 
-    # ── Decoder (train from scratch) ──────────────────────────────────────────
+    # -- VAE Projector (learnable) + Decoder (train from scratch) --------------
+    projector = MLSVAEProjector(n_layers=len(args.layers),
+                                dim=encoder.hidden_size, out_dim=args.latent_dim).to(device)
+
     from omegaconf import OmegaConf
     from stage1.rae import _load_decoder
-    s1 = OmegaConf.load(
-        "configs/stage2/training/imagenet-dinov3l-k7.yaml"
-    ).stage_1.params
+    s1 = OmegaConf.load("configs/stage2/training/imagenet-dinov3l-k7.yaml").stage_1.params
     decoder = _load_decoder(
         s1.decoder_config_path,
         hidden_size=args.latent_dim,
@@ -229,32 +265,19 @@ def main():
         pretrained_path=None,
     ).to(device)
 
-    # ── SpatialAttnRes (learned) ───────────────────────────────────────────────
-    attn_res = SpatialAttnRes(
-        dim=1024, out_dim=args.latent_dim,
-        gate_init=args.gate_init, gate_random=args.gate_random,
-    ).to(device)
+    projector_ddp = DDP(projector, device_ids=[local_rank])
+    decoder_ddp   = DDP(decoder,   device_ids=[local_rank])
 
-    # SyncBatchNorm: sync BN stats across GPUs (BatchNorm in SpatialAttnRes)
-    attn_res = torch.nn.SyncBatchNorm.convert_sync_batchnorm(attn_res)
+    ema_proj = deepcopy(projector); ema_proj.requires_grad_(False); ema_proj.eval()
+    ema_dec  = deepcopy(decoder);   ema_dec.requires_grad_(False);  ema_dec.eval()
 
-    # DDP wrap
-    attn_res_ddp = DDP(attn_res, device_ids=[local_rank])
-    decoder_ddp  = DDP(decoder,  device_ids=[local_rank])
-
-    # EMA — always in eval mode (no backprop, no BN communication needed)
-    ema_attn = deepcopy(attn_res); ema_attn.requires_grad_(False); ema_attn.eval()
-    ema_dec  = deepcopy(decoder);  ema_dec.requires_grad_(False); ema_dec.eval()
-
-    trainable = (list(attn_res.parameters()) + list(decoder.parameters()))
+    trainable = list(projector.parameters()) + list(decoder.parameters())
     if is_main:
         n = sum(p.numel() for p in trainable) / 1e6
-        print(f"Trainable: {n:.1f}M  (SpatialAttnRes + decoder)")
+        print(f"Trainable: {n:.1f}M  (vae projector + decoder)")
 
-    # ── Optimizer + Scheduler ─────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0
-    )
+    # -- Optimizer + Scheduler -------------------------------------------------
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
     total_steps  = args.epochs * len(train_loader)
     warmup_steps = args.warmup_epochs * len(train_loader)
 
@@ -266,44 +289,37 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
 
-    # ── LPIPS ─────────────────────────────────────────────────────────────────
+    # -- LPIPS -----------------------------------------------------------------
     from stage1.disc.lpips import LPIPS as LPIPS_
     lpips_all = LPIPS_().to(device).eval()
     for p in lpips_all.parameters():
         p.requires_grad_(False)
 
-    # ── Discriminator ─────────────────────────────────────────────────────────
+    # -- Discriminator ---------------------------------------------------------
     disc = DinoDiscriminator(
-        device=device,
-        dino_ckpt_path=args.disc_ckpt,
-        ks=1,
-        recipe="S_8",
-        norm_type="bn",
-        using_spec_norm=True,
+        device=device, dino_ckpt_path=args.disc_ckpt,
+        ks=1, recipe="S_8", norm_type="bn", using_spec_norm=True,
     ).to(device)
-    # Patch crop to handle 256×256 input (disc was designed for 224)
     from stage1.disc.utils import RandomWindowCrop
     disc.dino_proxy[0].crop = RandomWindowCrop(args.image_size, 224, 9, False)
     disc.dino_proxy[0].original_input_size = args.image_size
     disc_ddp = DDP(disc, device_ids=[local_rank])
     disc_aug = DiffAug(prob=0.5, cutout=True)
-    disc_optimizer = torch.optim.Adam(
-        disc.parameters(), lr=1e-4, betas=(0.5, 0.9)
-    )
+    disc_optimizer = torch.optim.Adam(disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
     disc_start_step = args.disc_start * len(train_loader)
     if is_main:
         n_disc = sum(p.numel() for p in disc.parameters()) / 1e6
         print(f"Discriminator: {n_disc:.1f}M  GAN starts at epoch {args.disc_start}")
 
-    # ── Auto-resume from latest checkpoint ────────────────────────────────────
+    # -- Auto-resume from latest checkpoint ------------------------------------
     start_epoch = 0
     global_step = 0
     latest = os.path.join(args.out_dir, "ckpt_latest.pt")
     if os.path.exists(latest):
         ckpt = torch.load(latest, map_location="cpu")
-        attn_res.load_state_dict(ckpt["attn_res"])
+        projector.load_state_dict(ckpt["projector"])
         decoder.load_state_dict(ckpt["decoder"])
-        ema_attn.load_state_dict(ckpt["ema_attn"])
+        ema_proj.load_state_dict(ckpt["ema_proj"])
         ema_dec.load_state_dict(ckpt["ema_dec"])
         disc.load_state_dict(ckpt["disc"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -313,44 +329,44 @@ def main():
         if is_main:
             print(f"Resumed from {latest}  (epoch={start_epoch}, step={global_step})")
 
-    # ── Precision ─────────────────────────────────────────────────────────────
+    # -- Precision -------------------------------------------------------------
     use_bf16 = (args.precision == "bf16")
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16)
     if is_main:
         print(f"Precision: {args.precision}")
 
-    # ── Training ──────────────────────────────────────────────────────────────
+    # -- Training --------------------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
-        attn_res_ddp.train(); decoder_ddp.train()
+        projector_ddp.train(); decoder_ddp.train()
         t0 = time.time()
 
         for step, (imgs, _) in enumerate(train_loader):
             imgs = imgs.to(device)
 
-            # DINOv3 encode (frozen) — get patch tokens from K layers
+            # frozen per-layer MLS tokens (no grad / no params)
             with torch.no_grad():
-                imgs_norm = (imgs - enc_mean) / enc_std
-                layer_out = encoder.model.get_intermediate_layers(
-                    imgs_norm, n=args.layers, return_class_token=False
-                )
-                patches_list = list(layer_out)   # already no-grad inside torch.no_grad()
-                # each: [B, 256, 1024]
+                layer_tokens = encode_layers(imgs)            # K x [B, 256, 1024]
 
             use_gan = (global_step >= disc_start_step) and (args.disc_weight > 0)
 
-            # ── Step A: Generator (attn_res + decoder) ─────────────────────────
+            # -- Step A: Generator (gated vae projector + decoder) -------------
             optimizer.zero_grad(set_to_none=True)
 
             with autocast_ctx:
-                z = attn_res_ddp(patches_list)                    # [B, 256, 1024]
+                mu, logvar = projector_ddp(layer_tokens)      # gate+combine+VAE head (trainable)
+                logvar = logvar.clamp(-30.0, 20.0)            # numerical stability
+                std = torch.exp(0.5 * logvar)
+                z = mu + std * torch.randn_like(std)          # reparameterize
                 dec_out = decoder_ddp(z, drop_cls_token=False).logits
                 x_rec   = (decoder_ddp.module.unpatchify(dec_out)
                            * enc_std + enc_mean).clamp(0, 1)
 
                 loss_l1    = F.l1_loss(x_rec, imgs)
                 loss_lpips = lpips_all(x_rec * 2 - 1, imgs * 2 - 1).mean()
-            loss_sig   = sigreg_loss(z.float().reshape(-1, args.latent_dim))
+            # KL(N(mu, sigma^2) || N(0, I)) in fp32: sum over latent dim, mean over B*N
+            mu_f, logvar_f = mu.float(), logvar.float()
+            loss_kl = (-0.5 * (1.0 + logvar_f - mu_f.pow(2) - logvar_f.exp())).sum(-1).mean()
             loss_rec   = loss_l1 + args.lpips_w * loss_lpips
 
             loss_gan = torch.zeros(1, device=device)
@@ -358,11 +374,9 @@ def main():
                 disc_ddp.eval()
                 half = max(1, x_rec.shape[0] // 2)
                 with autocast_ctx:
-                    # Generator step: NO detach — need grad for adaptive weight
                     fake_aug = disc_aug.aug(x_rec[:half] * 2 - 1)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                 loss_gan = vanilla_g_loss(logits_fake)
-                # last trainable decoder parameter as reference for adaptive weight
                 last_layer = next(reversed(list(decoder_ddp.module.parameters())))
                 adp_w = calculate_adaptive_weight(loss_rec, loss_gan, last_layer)
                 adp_w = adp_w.clamp(0, 1e4).detach()
@@ -370,7 +384,7 @@ def main():
                 adp_w = torch.tensor(0.0, device=device)
 
             loss = (loss_rec
-                    + args.sigreg_w * loss_sig
+                    + args.kl_w * loss_kl
                     + args.disc_weight * adp_w * loss_gan)
             loss.backward()
             if args.clip_grad > 0:
@@ -378,7 +392,7 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            # ── Step B: Discriminator ───────────────────────────────────────────
+            # -- Step B: Discriminator -----------------------------------------
             if use_gan:
                 disc_ddp.train()
                 disc_optimizer.zero_grad(set_to_none=True)
@@ -391,27 +405,31 @@ def main():
                 loss_d.backward()
                 disc_optimizer.step()
 
-            update_ema(ema_attn, attn_res, args.ema_decay)
-            update_ema(ema_dec,  decoder,  args.ema_decay)
+            update_ema(ema_proj, projector, args.ema_decay)
+            update_ema(ema_dec,  decoder,   args.ema_decay)
 
             global_step += 1
 
-            # ── logging ───────────────────────────────────────────────────────
+            # -- logging -------------------------------------------------------
             if is_main and global_step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 zd = gaussian_diag(z)
-                gate_sig = torch.sigmoid(attn_res.gate)
-                gate_val = gate_sig.mean().item()
-                gate_std = gate_sig.std().item()
+                ps = psnr(x_rec, imgs)
+                mu_abs  = mu.detach().float().abs().mean().item()
+                sigma_m = std.detach().float().mean().item()
+                gate_sig = torch.sigmoid(projector.gate).detach().tolist()  # per-layer openness
+                gate_str = " ".join(f"{v:.2f}" for v in gate_sig)
                 print(f"  ep{epoch+1} s{global_step}"
                       f"  loss={loss.item():.4e}"
                       f"  l1={loss_l1.item():.4e}"
                       f"  lpips={loss_lpips.item():.4e}"
-                      f"  sig={loss_sig.item():.4e}"
+                      f"  psnr={ps:.2f}"
+                      f"  kl={loss_kl.item():.4e}"
                       f"  gan={loss_gan.item():.4e}"
-                      f"  gate(μ={gate_val:.3f} σ={gate_std:.3f})"
-                      f"  z(μ={zd['mean']:.2f} σ={zd['std']:.2f})"
-                      f"  vard(μ={zd['var_mean']:.2f} σ={zd['var_disp']:.3f}) iso={zd['iso_disp']:.3f}"
+                      f"  gate=[{gate_str}]"
+                      f"  |mu|={mu_abs:.3f} sigma={sigma_m:.3f}"
+                      f"  z(mu={zd['mean']:.2f} sd={zd['std']:.2f})"
+                      f"  vard(mu={zd['var_mean']:.2f} sd={zd['var_disp']:.3f}) iso={zd['iso_disp']:.3f}"
                       f"  sk={zd['skew']:.3f} ku={zd['kurt']:.2f} d={zd['dead']}"
                       f"  lr={lr:.2e}", flush=True)
                 if args.wandb:
@@ -420,10 +438,11 @@ def main():
                         "train/loss":   loss.item(),
                         "train/l1":     loss_l1.item(),
                         "train/lpips":  loss_lpips.item(),
-                        "train/sigreg": loss_sig.item(),
+                        "train/psnr":   ps,
+                        "train/kl":     loss_kl.item(),
                         "train/gan_g":  loss_gan.item(),
                         "train/adp_w":  adp_w.item(),
-                        "train/gate":     gate_val, "train/gate_std": gate_std,
+                        "train/mu_abs": mu_abs, "train/sigma": sigma_m,
                         "train/z_mean":     zd["mean"], "train/z_std": zd["std"],
                         "train/z_var_mean": zd["var_mean"],
                         "train/z_var_disp": zd["var_disp"],
@@ -431,57 +450,52 @@ def main():
                         "train/z_skew":     zd["skew"], "train/z_kurt": zd["kurt"],
                         "train/z_dead":     zd["dead"],
                         "train/lr":     lr,
+                        **{f"train/gate_L{l}": v for l, v in zip(args.layers, gate_sig)},
                     }, step=global_step)
 
-
         if is_main:
-            print(f"Epoch {epoch+1}/{args.epochs}  "
-                  f"time={time.time()-t0:.0f}s", flush=True)
+            print(f"Epoch {epoch+1}/{args.epochs}  time={time.time()-t0:.0f}s", flush=True)
 
-        # ── fixed val images reconstruction ──────────────────────────────────
-        if is_main and val_patches_fixed is not None:
+        # -- fixed val images reconstruction (use posterior mean) --------------
+        if is_main and val_layers_fixed is not None:
             with torch.no_grad():
-                val_z   = ema_attn(val_patches_fixed)
-                val_dec = ema_dec(val_z, drop_cls_token=False).logits
-                val_rec = (ema_dec.unpatchify(val_dec)
-                           * enc_std + enc_mean).clamp(0, 1)   # [N, 3, H, W]
+                val_mu, _ = ema_proj(val_layers_fixed)        # deterministic: z = mu
+                val_dec   = ema_dec(val_mu, drop_cls_token=False).logits
+                val_rec   = (ema_dec.unpatchify(val_dec) * enc_std + enc_mean).clamp(0, 1)
+            val_ps = psnr(val_rec, val_img_orig)
+            print(f"  Val PSNR (EMA): {val_ps:.2f} dB", flush=True)
+            if args.wandb:
+                import wandb
+                wandb.log({"val/psnr": val_ps}, step=global_step)
 
             n = val_rec.shape[0]
             recon_dir = os.path.join(args.out_dir, "val_recon")
             os.makedirs(recon_dir, exist_ok=True)
-
-            # always overwrite latest
-            latest_path = os.path.join(args.out_dir, "recon_latest.png")
-            save_image(val_rec.cpu(), latest_path, nrow=n)
-
-            # keep permanent copy every 10 epochs
+            save_image(val_rec.cpu(), os.path.join(args.out_dir, "recon_latest.png"), nrow=n)
             if (epoch + 1) % 10 == 0:
                 out_path = os.path.join(recon_dir, f"epoch_{epoch+1}.png")
                 save_image(val_rec.cpu(), out_path, nrow=n)
-                print(f"  Val recon → {out_path}", flush=True)
+                print(f"  Val recon -> {out_path}", flush=True)
                 if args.wandb:
                     import wandb
-                    wandb.log({"val/recon": wandb.Image(
-                        out_path, caption=f"ep={epoch+1}"
-                    )}, step=global_step)
+                    wandb.log({"val/recon": wandb.Image(out_path, caption=f"ep={epoch+1}")},
+                              step=global_step)
 
-        # ── checkpoint ────────────────────────────────────────────────────────
+        # -- checkpoint --------------------------------------------------------
         if is_main:
             ckpt = {
-                "epoch":        epoch + 1,
-                "global_step":  global_step,
-                "attn_res":     attn_res.state_dict(),
-                "decoder":      decoder.state_dict(),
-                "ema_attn":     ema_attn.state_dict(),
-                "ema_dec":      ema_dec.state_dict(),
-                "disc":         disc.state_dict(),
-                "optimizer":    optimizer.state_dict(),
+                "epoch":          epoch + 1,
+                "global_step":    global_step,
+                "projector":      projector.state_dict(),
+                "decoder":        decoder.state_dict(),
+                "ema_proj":       ema_proj.state_dict(),
+                "ema_dec":        ema_dec.state_dict(),
+                "disc":           disc.state_dict(),
+                "optimizer":      optimizer.state_dict(),
                 "disc_optimizer": disc_optimizer.state_dict(),
-                "layers":       args.layers,
+                "layers":         args.layers,
             }
-            # always overwrite latest (for resume)
             torch.save(ckpt, os.path.join(args.out_dir, "ckpt_latest.pt"))
-            # keep permanent copy every ckpt_every epochs
             if (epoch + 1) % args.ckpt_every == 0:
                 ckpt_path = os.path.join(args.out_dir, f"ckpt_ep{epoch+1:03d}.pt")
                 torch.save(ckpt, ckpt_path)
