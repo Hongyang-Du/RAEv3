@@ -54,9 +54,11 @@ def main():
     rae = instantiate_from_config(config.stage_1).to(device)
     rae.eval()
 
-    # same pipeline stage-2 training feeds rae.encode (hf dataset default transform)
+    # same pipeline stage-2 training feeds rae.encode (hf loader default transform);
+    # CenterCrop is required: the local arrow images are short-side-256, not square
     transform = transforms.Compose([
         transforms.Resize(args.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(args.image_size),
         transforms.ToTensor(),
     ])
     dataset = ImageNetHFDataset(data_dir=args.data_dir, split="train", transform=transform)

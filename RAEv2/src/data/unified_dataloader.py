@@ -400,10 +400,13 @@ def _prepare_imagenet_loader(
     data_dir = config.get("data_dir", "./data/imagenet-256")
     split = config.get("split", "train")
 
-    # Build transform if not provided
+    # Build transform if not provided. CenterCrop matters: local arrow images are
+    # short-side-256 (not pre-square-cropped), and Resize(int) keeps aspect ratio,
+    # so without the crop the default collate crashes on unequal sizes.
     if transform is None:
         transform = transforms.Compose([
             transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
         ])
 

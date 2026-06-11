@@ -236,6 +236,14 @@ def train_one_epoch(
                             viz_fixed['attn_mask'].clone() if viz_fixed['attn_mask'] is not None else None,
                             **sample_args,
                         )
+                    # save sample grids locally (wandb-independent visualization)
+                    from torchvision.utils import save_image as _save_image
+                    sample_dir = os.path.join(experiment_dir, "samples")
+                    os.makedirs(sample_dir, exist_ok=True)
+                    for name, samples in samples_dict.items():
+                        out_png = os.path.join(sample_dir, f"{name.replace('/', '_')}_s{global_step:07d}.png")
+                        _save_image(samples.clamp(0, 1), out_png, nrow=round(samples.shape[0] ** 0.5))
+                    logger.info(f"Saved sample grids to {sample_dir} (step {global_step})")
                     if args.wandb: # log samples to wandb
                         for name, samples in samples_dict.items():
                             grid = wandb_utils.array2grid(samples)

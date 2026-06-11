@@ -3,7 +3,7 @@
 ## Meta
 - **Phase**: Experiment
 - **Target**: TBD
-- **Last Updated**: 2026-06-10
+- **Last Updated**: 2026-06-11
 - **Updated By**: dgx session
 
 ## Current Focus
@@ -18,7 +18,7 @@ combine (dropmean).
 | mls_raev2 | fixed mean, no SIGReg | done (5 ep) | 25.98 | baseline |
 | mls_nogate_sigreg | fixed mean + projector + SIGReg | done (5 ep) | 26.02 | SIGReg ~free vs baseline |
 | mls_softgate_sigreg | softmax gate + per-step layer-drop 0.2 | KILLED at ep3 | 27.57 (ep3) | gate collapsed to [0.98 0.02 0 ...] = L11 only; higher PSNR is the shallow-layer hack, defeats fusion |
-| mls_dropmean_sigreg | NO gate; per-sample random-subset equal-weight mean, layer_drop 0.3 | running (started 2026-06-10) | — | collapse structurally impossible (no learnable weight) |
+| mls_dropmean_sigreg | NO gate; per-sample random-subset equal-weight mean, layer_drop 0.3 | done (5 ep) | 25.80 | collapse-free; only 0.22 dB below nogate |
 
 All runs: imagenet-256-full, 8 GPU, batch 32/GPU, 5 epochs, bf16, lr 8e-4, ViT-XL decoder,
 L1+LPIPS+GAN+SIGReg(w=1). Logs: `RAEv2/output_full/<run>/train.log`; compare plot:
@@ -67,6 +67,34 @@ L1+LPIPS+GAN+SIGReg(w=1). Logs: `RAEv2/output_full/<run>/train.log`; compare plo
   seeded loader), + stage-1 decode ceiling. Cross-run comparable (latent losses are
   not). In stage2/engine.py + stage2/utils.denoise_probe; plot_dit_progress.py compares
   the 3 logs. SIGReg advantage, if real, should show first at large t.
+
+## L11-only control (shallowest layer, decoder + DiT) — built, not launched
+- 2026-06-11: control for "are the deeper layers / multi-layer mix actually needed?"
+  Same raev2 recipe end to end, layers=[11] only (dinov3mls combine on one layer =
+  L11 tokens + L11 token-mean surrogate). Records decoder val PSNR, DiT denoise
+  probes, and generation FID.
+- New: `run_train_decoder_mls_l11.sh` (stage-1, reuses train_decoder_mls.py --layers 11,
+  -> output_full/train_decoder_mls_l11), config `imagenet-dinov3l-l11-raev2mls.yaml`,
+  `l11` variant in run_train_dit.sh (EXPERIMENT_NAME=dit-l11), `src/eval_fid_dit.py`
+  (offline generation FID: N class-balanced EMA samples vs N real train images,
+  torch-fidelity, fixed seed — use same N/seed across variants for comparison),
+  master `run_l11_ablation.sh` (decoder -> DiT -> FID -> summary; auto-resumes).
+- Queue AFTER the current 3-run DiT queue finishes (uses all 8 GPUs).
+
+## E2E joint training (projector + decoder + DiT) — built, queued behind baselines
+- 2026-06-10: `src/train_e2e_sigreg_dit.py` + `run_train_e2e_sigreg_dit.sh`. User's
+  design: NO stop-grad / NO EMA target — SIGReg pins latent geometry, recon pins
+  information; generation gradients reach the projector via (a) FM target, (b) xt
+  interpolation, (c) L_pix = d(dec(zhat), dec(z)) [target = reconstruction, NOT GT].
+  L = w_rec·(L1+LPIPS)(dec(z),GT) + SIGReg(z) + w_fm·|zhat-z|²/t² (+IG base head)
+      + w_pix·(L1+LPIPS)(dec(zhat), dec(z))
+- Safety valves (flags, default OFF): --detach-fm-target / --detach-xt /
+  --detach-pix-target / --pix-t-weight. Collapse alarm = falling per-epoch Val PSNR.
+- Verified in container: full backward grads proj=1564/dec=4165/dit=1025; isolated
+  pixel-FM path alone delivers projector grad 420.8 (>0, the design's core claim);
+  Euler sampler OK. Probe line formats match plot_val_psnr.py + plot_dit_progress.py.
+- Warm-start: nogate stage-1 by default (INIT_STAGE1 var; switch to dropmean when done).
+  DiT from scratch (INIT_DIT optional). 10 ep, batch 24/GPU, AdamW(pd)+gmuon(DiT).
 
 ## Next Steps
 - [ ] Monitor dropmean stage-1 (ep2-5 w/ layer-usage probe): `RAEv2/output_full/train_decoder_mls_dropmean_sigreg/train.log`

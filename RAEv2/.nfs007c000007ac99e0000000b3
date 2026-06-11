@@ -14,7 +14,7 @@
 # ============================================================
 set -euo pipefail
 
-VARIANT=${1:?usage: run_train_dit.sh raev2mls|nogate|dropmean|l11}
+VARIANT=${1:?usage: run_train_dit.sh raev2mls|nogate|dropmean}
 
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
@@ -34,10 +34,6 @@ case "${VARIANT}" in
     CONFIG=configs/stage2/training/imagenet-dinov3l-k7-dropmean-sigreg.yaml
     S1_DIR=output_full/train_decoder_mls_dropmean_sigreg
     ;;
-  l11)
-    CONFIG=configs/stage2/training/imagenet-dinov3l-l11-raev2mls.yaml
-    S1_DIR=output_full/train_decoder_mls_l11
-    ;;
   *) echo "unknown variant: ${VARIANT}"; exit 1 ;;
 esac
 
@@ -45,12 +41,7 @@ esac
 NGPU=8
 DATA=/datasets/imagenet-256-full
 RESULTS_DIR=ckpts_full/stage2
-# l11 is a single-layer control, so no -k7 suffix
-if [[ "${VARIANT}" == "l11" ]]; then
-    export EXPERIMENT_NAME=dit-l11
-else
-    export EXPERIMENT_NAME=dit-${VARIANT}-k7
-fi
+export EXPERIMENT_NAME=dit-${VARIANT}-k7
 STATS=${S1_DIR}/latent_stats.pt
 S1_CKPT=${S1_DIR}/ckpt_latest.pt
 NUM_STATS_SAMPLES=250000

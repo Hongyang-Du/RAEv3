@@ -1,20 +1,19 @@
-# Stage-2 DiT on the MLS dropmean+SIGReg stage-1 (latent = frozen EMA projector output).
-# Identical to imagenet-dinov3l-k7.yaml except:
-#   - stage_1 -> RAEProjected wrapper (ema_proj + ema_dec; decode de-normalizes
-#     ImageNet stats, which our stage-1 decoders require, unlike the official decoder)
-#   - dataset.data_dir -> local full ImageNet arrow
-#   - eval section removed (no val split / reference npz on this box)
-#   - 10-epoch screening schedule (warmup 3, decay->ep6); ckpt every 2 ep (~10 GB each)
+# Stage-2 DiT on the L11-ONLY stage-1 control (run_train_decoder_mls_l11.sh).
+# Identical to imagenet-dinov3l-k7-raev2mls.yaml except:
+#   - encoder uses ONLY DINOv3-L layer 11 (shallowest of the K7 set);
+#     the dinov3mls combine on one layer = L11 tokens + L11 token-mean surrogate
+#   - stage_1 ckpt/stats -> output_full/train_decoder_mls_l11
+# Control for: does diffusion benefit from the deeper layers / multi-layer mix?
 stage_1:
-  target: stage1.RAEProjected
+  target: stage1.RAEMLSBaseline
   params:
-    encoder_name: dinov3mls-vit-l16[layers=11.13.15.17.19.21.23]
+    encoder_name: dinov3mls-vit-l16[layers=11]
     resolution: 256
     decoder_config_path: configs/decoder/ViTXL
-    stage1_ckpt_path: output_full/train_decoder_mls_dropmean_sigreg/ckpt_latest.pt
+    stage1_ckpt_path: output_full/train_decoder_mls_l11/ckpt_latest.pt
     use_ema: true
     latent_dim: 1024
-    normalization_stat_path: output_full/train_decoder_mls_dropmean_sigreg/latent_stats.pt
+    normalization_stat_path: output_full/train_decoder_mls_l11/latent_stats.pt
 stage_2:
   target: stage2.models.DDT.DiTwDDTHeadIG
   params:

@@ -60,7 +60,7 @@ dataset:
 training:
   epochs: 10
   global_batch_size: 1024
-  grad_accum_steps: 1
+  grad_accum_steps: 2
   ema_decay: 0.9995
   num_workers: 4
   log_interval: 100

@@ -23,7 +23,8 @@ run_one () {
     echo "##################################################################"
     mkdir -p "${outdir}"
     bash run_train_dit.sh "${variant}" > "${outdir}/train.log" 2>&1
-    echo "#####  $(date '+%F %T')  DONE   dit-${variant} (exit $?)  ->  ${outdir}/train.log"
+    local rc=$?
+    echo "#####  $(date '+%F %T')  DONE   dit-${variant} (exit ${rc})  ->  ${outdir}/train.log"
     cleanup
 }
 

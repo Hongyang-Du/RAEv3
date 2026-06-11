@@ -8,6 +8,7 @@
 RAE/output/
 RAEv2/output/
 RAEv2/output_full/
+RAEv2/ckpts_full/
 RAE/wandb/
 RAEv2/wandb/
 comparison_results/
