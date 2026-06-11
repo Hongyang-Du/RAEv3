@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from configs.stage2 import Stage2Config
 from stage2 import nwm_cond
 from stage2.utils import (
+    denoise_probe,
     encode_text,
     get_fixed_viz_batch_conditions,
     get_null_cond,
@@ -126,7 +127,11 @@ def train_one_epoch(
                 if viz_fixed['context'] is None:
                     viz_fixed['context'] = nwm_cond.viz_context(y, viz_fixed['zs'].shape[0], rae, device)
             else:
+                first_capture = viz_fixed['context'] is None
                 viz_fixed = get_fixed_viz_batch_conditions(viz_fixed, y, config.conditioning.type, text_encoder, device)
+                # fixed images (aligned with the captured labels) for the denoise probe
+                if first_capture and config.conditioning.type == "label":
+                    viz_fixed['probe_imgs'] = images[:viz_fixed['zs'].shape[0]].clone()
 
         # Encode conditions
         if config.conditioning.type == "text":
@@ -273,6 +278,23 @@ def train_one_epoch(
             model.train() # set model back to train mode
             logger.info("Evaluation done.")
 
+
+    #########################################################
+    # Denoise probe — pixel-space PSNR of EMA x-prediction at a fixed t grid.
+    # The cross-run comparable progress metric (latent losses are not comparable
+    # across different stage-1 latent spaces; pixel space is shared).
+    #########################################################
+    if (rank == 0 and viz_fixed is not None and config.conditioning.type == "label"
+            and config.transport.prediction == "x"
+            and viz_fixed.get('probe_imgs') is not None):
+        probe = denoise_probe(ema_model, rae, viz_fixed, autocast_kwargs)
+        if probe is not None:
+            t_grid = [k for k in probe if k != 'ceiling']
+            grid = "  ".join(f"t{int(t*100)}={probe[t]:.2f}" for t in t_grid)
+            logger.info(f"[Epoch {epoch}] Denoise PSNR (EMA): {grid}  ceil={probe['ceiling']:.2f} dB")
+            if args.wandb:
+                wandb_utils.log({**{f"val/denoise_psnr_t{int(t*100)}": probe[t] for t in t_grid},
+                                 "val/denoise_psnr_ceiling": probe['ceiling']}, step=global_step)
 
     #########################################################
     # Epoch summary

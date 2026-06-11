@@ -98,6 +98,43 @@ def get_fixed_viz_batch_conditions(viz_fixed, y, condition_type, text_encoder, d
     return viz_fixed
 
 
+def _psnr01(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (10 * torch.log10(1.0 / torch.mean((a - b) ** 2))).item()
+
+
+@torch.no_grad()
+def denoise_probe(ema_model, rae, viz_fixed, autocast_kwargs,
+                  t_values=(0.25, 0.5, 0.75, 0.95)):
+    """Pixel-space denoising PSNR of the EMA model's x-prediction at a fixed t grid.
+
+    The cross-run comparable "val PSNR" for stage-2: latent-space losses are not
+    comparable across different stage-1 latent spaces, but decoding x-predictions of
+    the SAME fixed images + noise through each run's own decoder lands everything in
+    shared pixel space. 'ceiling' = decode(z) PSNR, the stage-1 reconstruction bound
+    the t->0 end converges to. Requires transport.prediction == 'x'.
+    """
+    imgs = viz_fixed.get('probe_imgs')
+    if imgs is None:
+        return None
+    if viz_fixed.get('probe_z') is None:
+        viz_fixed['probe_z'] = rae.encode(imgs)
+        rec = rae.decode(viz_fixed['probe_z']).float().clamp(0, 1)
+        viz_fixed['probe_ceiling'] = _psnr01(rec, imgs)
+    z = viz_fixed['probe_z']
+    eps = viz_fixed['zs'][:z.shape[0]].to(z.dtype)
+    out = {'ceiling': viz_fixed['probe_ceiling']}
+    for tv in t_values:
+        xt = (1 - tv) * z + tv * eps
+        tt = torch.full((z.shape[0],), tv, device=z.device)
+        with autocast(**autocast_kwargs):
+            pred = ema_model(xt, tt, context=viz_fixed['context'], attn_mask=None)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+        img = rae.decode(pred.float()).clamp(0, 1)
+        out[tv] = _psnr01(img, imgs)
+    return out
+
+
 def sample_and_decode(
     zs, context, attn_mask,
     eval_sampler, model_fn, sample_model_kwargs, rae,

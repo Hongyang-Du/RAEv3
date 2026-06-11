@@ -1,0 +1,94 @@
+# Stage-2 DiT on the MLS nogate+SIGReg stage-1 (latent = frozen EMA projector output).
+# Identical to imagenet-dinov3l-k7.yaml except:
+#   - stage_1 -> RAEProjected wrapper (ema_proj + ema_dec; decode de-normalizes
+#     ImageNet stats, which our stage-1 decoders require, unlike the official decoder)
+#   - dataset.data_dir -> local full ImageNet arrow
+#   - eval section removed (no val split / reference npz on this box)
+#   - 10-epoch screening schedule (warmup 3, decay->ep6); ckpt every 2 ep (~10 GB each)
+stage_1:
+  target: stage1.RAEProjected
+  params:
+    encoder_name: dinov3mls-vit-l16[layers=11.13.15.17.19.21.23]
+    resolution: 256
+    decoder_config_path: configs/decoder/ViTXL
+    stage1_ckpt_path: output_full/train_decoder_mls_nogate_sigreg/ckpt_latest.pt
+    use_ema: true
+    latent_dim: 1024
+    normalization_stat_path: output_full/train_decoder_mls_nogate_sigreg/latent_stats.pt
+stage_2:
+  target: stage2.models.DDT.DiTwDDTHeadIG
+  params:
+    input_size: 16
+    patch_size:
+    - 1
+    - 1
+    in_channels: 1024
+    hidden_size:
+    - 1440
+    - 2048
+    depth:
+    - 28
+    - 2
+    num_heads:
+    - 20
+    - 16
+    mlp_ratio: 4.0
+    base_model_depth: 8
+conditioning:
+  type: label
+  cfg_dropout_prob: 0.1
+  arch:
+    num_t_tokens: 4
+    num_c_tokens: 8
+transport:
+  prediction: x
+  time_dist_type: logit-normal_0_1
+sampler:
+  num_steps: 50
+guidance:
+  cfg:
+    scale: 1.0
+    t_min: 0.0
+    t_max: 1.0
+dataset:
+  target: imagenet
+  type: hf
+  data_dir: /datasets/imagenet-256-full
+  split: train
+  condition_type: label
+  shared_tmpdir: ~/tmp
+training:
+  epochs: 10
+  global_batch_size: 1024
+  grad_accum_steps: 1
+  ema_decay: 0.9995
+  num_workers: 4
+  log_interval: 100
+  checkpoint_interval: 2
+  sample_every: 2500
+  clip_grad: 1.0
+  global_seed: 42
+  optimizer:
+    type: gmuon
+    lr: 0.0002
+    momentum: 0.95
+    nesterov: true
+    ns_coefficients_preset: POLAR_EXPRESS_COEFFICIENTS
+    ns_use_kernels: false
+    weight_decay: 0.0
+  scheduler:
+    type: linear
+    warmup_epochs: 3
+    decay_end_epoch: 6
+    base_lr: 0.0002
+    final_lr: 2.0e-05
+    warmup_from_zero: false
+  image_size: 256
+misc:
+  latent_size:
+  - 1024
+  - 16
+  - 16
+  num_classes: 1000
+  time_dist_shift_dim: 262144
+  time_dist_shift_base: 4096

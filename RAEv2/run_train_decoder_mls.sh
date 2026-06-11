@@ -21,10 +21,10 @@ cd "$(dirname "$(realpath "$0")")"
 
 # -- config ---------------------------------------------------
 NGPU=8
-DATA=/datasets/imagenet-256
-OUT_DIR=output/train_decoder_mls_raev2
+DATA=/datasets/imagenet-256-full
+OUT_DIR=output_full/train_decoder_mls_raev2
 
-EPOCHS=50
+EPOCHS=5
 BATCH=32                 # per GPU; global = BATCH x NGPU
 LR=8e-4
 PRECISION=bf16           # bf16 saves ~50% memory, same accuracy on A100
@@ -34,7 +34,7 @@ LPIPS_W=1.0
 DISC_WEIGHT=0.75
 DISC_START=1             # epoch to start GAN (disc uses half-batch to save memory)
 
-CKPT_EVERY=10           # keep a permanent ckpt every N epochs (ckpt_latest always saved)
+CKPT_EVERY=1             # keep a permanent ckpt every N epochs (ckpt_latest always saved)
 VAL_EVERY=500            # log val images every N steps
 LOG_EVERY=50
 VAL_IMAGE=assets/samples/sample_1.png  # fixed images (dir globbed) to track recon quality
@@ -42,7 +42,7 @@ VAL_IMAGE=assets/samples/sample_1.png  # fixed images (dir globbed) to track rec
 WANDB=true
 export WANDB_BASE_URL=https://api.wandb.ai
 export WANDB_API_KEY=$(grep -A2 'api.wandb.ai' ~/.netrc | grep password | awk '{print $2}')
-WANDB_PROJECT=raev3
+WANDB_PROJECT=raev3-full
 WANDB_ENTITY=uscgvl
 # -------------------------------------------------------------
 

@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
 # ============================================================
-#  raev2 MLS + learnable VAE Projector(KL) + Decoder training
-#  (src/train_decoder_mls_kl.py)
+#  raev2 SOFTMAX-gated MLS (+ layer dropout) + Projector(SIGReg) + Decoder
+#  (src/train_decoder_mls_softgate_sigreg.py)  -- ANTI-COLLAPSE gate
 #
 #  Encoder:  DINOv3-L (frozen, layers 11,13,15,17,19,21,23)
-#  Combine:  raev2 dinov3mls multi-layer sum (frozen, no params)
-#  Project:  learnable VAE head -> (mu, logvar), reparam z=mu+sigma*eps
+#  Combine:  softmax convex weighting over K layers + per-step layer dropout
+#  Project:  learnable per-token residual MLP  <- SIGReg shapes its output
 #  Decoder:  ViT-XL (trained from scratch)
-#  Reg:      KL(N(mu,sigma^2) || N(0,I))   (LDM / diffusion-VAE style)
-#  Loss:     L1 + LPIPS + GAN + kl_w * KL
+#  Reg:      SIGReg (1024 random projections, multi-frequency Epps-Pulley)
+#  Loss:     L1 + LPIPS + GAN + sigreg_w * SIGReg
 # ============================================================
 set -euo pipefail
 
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
 PYTHON=${CONDA_ENV}/bin/python
-SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls_kl.py
+SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls_softgate_sigreg.py
 
 cd "$(dirname "$(realpath "$0")")"
 
 # ── config ───────────────────────────────────────────────────
 NGPU=8
 DATA=/datasets/imagenet-256-full
-OUT_DIR=output_full/train_decoder_mls_kl
+OUT_DIR=output_full/train_decoder_mls_softgate_sigreg
 
 EPOCHS=5
 BATCH=32                # per GPU; global = BATCH × NGPU
 LR=8e-4
 PRECISION=bf16
-LAYERS="11 13 15 17 19 21 23"   # DINOv3-L layers to combine (K7); e.g. "23" = last layer only
+LAYERS="11 13 15 17 19 21 23"   # DINOv3-L layers to combine (K7)
 
-KL_W=1e-6               # LDM-style; re-tune (KL summed over latent dim)
+SIGREG_W=1              # re-tuned for the 1024-proj / multi-freq SIGReg
+LAYER_DROP=0.2         # per-step layer-dropout prob (anti-collapse); 0 disables
 LPIPS_W=1.0
 DISC_WEIGHT=0.75
 DISC_START=1
@@ -48,9 +49,9 @@ WANDB_ENTITY=uscgvl
 # ─────────────────────────────────────────────────────────────
 
 echo "========================================================"
-echo "  MLS + VAE Projector(KL) + Decoder training"
+echo "  SOFTMAX-gated MLS (+layer dropout) + Projector(SIGReg) + Decoder"
 echo "  GPUs:      ${NGPU}   Batch: ${BATCH}/GPU (global $((BATCH * NGPU)))"
-echo "  Epochs:    ${EPOCHS}  |  Precision: ${PRECISION}  |  kl_w: ${KL_W}"
+echo "  Epochs:    ${EPOCHS}  |  Precision: ${PRECISION}  |  sigreg_w: ${SIGREG_W}  |  layer_drop: ${LAYER_DROP}"
 echo "  Data:      ${DATA}"
 echo "  Output:    ${OUT_DIR}"
 echo "  wandb:     ${WANDB} (${WANDB_ENTITY}/${WANDB_PROJECT})"
@@ -76,7 +77,8 @@ PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU}
     --precision   "${PRECISION}" \
     --lr          "${LR}" \
     --layers      ${LAYERS} \
-    --kl-w        "${KL_W}" \
+    --sigreg-w    "${SIGREG_W}" \
+    --layer-drop  "${LAYER_DROP}" \
     --lpips-w     "${LPIPS_W}" \
     --disc-weight "${DISC_WEIGHT}" \
     --disc-start  "${DISC_START}" \
