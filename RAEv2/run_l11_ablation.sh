@@ -72,6 +72,7 @@ CUDA_VISIBLE_DEVICES=0 ${PYTHON} src/eval_fid_dit.py \
     --ckpt   "${CKPT}" \
     --data   /datasets/imagenet-256-full \
     --num-samples 10000 \
+    --batch  256 \
     --grid   "${S2_DIR}/samples/fid_grid.png" \
     --out    "${S2_DIR}/fid.json" \
     2>&1 | tee "${S2_DIR}/fid.log"

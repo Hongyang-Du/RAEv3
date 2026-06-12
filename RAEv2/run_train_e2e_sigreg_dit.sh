@@ -10,6 +10,8 @@
 # ============================================================
 set -euo pipefail
 
+VARIANT=${1:-nodrop}    # nodrop | drop
+
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
 PYTHON=${CONDA_ENV}/bin/python
@@ -20,7 +22,20 @@ cd "$(dirname "$(realpath "$0")")"
 # ── config ───────────────────────────────────────────────────
 NGPU=8
 DATA=/datasets/imagenet-256-full
-OUT_DIR=output_full/train_e2e_sigreg_dit
+
+case "${VARIANT}" in
+  nodrop)   # plain mean (nogate-style), deterministic FM target
+    OUT_DIR=output_full/train_e2e_nodrop
+    LAYER_DROP=0.0
+    INIT_STAGE1=output_full/train_decoder_mls_nogate_sigreg/ckpt_latest.pt
+    ;;
+  drop)     # dropmean-style random layer dropout 0.3 (stochastic FM target)
+    OUT_DIR=output_full/train_e2e_drop
+    LAYER_DROP=0.3
+    INIT_STAGE1=output_full/train_decoder_mls_dropmean_sigreg/ckpt_latest.pt
+    ;;
+  *) echo "unknown variant: ${VARIANT} (use nodrop|drop)"; exit 1 ;;
+esac
 
 EPOCHS=10
 BATCH=24                # per GPU; e2e holds DiT+decoder+projector -> heavier than either stage
@@ -31,10 +46,12 @@ PRECISION=bf16
 W_REC=1.0
 SIGREG_W=1
 W_FM=1.0
-W_PIX=0.5
+W_PIX=0.0               # 0 = minimal design (recon + SIGReg + latent FM w/ live target;
+                        # FM alone already updates DiT AND projector). >0 adds the
+                        # pixel-FM branch dec(zhat) vs dec(z): perceptual reweighting,
+                        # costs a 2nd decoder forward + 2nd LPIPS per step.
 EXTRA_FLAGS=""          # safety valves: --detach-fm-target --detach-xt --detach-pix-target --pix-t-weight
 
-INIT_STAGE1=output_full/train_decoder_mls_nogate_sigreg/ckpt_latest.pt   # or dropmean ckpt
 INIT_DIT=""             # optional: ckpts_full/stage2/dit-nogate-k7/checkpoints/ep-XXXXXXX.pt
 
 CKPT_EVERY=2
@@ -50,8 +67,9 @@ WANDB_ENTITY=uscgvl
 # ─────────────────────────────────────────────────────────────
 
 echo "========================================================"
-echo "  E2E projector(SIGReg)+decoder+DiT  |  GPUs: ${NGPU}  Batch: ${BATCH}/GPU (global $((BATCH * NGPU)))"
-echo "  Epochs: ${EPOCHS}  |  lr_pd ${LR_PD}  lr_dit ${LR_DIT}  |  w_fm ${W_FM}  w_pix ${W_PIX}"
+echo "  E2E projector(SIGReg)+decoder+DiT  variant=${VARIANT}"
+echo "  GPUs: ${NGPU}  Batch: ${BATCH}/GPU (global $((BATCH * NGPU)))"
+echo "  Epochs: ${EPOCHS}  |  lr_pd ${LR_PD}  lr_dit ${LR_DIT}  |  w_fm ${W_FM}  w_pix ${W_PIX}  layer_drop ${LAYER_DROP}"
 echo "  Init stage-1: ${INIT_STAGE1}"
 echo "  Output: ${OUT_DIR}"
 echo "========================================================"
@@ -82,6 +100,7 @@ PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU}
     --sigreg-w     "${SIGREG_W}" \
     --w-fm         "${W_FM}" \
     --w-pix        "${W_PIX}" \
+    --layer-drop   "${LAYER_DROP}" \
     --init-stage1  "${INIT_STAGE1}" \
     --ckpt-every   "${CKPT_EVERY}" \
     --log-every    "${LOG_EVERY}" \

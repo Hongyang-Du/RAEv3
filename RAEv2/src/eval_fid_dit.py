@@ -133,8 +133,6 @@ def main():
     ap.add_argument("--batch",       type=int, default=64)
     ap.add_argument("--steps",       type=int, default=50)
     ap.add_argument("--seed",        type=int, default=42)
-    ap.add_argument("--cfg-scale",   type=float, default=None,
-                    help="Override guidance.cfg.scale (default: config value, 1.0 = none)")
     ap.add_argument("--raw",         action="store_true", help="Use raw weights instead of EMA")
     ap.add_argument("--grid",        default=None, help="Optional PNG path for a 64-sample grid")
     ap.add_argument("--out",         default=None, help="Optional JSON path for the result")
@@ -147,8 +145,10 @@ def main():
         OmegaConf.merge(OmegaConf.structured(Stage2Config), OmegaConf.load(args.config)))
     config.post_process()
     config.prepare_model_params()
-    if args.cfg_scale is not None:
-        config.guidance.cfg.scale = args.cfg_scale
+    # NOTE: this repo's simplified sampler applies NO guidance at inference —
+    # the IG base head output is discarded (transport.get_drift takes tuple[0])
+    # and there is no cond/uncond double forward. All FID numbers are
+    # plain conditional Euler sampling.
 
     gen_arr, epoch = generate(args, config, device)
     ref_arr = load_reference(args, config.training.image_size)
@@ -163,7 +163,7 @@ def main():
         "num_samples": args.num_samples,
         "steps": args.steps,
         "seed": args.seed,
-        "cfg_scale": args.cfg_scale if args.cfg_scale is not None else config.guidance.cfg.scale,
+        "guidance": "none (plain conditional Euler)",
         "weights": "raw" if args.raw else "ema",
     }
     print(f"FID = {fid:.3f}  ({args.num_samples} gen vs {args.num_samples} real, "

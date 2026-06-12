@@ -63,8 +63,16 @@ from utils.optim_utils import build_optimizer
 # --- Projector (nogate: plain mean over K layers + residual MLP) ---------------
 
 class MLSProjector(nn.Module):
-    def __init__(self, dim: int = 1024, out_dim: int = 1024, mult: int = 4):
+    """p_drop > 0 enables dropmean-style per-sample random layer dropout
+    (train mode only): Bernoulli keep mask per (layer, sample), >=1 layer kept,
+    equal weights renormalized over the kept subset. Eval / EMA always use the
+    full mean. NOTE: with dropout on, z is stochastic -> the FM target jitters
+    (same image, different z), which raises the irreducible FM loss floor."""
+
+    def __init__(self, dim: int = 1024, out_dim: int = 1024, mult: int = 4,
+                 p_drop: float = 0.0):
         super().__init__()
+        self.p_drop = p_drop
         self.skip = nn.Linear(dim, out_dim) if dim != out_dim else nn.Identity()
         self.norm = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -74,7 +82,17 @@ class MLSProjector(nn.Module):
         )
 
     def forward(self, layer_tokens) -> torch.Tensor:        # K x [B, N, dim] -> [B, N, out_dim]
-        z0 = torch.stack(layer_tokens, dim=0).mean(0)
+        stk = torch.stack(layer_tokens, dim=0)               # [K, B, N, dim]
+        if self.training and self.p_drop > 0:
+            K, B = stk.shape[0], stk.shape[1]
+            keep = torch.rand(K, B, device=stk.device) > self.p_drop
+            dead = ~keep.any(0)
+            if dead.any():
+                keep[torch.randint(K, (int(dead.sum()),), device=stk.device), dead] = True
+            w = keep.float() / keep.float().sum(0, keepdim=True)
+            z0 = (w.view(K, B, 1, 1) * stk).sum(0)
+        else:
+            z0 = stk.mean(0)
         return self.skip(z0) + self.ffn(self.norm(z0))
 
 
@@ -167,6 +185,9 @@ def main():
     parser.add_argument("--t-shift",       type=float, default=8.0)
     parser.add_argument("--t-eps",         type=float, default=0.05)
     # safety valves (default OFF = pure user design)
+    parser.add_argument("--layer-drop",    type=float, default=0.0,
+                        help="dropmean-style random layer dropout prob (0 = off, plain mean). "
+                             "Train-time only; makes z stochastic -> FM target jitters.")
     parser.add_argument("--detach-fm-target",  action="store_true")
     parser.add_argument("--detach-xt",         action="store_true")
     parser.add_argument("--detach-pix-target", action="store_true")
@@ -215,7 +236,8 @@ def main():
     if args.wandb and is_main:
         import wandb
         wandb.init(project=args.wandb_project, entity=args.wandb_entity,
-                   name=f"e2e-sigreg-dit-k{len(args.layers)}",
+                   name=f"e2e-sigreg-dit-k{len(args.layers)}"
+                        + (f"-drop{args.layer_drop}" if args.layer_drop > 0 else ""),
                    config={**vars(args), "global_batch": args.batch_size * world_size},
                    tags=["e2e", "sigreg", "dit", "stage1+2", f"k{len(args.layers)}"])
 
@@ -245,7 +267,8 @@ def main():
                 return_class_token=False, norm=True))
 
     # -- Trainable: projector + decoder + DiT -----------------------------------
-    projector = MLSProjector(dim=encoder.hidden_size, out_dim=args.latent_dim).to(device)
+    projector = MLSProjector(dim=encoder.hidden_size, out_dim=args.latent_dim,
+                             p_drop=args.layer_drop).to(device)
 
     from stage1.rae import _load_decoder
     decoder = _load_decoder("configs/decoder/ViTXL", hidden_size=args.latent_dim,
@@ -396,16 +419,21 @@ def main():
                 loss_fm = (w_t * (zhat - z_tg) ** 2).mean() \
                         + args.base_coeff * (w_t * (zhat_base - z_tg) ** 2).mean()
 
-                # pixel-space FM: decode(zhat) vs decode(z) — NOT GT (user's design:
-                # this is the channel through which generation shapes the projector)
-                x_gen = decode_imgs(decoder_ddp, spatial_to_tokens(zhat))
-                pix_target = x_rec.detach() if args.detach_pix_target else x_rec
-                pix_l1    = F.l1_loss(x_gen, pix_target, reduction="none").mean(dim=(1,2,3))
-                pix_lpips = lpips_all(x_gen * 2 - 1, pix_target * 2 - 1).view(-1)
-                pix = pix_l1 + pix_lpips
-                if args.pix_t_weight:
-                    pix = pix * (1 - t)
-                loss_pix = pix.mean()
+                # OPTIONAL pixel-space FM: decode(zhat) vs decode(z) — NOT GT.
+                # Not needed for gradient flow (the live FM target already updates
+                # the projector); only adds perceptual reweighting of latent errors,
+                # at the cost of a 2nd decoder forward + 2nd LPIPS. Off by default.
+                if args.w_pix > 0:
+                    x_gen = decode_imgs(decoder_ddp, spatial_to_tokens(zhat))
+                    pix_target = x_rec.detach() if args.detach_pix_target else x_rec
+                    pix_l1    = F.l1_loss(x_gen, pix_target, reduction="none").mean(dim=(1,2,3))
+                    pix_lpips = lpips_all(x_gen * 2 - 1, pix_target * 2 - 1).view(-1)
+                    pix = pix_l1 + pix_lpips
+                    if args.pix_t_weight:
+                        pix = pix * (1 - t)
+                    loss_pix = pix.mean()
+                else:
+                    loss_pix = torch.zeros((), device=device)
 
             loss_sig = sigreg_loss(z_tok.float().reshape(-1, args.latent_dim))
             loss_rec = loss_l1 + args.lpips_w * loss_lpips

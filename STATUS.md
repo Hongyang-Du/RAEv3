@@ -24,6 +24,15 @@ All runs: imagenet-256-full, 8 GPU, batch 32/GPU, 5 epochs, bf16, lr 8e-4, ViT-X
 L1+LPIPS+GAN+SIGReg(w=1). Logs: `RAEv2/output_full/<run>/train.log`; compare plot:
 `RAEv2/output_full/val_psnr_compare.png` (plot_val_psnr.py).
 
+## Key Results (stage-2 / semantics, 2026-06-12)
+- DiT 10-ep FID (5k, no guidance): raev2 16.5 / nogate 16.9 / dropmean 17.3 — a TIE
+  (gaps within 5k-FID noise). Denoise-probe PSNR advantage of SIGReg runs did NOT
+  translate into FID at this schedule. Curves: ckpts_full/stage2/dit_fid_compare.png.
+- Linear probe top-1 (25k held-out, 5 ep): DINOv3 layers monotonic 57.5 (L11) -> 87.3
+  (L23); mls_mean 85.4; raev2 combine 87.1 (CLS surrogate +1.7); nogate 84.3 /
+  dropmean 84.3 (SIGReg projector costs ~1.1 vs its input). Figure:
+  output_full/linear_probe_compare.png; runner: run_linear_probes.sh.
+
 ## Key Results
 - SIGReg costs nothing on recon (26.02 vs 25.98) while shaping z toward N(0,I).
 - Learnable gates (free sigmoid AND softmax+dropout-0.2) both collapse to L11.
