@@ -59,7 +59,8 @@ def all_gather_with_grad(z: torch.Tensor) -> torch.Tensor:
 # ─── SIGReg ─────────────────────────────────────────────────────────────────
 
 def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
-                max_samples: int = 32768, distributed: bool = False) -> torch.Tensor:
+                max_samples: int = 32768, distributed: bool = False,
+                scale_by_n: bool = False) -> torch.Tensor:
     """Sketched Isotropic Gaussian Regularization (SIGReg, LeJEPA-style).
 
     A distribution is N(0, I) iff every 1D projection is N(0, 1) (Cramér-Wold),
@@ -82,6 +83,14 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
     global batch at the cost of one tiny [n_proj] all-reduce per frequency.
     Requires equal per-rank sample counts (drop_last=True). Samples are capped
     at `max_samples` per rank to bound the memory of the [M, n_proj] sketch.
+
+    scale_by_n=True: multiply by the TOTAL sample count (official LeJEPA /
+    Epps-Pulley calibration, stable_pretraining LeJEPA: `stat * N * world`).
+    The ECF sampling noise is O(1/N), so the scaled statistic has an O(1)
+    floor under H0 regardless of batch size — the weight (lambda ~ 0.02 in
+    the paper) transfers across batch sizes. Unscaled (default, used by the
+    finished stage-1 runs with w=1.0), the loss magnitude shrinks as 1/N and
+    the effective pressure depends on batch size.
     """
     if z.ndim == 3:
         z = z.reshape(-1, z.shape[-1])   # [B*N, D]
@@ -127,7 +136,11 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
             sin_emp = dist_nn.all_reduce(sin_emp) / world
         cf2     = (cos_emp - torch.exp(-0.5 * tk ** 2)) ** 2 + sin_emp ** 2
         loss    = loss + wk * cf2.mean()
-    return loss / w.sum()
+    loss = loss / w.sum()
+    if scale_by_n:
+        n_total = z.shape[0] * (world if sync else 1)
+        loss = loss * n_total
+    return loss
 
 
 @torch.no_grad()

@@ -202,7 +202,8 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--w-rec",         type=float, default=1.0)
     parser.add_argument("--lpips-w",       type=float, default=1.0)
-    parser.add_argument("--sigreg-w",      type=float, default=1.0)
+    parser.add_argument("--sigreg-w",      type=float, default=0.02,
+                        help="official LeJEPA lambda; pairs with the N-scaled statistic")
     parser.add_argument("--w-fm",          type=float, default=1.0)
     parser.add_argument("--w-pix",         type=float, default=0.0)
     parser.add_argument("--base-coeff",    type=float, default=1.0, help="IG base head FM loss coeff")
@@ -460,11 +461,12 @@ def main():
                 else:
                     loss_pix = torch.zeros((), device=device)
 
-            # global SIGReg: ECF means all-reduced differentiably across ranks —
-            # the statistic is computed on the pooled 8-GPU batch (49k tokens),
-            # not per-rank (per-rank keeps an O(1/B_local) noise floor)
+            # global SIGReg with the official LeJEPA calibration: ECF means
+            # all-reduced differentiably (pooled 8-GPU statistic) and scaled by
+            # the total sample count, so under H0 the loss floor is O(1) and
+            # sigreg_w (~0.02, paper value) is batch-size independent
             loss_sig = sigreg_loss(z_tok.float().reshape(-1, args.latent_dim),
-                                   distributed=True)
+                                   distributed=True, scale_by_n=True)
             loss_rec = loss_l1 + args.lpips_w * loss_lpips
 
             loss = (args.w_rec * loss_rec

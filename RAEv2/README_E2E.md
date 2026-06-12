@@ -45,7 +45,7 @@ L = w_rec · [ L1(dec(z), GT) + LPIPS(dec(z), GT) ]                 # informatio
   + w_pix · [ L1(dec(ẑ), dec(z)) + LPIPS(dec(ẑ), dec(z)) ]         # OPTIONAL, default 0
 ```
 
-Defaults: `w_rec=1, sigreg_w=1, w_fm=1, w_pix=0` (minimal design — the live FM
+Defaults: `w_rec=1, sigreg_w=0.02 (N-scaled statistic), w_fm=1, w_pix=0` (minimal design — the live FM
 target already routes generation gradients into the projector; the pixel branch
 only adds perceptual reweighting at the cost of a 2nd decoder forward + 2nd
 LPIPS per step).
@@ -68,17 +68,23 @@ the per-epoch `Val PSNR` line falling.** Safety valves (all default OFF):
 - `--detach-pix-target` stop-grad dec(z) in L_pix
 - `--pix-t-weight`      weight L_pix per-sample by (1−t)
 
-### SIGReg is GLOBAL across GPUs
+### SIGReg is GLOBAL across GPUs, with the official LeJEPA calibration
 
-`sigreg_loss(..., distributed=True)`: projection directions are broadcast from
-rank 0 and the per-projection cos/sin ECF means are all-reduced
-**differentiably** (`torch.distributed.nn`), so the Epps-Pulley statistic is
-computed on the pooled 8-GPU batch (8·24·256 ≈ 49k tokens), not per rank.
-Per-rank statistics would keep an O(1/B_local) sampling-noise floor (the ECF
-test is nonlinear in the sample means). Cost: 8 tiny `[1024]` all-reduces per
-step. BatchNorm inside the projector stays per-GPU on purpose — it is an
-internal conditioner (6144 token samples/GPU ⇒ ~1.3% stat error), not the
-distribution objective; DDP `broadcast_buffers` keeps eval stats consistent.
+`sigreg_loss(..., distributed=True, scale_by_n=True)`: projection directions
+are broadcast from rank 0 and the per-projection cos/sin ECF means are
+all-reduced **differentiably** (`torch.distributed.nn`), so the Epps-Pulley
+statistic is computed on the pooled 8-GPU batch (8·24·256 ≈ 49k tokens), not
+per rank. Per-rank statistics would keep an O(1/B_local) sampling-noise floor
+(the ECF test is nonlinear in the sample means). The statistic is then scaled
+by the total sample count (official stable_pretraining LeJEPA: `stat·N·world`)
+so its H0 floor is O(1) regardless of batch size, and `sigreg_w = 0.02` (the
+paper's λ) transfers across batch sizes. Cost: 8 tiny `[1024]` all-reduces per
+step. NOTE: the finished stage-1 runs used the UNSCALED per-rank statistic
+with w=1.0 — numerically different but empirically equivalent in effect
+(var.mean 0.94). BatchNorm inside the projector stays per-GPU on purpose — it
+is an internal conditioner (6144 token samples/GPU ⇒ ~1.3% stat error), not
+the distribution objective; DDP `broadcast_buffers` keeps eval stats
+consistent.
 
 ### EMA policy
 

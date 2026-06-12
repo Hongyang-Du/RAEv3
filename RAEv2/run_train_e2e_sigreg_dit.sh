@@ -44,7 +44,8 @@ LR_DIT=2e-4             # DiT gmuon, same as stage-2 baselines
 PRECISION=bf16
 
 W_REC=1.0
-SIGREG_W=1
+SIGREG_W=0.02           # official LeJEPA lambda — pairs with the N-scaled global
+                        # statistic (loss floor O(1) under H0, batch-size independent)
 W_FM=1.0
 W_PIX=0.0               # 0 = minimal design (recon + SIGReg + latent FM w/ live target;
                         # FM alone already updates DiT AND projector). >0 adds the
