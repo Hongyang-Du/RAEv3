@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-Multi-GPU DDP training: raev2 DROP-MEAN MLS latent -> Projector (SIGReg) -> ViT Decoder.
+Multi-GPU DDP training: DROP-MEAN MLS latent -> BN-Projector (global SIGReg) -> ViT Decoder.
+
+BN variant of train_decoder_mls_dropmean_sigreg.py (which is kept untouched as the
+provenance of the finished K7 run). Two changes, matching the e2e recipe:
+  1. Projector MLP norm: pre-LayerNorm residual -> LeWM recipe
+     (fc1 -> BatchNorm1d(hidden, over B*N token samples) -> GELU -> fc2, + skip;
+     output is a bare Linear so SIGReg sees an unconstrained distribution).
+  2. SIGReg computed GLOBALLY across ranks (differentiable all-reduce of the ECF
+     means) instead of per-rank.
+Intended first use: ALL DINOv3-L layers (--layers 0..23) to map every layer's
+contribution via the built-in per-epoch LOO/solo probes.
 
 Drop-mean variant of train_decoder_mls_nogate_sigreg.py: the K MLS layers are combined
 by an EQUAL-WEIGHT mean over a RANDOM SUBSET of layers (per-sample layer dropout,
@@ -71,12 +81,12 @@ class MLSProjector(nn.Module):
         super().__init__()
         self.p_drop = p_drop
         self.skip = nn.Linear(dim, out_dim) if dim != out_dim else nn.Identity()
-        self.norm = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * mult),
-            nn.GELU(),
-            nn.Linear(dim * mult, out_dim),
-        )
+        # LeWM recipe: no pre-norm, BatchNorm on the HIDDEN dim over B*N token
+        # samples; output stays a bare Linear (nothing constrains the
+        # distribution SIGReg shapes)
+        self.fc1 = nn.Linear(dim, dim * mult)
+        self.bn = nn.BatchNorm1d(dim * mult)
+        self.fc2 = nn.Linear(dim * mult, out_dim)
 
     def forward(self, layer_tokens) -> torch.Tensor:        # K x [B, N, dim] -> [B, N, out_dim]
         stk = torch.stack(layer_tokens, dim=0)              # [K, B, N, dim]
@@ -91,7 +101,10 @@ class MLSProjector(nn.Module):
             z0 = (w.view(K, B, 1, 1) * stk).sum(0)          # [B, N, dim]
         else:
             z0 = stk.mean(0)                                # [B, N, dim]  full MLS mean (eval)
-        return self.skip(z0) + self.ffn(self.norm(z0))      # project to new space
+        b, n, _ = z0.shape
+        h = self.fc1(z0)
+        h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
+        return self.skip(z0) + self.fc2(F.gelu(h))          # project to new space
 
 
 # --- EMA ----------------------------------------------------------------------
@@ -100,6 +113,10 @@ def update_ema(ema, model, decay=0.9995):
     with torch.no_grad():
         for ep, p in zip(ema.parameters(), model.parameters()):
             ep.data.mul_(decay).add_(p.data, alpha=1 - decay)
+        # BN running stats are buffers: copy (they are already running averages);
+        # without this the EMA projector keeps init stats and val probes are wrong
+        for eb, b in zip(ema.buffers(), model.buffers()):
+            eb.copy_(b)
 
 
 # --- Data ---------------------------------------------------------------------
@@ -199,9 +216,9 @@ def main():
         import wandb
         wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
-            name=f"decoder-mls-dropmean-sigreg-k{len(args.layers)}",
+            name=f"decoder-mls-dropmean-bn-sigreg-k{len(args.layers)}",
             config={**vars(args), "global_batch": args.batch_size * world_size},
-            tags=["decoder", "mls", "sigreg", "dropmean", "raev2", "stage1", f"k{len(args.layers)}"],
+            tags=["decoder", "mls", "sigreg", "dropmean", "bn", "stage1", f"k{len(args.layers)}"],
         )
 
     # -- Data ------------------------------------------------------------------
@@ -376,7 +393,8 @@ def main():
 
                 loss_l1    = F.l1_loss(x_rec, imgs)
                 loss_lpips = lpips_all(x_rec * 2 - 1, imgs * 2 - 1).mean()
-            loss_sig   = sigreg_loss(z.float().reshape(-1, args.latent_dim))
+            loss_sig   = sigreg_loss(z.float().reshape(-1, args.latent_dim),
+                                     distributed=True)      # pooled 8-GPU statistic
             loss_rec   = loss_l1 + args.lpips_w * loss_lpips
 
             loss_gan = torch.zeros(1, device=device)
@@ -472,7 +490,6 @@ def main():
 
             # layer-usage probe (LOO/solo): FINAL EPOCH ONLY — per-epoch
             # validation is just the full-mean inference PSNR above.
-            # (Probe frequency change only; training math untouched.)
             if (epoch + 1) == args.epochs:
               with torch.no_grad():
                 def _subset_psnr(toks):
