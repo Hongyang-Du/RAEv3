@@ -29,9 +29,11 @@ Optimizers: projector+decoder AdamW (small lr, expects stage-1 warm-start);
 DiT gmuon — identical to the stage-2 baselines for comparability.
 Monitoring lines match stage-1/stage-2 formats so plot_val_psnr.py and
 plot_dit_progress.py both parse this run's train.log.
-No GAN in v1 (stability first). dropmean-style layer dropout is NOT used here:
-with a live (non-EMA) FM target, a random-subset combine would make the DiT
-chase per-step target jitter; the combine is the plain K-layer mean (nogate).
+No GAN in v1 (stability first). dropmean-style layer dropout is a SWITCH
+(--layer-drop, default 0 = plain mean): with a live FM target a random-subset
+combine makes the DiT chase per-step target jitter — that cost is part of what
+the {nodrop, drop} queue measures. L_pix defaults to 0 (minimal design); EMA is
+kept ONLY for the DiT (baseline-FID comparability), projector/decoder eval live.
 
 Usage:
     torchrun --nproc_per_node=8 src/train_e2e_sigreg_dit.py \
@@ -74,12 +76,12 @@ class MLSProjector(nn.Module):
         super().__init__()
         self.p_drop = p_drop
         self.skip = nn.Linear(dim, out_dim) if dim != out_dim else nn.Identity()
-        self.norm = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * mult),
-            nn.GELU(),
-            nn.Linear(dim * mult, out_dim),
-        )
+        # LeWM recipe (le-wm config/train/model/lewm.yaml): no pre-norm,
+        # BatchNorm on the HIDDEN dim over B*N token samples; output stays
+        # a bare Linear so SIGReg sees an unconstrained distribution.
+        self.fc1 = nn.Linear(dim, dim * mult)
+        self.bn = nn.BatchNorm1d(dim * mult)
+        self.fc2 = nn.Linear(dim * mult, out_dim)
 
     def forward(self, layer_tokens) -> torch.Tensor:        # K x [B, N, dim] -> [B, N, out_dim]
         stk = torch.stack(layer_tokens, dim=0)               # [K, B, N, dim]
@@ -93,7 +95,25 @@ class MLSProjector(nn.Module):
             z0 = (w.view(K, B, 1, 1) * stk).sum(0)
         else:
             z0 = stk.mean(0)
-        return self.skip(z0) + self.ffn(self.norm(z0))
+        b, n, _ = z0.shape
+        h = self.fc1(z0)
+        h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
+        return self.skip(z0) + self.fc2(F.gelu(h))
+
+    def load_ln_ckpt(self, sd):
+        """Warm-start from an LN-projector state dict (nogate / dropmean
+        stage-1): Linear weights carry over, BN stats start fresh."""
+        remap = {}
+        for k, v in sd.items():
+            if k.startswith("ffn.0."):
+                remap["fc1." + k.split(".")[-1]] = v
+            elif k.startswith("ffn.2."):
+                remap["fc2." + k.split(".")[-1]] = v
+            elif k.startswith("skip."):
+                remap[k] = v
+            # norm.{weight,bias} (LayerNorm) intentionally dropped
+        missing, unexpected = self.load_state_dict(remap, strict=False)
+        print(f"MLSProjector: remapped LN ckpt — fresh: {sorted(missing)}")
 
 
 # --- helpers --------------------------------------------------------------------
@@ -102,6 +122,11 @@ def update_ema(ema, model, decay=0.9995):
     with torch.no_grad():
         for ep, p in zip(ema.parameters(), model.parameters()):
             ep.data.mul_(decay).add_(p.data, alpha=1 - decay)
+        # buffers (e.g. BN running stats in the projector) are copied, not EMA'd —
+        # they are already running averages; without this the EMA copy keeps its
+        # init stats forever and eval probes are wrong
+        for eb, b in zip(ema.buffers(), model.buffers()):
+            eb.copy_(b)
 
 
 def tokens_to_spatial(z):                                   # [B,N,C] -> [B,C,H,W]
@@ -179,7 +204,7 @@ def main():
     parser.add_argument("--lpips-w",       type=float, default=1.0)
     parser.add_argument("--sigreg-w",      type=float, default=1.0)
     parser.add_argument("--w-fm",          type=float, default=1.0)
-    parser.add_argument("--w-pix",         type=float, default=0.5)
+    parser.add_argument("--w-pix",         type=float, default=0.0)
     parser.add_argument("--base-coeff",    type=float, default=1.0, help="IG base head FM loss coeff")
     parser.add_argument("--cfg-dropout",   type=float, default=0.1)
     parser.add_argument("--t-shift",       type=float, default=8.0)
@@ -236,7 +261,7 @@ def main():
     if args.wandb and is_main:
         import wandb
         wandb.init(project=args.wandb_project, entity=args.wandb_entity,
-                   name=f"e2e-sigreg-dit-k{len(args.layers)}"
+                   name=f"e2e-sigreg-dit-k{len(args.layers)}-bn"
                         + (f"-drop{args.layer_drop}" if args.layer_drop > 0 else ""),
                    config={**vars(args), "global_batch": args.batch_size * world_size},
                    tags=["e2e", "sigreg", "dit", "stage1+2", f"k{len(args.layers)}"])
@@ -276,7 +301,7 @@ def main():
 
     if args.init_stage1:
         ck = torch.load(args.init_stage1, map_location="cpu", weights_only=False)
-        projector.load_state_dict(ck["ema_proj"])
+        projector.load_ln_ckpt(ck["ema_proj"])
         decoder.load_state_dict(ck["ema_dec"])
         if is_main:
             print(f"Warm-started projector+decoder from {args.init_stage1} (ep {ck.get('epoch')})")
@@ -301,9 +326,10 @@ def main():
     decoder_ddp   = DDP(decoder,   device_ids=[local_rank])
     dit_ddp       = DDP(dit,       device_ids=[local_rank])
 
-    ema_proj = deepcopy(projector); ema_proj.requires_grad_(False); ema_proj.eval()
-    ema_dec  = deepcopy(decoder);   ema_dec.requires_grad_(False);  ema_dec.eval()
-    ema_dit  = deepcopy(dit);       ema_dit.requires_grad_(False);  ema_dit.eval()
+    # EMA only for the DiT (raw-vs-EMA gap in diffusion sampling is large, and the
+    # stage-2 baseline FIDs are EMA — keep comparable). Projector/decoder are
+    # evaluated LIVE: more responsive collapse alarm, no 1/(1-decay)-step lag.
+    ema_dit = deepcopy(dit); ema_dit.requires_grad_(False); ema_dit.eval()
 
     pd_params  = list(projector.parameters()) + list(decoder.parameters())
     dit_params = list(dit.parameters())
@@ -366,7 +392,6 @@ def main():
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         projector.load_state_dict(ck["projector"]); decoder.load_state_dict(ck["decoder"])
         dit.load_state_dict(ck["dit"])
-        ema_proj.load_state_dict(ck["ema_proj"]); ema_dec.load_state_dict(ck["ema_dec"])
         ema_dit.load_state_dict(ck["ema_dit"])
         opt_pd.load_state_dict(ck["opt_pd"]); opt_dit.load_state_dict(ck["opt_dit"])
         sched_pd.load_state_dict(ck["sched_pd"]); sched_dit.load_state_dict(ck["sched_dit"])
@@ -435,7 +460,11 @@ def main():
                 else:
                     loss_pix = torch.zeros((), device=device)
 
-            loss_sig = sigreg_loss(z_tok.float().reshape(-1, args.latent_dim))
+            # global SIGReg: ECF means all-reduced differentiably across ranks —
+            # the statistic is computed on the pooled 8-GPU batch (49k tokens),
+            # not per-rank (per-rank keeps an O(1/B_local) noise floor)
+            loss_sig = sigreg_loss(z_tok.float().reshape(-1, args.latent_dim),
+                                   distributed=True)
             loss_rec = loss_l1 + args.lpips_w * loss_lpips
 
             loss = (args.w_rec * loss_rec
@@ -449,9 +478,7 @@ def main():
             opt_pd.step(); opt_dit.step()
             sched_pd.step(); sched_dit.step()
 
-            update_ema(ema_proj, projector, args.ema_decay)
-            update_ema(ema_dec,  decoder,   args.ema_decay)
-            update_ema(ema_dit,  dit,       args.ema_decay)
+            update_ema(ema_dit, dit, args.ema_decay)
             global_step += 1
 
             if is_main and global_step % args.log_every == 0:
@@ -482,11 +509,13 @@ def main():
             # -- sample grid (EMA, Euler 50 steps) -------------------------------
             if is_main and args.sample_every > 0 and global_step % args.sample_every == 0 \
                     and val_eps is not None:
+                decoder.eval()
                 with torch.no_grad(), autocast_ctx:
                     n = val_eps.shape[0]
                     y_fix = torch.arange(n, device=device) * (args.num_classes // max(1, n))
                     z_gen = euler_sample(ema_dit, val_eps, y_fix, num_steps=50, t_eps=args.t_eps)
-                    x_smp = decode_imgs(ema_dec, spatial_to_tokens(z_gen.float()))
+                    x_smp = decode_imgs(decoder, spatial_to_tokens(z_gen.float()))
+                decoder.train()
                 out = os.path.join(args.out_dir, f"samples_s{global_step}.png")
                 save_image(x_smp.cpu().float(), out, nrow=n)
                 print(f"  Samples -> {out}", flush=True)
@@ -497,11 +526,13 @@ def main():
         if is_main:
             print(f"Epoch {epoch+1}/{args.epochs}  time={time.time()-t0:.0f}s", flush=True)
 
-        # -- per-epoch probes (formats match plot_val_psnr / plot_dit_progress) ----
+        # -- per-epoch probes on the LIVE projector/decoder (eval mode: BN uses
+        # running stats, layer-drop off) + EMA DiT --------------------------------
         if is_main and val_layers_fixed is not None:
+            projector.eval(); decoder.eval()
             with torch.no_grad():
-                vz_tok = ema_proj(val_layers_fixed)
-                v_rec  = decode_imgs(ema_dec, vz_tok)
+                vz_tok = projector(val_layers_fixed)
+                v_rec  = decode_imgs(decoder, vz_tok)
                 val_ps = psnr(v_rec, val_img_orig)
                 print(f"  Val PSNR (EMA): {val_ps:.2f} dB", flush=True)
 
@@ -514,10 +545,11 @@ def main():
                         pred = ema_dit(xt_v, tt, context=val_labels, attn_mask=None)
                     if isinstance(pred, tuple):
                         pred = pred[0]
-                    img = decode_imgs(ema_dec, spatial_to_tokens(pred.float()))
+                    img = decode_imgs(decoder, spatial_to_tokens(pred.float()))
                     parts.append((tv, psnr(img, val_img_orig)))
                 grid = "  ".join(f"t{int(tv*100)}={v:.2f}" for tv, v in parts)
                 print(f"  Denoise PSNR (EMA): {grid}  ceil={val_ps:.2f} dB", flush=True)
+            projector.train(); decoder.train()
             if args.wandb:
                 import wandb
                 wandb.log({"val/psnr": val_ps,
@@ -530,7 +562,6 @@ def main():
                 "epoch": epoch + 1, "global_step": global_step,
                 "projector": projector.state_dict(), "decoder": decoder.state_dict(),
                 "dit": dit.state_dict(),
-                "ema_proj": ema_proj.state_dict(), "ema_dec": ema_dec.state_dict(),
                 "ema_dit": ema_dit.state_dict(),
                 "opt_pd": opt_pd.state_dict(), "opt_dit": opt_dit.state_dict(),
                 "sched_pd": sched_pd.state_dict(), "sched_dit": sched_dit.state_dict(),

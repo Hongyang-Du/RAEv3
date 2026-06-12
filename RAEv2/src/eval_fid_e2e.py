@@ -5,7 +5,7 @@ Same protocol as eval_fid_dit.py (N class-balanced samples, fixed seed, 50-step
 Euler with the SHIFTED time grid the official stage-2 sampler uses, vs N real
 train images) so e2e FID is directly comparable with the stage-2 sweep numbers.
 Differences vs eval_fid_dit.py:
-  - loads ema_dit / ema_dec from the single e2e ckpt (no stage-2 config YAML)
+  - loads ema_dit + live decoder from the single e2e ckpt (no stage-2 config YAML)
   - latent space is the RAW live z (SIGReg'd ~N(0,1)); no stats normalization
 
 Usage (inside rae container, one free GPU):
@@ -91,10 +91,10 @@ def main():
 
     decoder = _load_decoder("configs/decoder/ViTXL", hidden_size=args.latent_dim,
                             patch_size=16, num_patches=256, pretrained_path=None).to(device).eval()
-    decoder.load_state_dict(ck["decoder" if args.raw else "ema_dec"])
+    decoder.load_state_dict(ck["decoder"])     # decoder is live-only (no EMA kept)
     for p in list(dit.parameters()) + list(decoder.parameters()):
         p.requires_grad_(False)
-    print(f"Loaded {'raw' if args.raw else 'EMA'} dit+decoder from {args.ckpt} (epoch {epoch})", flush=True)
+    print(f"Loaded {'raw' if args.raw else 'EMA'} dit + live decoder from {args.ckpt} (epoch {epoch})", flush=True)
     del ck
 
     img_mean, img_std = IMAGENET_MEAN.to(device), IMAGENET_STD.to(device)

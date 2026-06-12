@@ -90,6 +90,20 @@ L1+LPIPS+GAN+SIGReg(w=1). Logs: `RAEv2/output_full/<run>/train.log`; compare plo
   master `run_l11_ablation.sh` (decoder -> DiT -> FID -> summary; auto-resumes).
 - Queue AFTER the current 3-run DiT queue finishes (uses all 8 GPUs).
 
+## E2E joint training (projector + decoder + DiT) — redesigned 2026-06-12, ready
+- Full design doc: `RAEv2/README_E2E.md`. Changes vs the 06-10 build (below):
+  (a) projector = LeWM recipe (fc→BN(hidden, B·N tokens)→GELU→fc + skip, NO
+  LayerNorm; le-wm/config/train/model/lewm.yaml precedent); (b) SIGReg computed
+  GLOBALLY across ranks (differentiable all-reduce of ECF means; per-rank keeps
+  an O(1/B_local) noise floor); (c) w_pix default 0 — live FM target already
+  routes generation grads to the projector, pixel branch is optional perceptual
+  reweighting; (d) EMA kept ONLY for DiT (baseline-FID comparability),
+  projector/decoder evaluated live; (e) --layer-drop switch -> two-variant queue
+  run_all_e2e.sh: nodrop (nogate init) -> drop 0.3 (dropmean init), each + 5k FID
+  (eval_fid_e2e.py, shift-8 grid, comparable with 16.5/16.9/17.3 baselines).
+- LeWM (arXiv 2603.19312) validates the core bet: live target + SIGReg, no EMA
+  /stop-grad, stable e2e — same principle, world-model setting.
+
 ## E2E joint training (projector + decoder + DiT) — built, queued behind baselines
 - 2026-06-10: `src/train_e2e_sigreg_dit.py` + `run_train_e2e_sigreg_dit.sh`. User's
   design: NO stop-grad / NO EMA target — SIGReg pins latent geometry, recon pins

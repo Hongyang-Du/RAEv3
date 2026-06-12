@@ -59,7 +59,7 @@ def all_gather_with_grad(z: torch.Tensor) -> torch.Tensor:
 # ─── SIGReg ─────────────────────────────────────────────────────────────────
 
 def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
-                max_samples: int = 32768) -> torch.Tensor:
+                max_samples: int = 32768, distributed: bool = False) -> torch.Tensor:
     """Sketched Isotropic Gaussian Regularization (SIGReg, LeJEPA-style).
 
     A distribution is N(0, I) iff every 1D projection is N(0, 1) (Cramér-Wold),
@@ -71,11 +71,17 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
 
     z: [B, N, D] or [B, D] — a batch of D-dim samples (B >> 1). Directions and
     frequencies are resampled every call, so sphere coverage accumulates over
-    training. Computed PER-RANK (no all-gather): with ~16k local tokens the CF is
-    already low-variance, and DDP averages the gradient across ranks — gathering
-    then subsampling would instead leave only ~max_samples/world_size rows on the
-    autograd graph, diluting the per-step gradient. Samples are capped at
-    `max_samples` to bound the memory of the [M, n_proj] sketch.
+    training.
+
+    distributed=False: computed PER-RANK; DDP averages the gradients. Cheap, but
+    the ECF is a NONLINEAR function of sample means, so mean-of-per-rank-losses
+    keeps an O(1/B_local) sampling-noise floor and only B_local test power.
+    distributed=True: the projection directions are broadcast from rank 0 and the
+    per-projection cos/sin ECF means are all-reduced DIFFERENTIABLY
+    (torch.distributed.nn) — the loss is the exact statistic of the pooled
+    global batch at the cost of one tiny [n_proj] all-reduce per frequency.
+    Requires equal per-rank sample counts (drop_last=True). Samples are capped
+    at `max_samples` per rank to bound the memory of the [M, n_proj] sketch.
     """
     if z.ndim == 3:
         z = z.reshape(-1, z.shape[-1])   # [B*N, D]
@@ -90,8 +96,19 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
         idx = torch.randperm(B, device=z.device)[:max_samples]
         z = z[idx]
 
-    # Random unit projections (1D slices)
+    sync = False
+    if distributed:
+        import torch.distributed as dist
+        sync = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+    # Random unit projections (1D slices) — must be IDENTICAL on every rank
+    # when pooling, otherwise the per-rank ECF means are not summable
     A = F.normalize(torch.randn(D, n_proj, device=z.device), dim=0)  # [D, n_proj]
+    if sync:
+        import torch.distributed as dist
+        import torch.distributed.nn as dist_nn
+        dist.broadcast(A, src=0)
+        world = dist.get_world_size()
     proj = z @ A                                                     # [M, n_proj]
 
     # Epps-Pulley test per slice over a Gaussian-weighted frequency grid:
@@ -103,6 +120,11 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
     for tk, wk in zip(t.unbind(), w.unbind()):                       # loop = low peak mem
         cos_emp = torch.cos(proj * tk).mean(0)                      # [n_proj]
         sin_emp = torch.sin(proj * tk).mean(0)                      # [n_proj]
+        if sync:
+            # differentiable all-reduce: ECF mean of the POOLED global batch
+            # (equal per-rank counts), grads flow back into local samples
+            cos_emp = dist_nn.all_reduce(cos_emp) / world
+            sin_emp = dist_nn.all_reduce(sin_emp) / world
         cf2     = (cos_emp - torch.exp(-0.5 * tk ** 2)) ** 2 + sin_emp ** 2
         loss    = loss + wk * cf2.mean()
     return loss / w.sum()

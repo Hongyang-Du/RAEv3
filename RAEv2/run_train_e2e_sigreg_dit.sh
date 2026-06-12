@@ -50,6 +50,8 @@ W_PIX=0.0               # 0 = minimal design (recon + SIGReg + latent FM w/ live
                         # FM alone already updates DiT AND projector). >0 adds the
                         # pixel-FM branch dec(zhat) vs dec(z): perceptual reweighting,
                         # costs a 2nd decoder forward + 2nd LPIPS per step.
+# projector = LeWM-recipe MLP: Linear -> BN(hidden, over B*N tokens) -> GELU -> Linear
+# (+ identity skip); Linear weights warm-start from the LN stage-1 ckpt, BN stats fresh
 EXTRA_FLAGS=""          # safety valves: --detach-fm-target --detach-xt --detach-pix-target --pix-t-weight
 
 INIT_DIT=""             # optional: ckpts_full/stage2/dit-nogate-k7/checkpoints/ep-XXXXXXX.pt
