@@ -10,7 +10,7 @@ lr-dit: 2.0e-4
 warmup-epochs: 2
 w-rec: 1.0
 lpips-w: 1.0
-sigreg-w: 0.02          # official LeJEPA lambda (paired with N-scaled global stat)
+sigreg-w: 1.0          # unscaled global statistic (scale_by_n=false) -> gentle ~0.30x recon grad
 w-fm: 1.0
 w-pix: 0.0              # minimal design: live FM target already reaches the projector
 layer-drop: 0.3        # drop: random subset, stochastic FM target

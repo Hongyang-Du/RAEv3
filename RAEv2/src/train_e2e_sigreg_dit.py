@@ -203,8 +203,8 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--w-rec",         type=float, default=1.0)
     parser.add_argument("--lpips-w",       type=float, default=1.0)
-    parser.add_argument("--sigreg-w",      type=float, default=0.02,
-                        help="official LeJEPA lambda; pairs with the N-scaled statistic")
+    parser.add_argument("--sigreg-w",      type=float, default=1.0,
+                        help="gentle regularizer with the UNSCALED global statistic (~0.30x recon grad)")
     parser.add_argument("--w-fm",          type=float, default=1.0)
     parser.add_argument("--w-pix",         type=float, default=0.0)
     parser.add_argument("--base-coeff",    type=float, default=1.0, help="IG base head FM loss coeff")
@@ -472,12 +472,14 @@ def main():
                 else:
                     loss_pix = torch.zeros((), device=device)
 
-            # global SIGReg with the official LeJEPA calibration: ECF means
-            # all-reduced differentiably (pooled 8-GPU statistic) and scaled by
-            # the total sample count, so under H0 the loss floor is O(1) and
-            # sigreg_w (~0.02, paper value) is batch-size independent
+            # global SIGReg as a GENTLE regularizer: ECF means all-reduced
+            # differentiably (pooled global statistic) but NOT N-scaled -> the
+            # MEAN ECF discrepancy (batch-independent). With scale_by_n=True the
+            # statistic is x N (~65536) and any weight near the recon scale
+            # swamps recon's gradient (~575x at w=0.02). Unscaled + sigreg_w 1.0
+            # = ~0.30x recon projector-grad (gradient-probed).
             loss_sig = sigreg_loss(z_tok.float().reshape(-1, args.latent_dim),
-                                   distributed=True, scale_by_n=True)
+                                   distributed=True, scale_by_n=False)
             loss_rec = loss_l1 + args.lpips_w * loss_lpips
 
             loss = (args.w_rec * loss_rec
