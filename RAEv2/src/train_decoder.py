@@ -70,7 +70,8 @@ def main():
         OmegaConf.structured(DecoderConfig), OmegaConf.load(args.config)))
     C, L, D, T, P = cfg.combine, cfg.loss, cfg.data, cfg.training, cfg.probe
 
-    dist.init_process_group("nccl")
+    from datetime import timedelta
+    dist.init_process_group("nccl", timeout=timedelta(minutes=30))   # NFS ckpt saves can be slow
     rank, world = dist.get_rank(), dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
@@ -172,6 +173,22 @@ def main():
         with torch.no_grad():
             val_layers_fixed = [t.detach() for t in encode_layers(val_img_orig)]
         print(f"Val demo images: {len(vpaths)} from {vdir}", flush=True)
+
+    # -- pre-load the fixed val-N subset ONCE (rank 0) -------------------------
+    # The 9.8GB val npz is loaded/decoded entirely on first access; doing that
+    # at an epoch boundary (between train_one_epoch and the next epoch's first
+    # SIGReg broadcast) makes the other ranks time out waiting. Extract the 100
+    # fixed images here, before the loop, into a small CPU tensor (~20MB).
+    val_eval_imgs = None
+    if is_main and D.val_npz and os.path.exists(D.val_npz):
+        import numpy as np
+        z = np.load(D.val_npz, mmap_mode="r")
+        arr = z[z.files[0]] if hasattr(z, "files") else z
+        idx = torch.randperm(len(arr), generator=torch.Generator().manual_seed(0))[:D.val_n].tolist()
+        val_eval_imgs = torch.stack([torch.from_numpy(arr[j].copy()) for j in idx]) \
+            .permute(0, 3, 1, 2).contiguous()        # [N,3,256,256] uint8, CPU
+        del z, arr
+        print(f"Val-set images pre-loaded: {val_eval_imgs.shape[0]} from {D.val_npz}", flush=True)
 
     # -- auto-resume -----------------------------------------------------------
     start_epoch = global_step = 0
@@ -286,11 +303,19 @@ def main():
             if cfg.wandb.enabled:
                 import wandb; wandb.log({"val/psnr_demo": vps_demo}, step=global_step)
 
-        if is_main and D.val_npz and os.path.exists(D.val_npz):
-            def _recon(imgs01):
-                return decode_imgs(ema_dec, ema_combine(encode_layers(imgs01)))
-            vpsnr, vssim = val_recon_psnr_npz(_recon, D.val_npz, device, n=D.val_n,
-                                              seed=0, want_ssim=True)
+        if is_main and val_eval_imgs is not None:
+            from torchmetrics.image import StructuralSimilarityIndexMeasure
+            ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+            psnrs = []
+            with torch.no_grad():
+                for i in range(0, val_eval_imgs.shape[0], 32):
+                    vb = val_eval_imgs[i:i + 32].to(device).float() / 255      # [b,3,256,256]
+                    rec = decode_imgs(ema_dec, ema_combine(encode_layers(vb))).clamp(0, 1).float()
+                    mse = ((rec - vb) ** 2).flatten(1).mean(1)
+                    psnrs.append(-10.0 * torch.log10(mse + 1e-10))
+                    ssim_metric.update(rec, vb)
+            vpsnr = torch.cat(psnrs).mean().item()
+            vssim = ssim_metric.compute().item()
             print(f"  Val PSNR (EMA, {D.val_n} val imgs): {vpsnr:.3f} dB  SSIM={vssim:.4f}", flush=True)
             # append to TSV (epoch, step, psnr, ssim) for plot_val_psnr_steps.py
             tsv = os.path.join(T.out_dir, "val_psnr_steps.tsv")
@@ -331,6 +356,10 @@ def main():
             if (epoch + 1) % T.ckpt_every == 0:
                 torch.save(ckpt, os.path.join(T.out_dir, f"ckpt_ep{epoch+1:03d}.pt"))
             print(f"  Saved ckpt (ep{epoch+1})", flush=True)
+
+        # all ranks wait for rank 0's val + ckpt before starting the next epoch,
+        # so the others don't race ahead to the next SIGReg broadcast and time out
+        dist.barrier()
 
     if cfg.wandb.enabled and is_main:
         import wandb; wandb.finish()
