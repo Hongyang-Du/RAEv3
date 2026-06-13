@@ -15,7 +15,7 @@ TORCHRUN=${CONDA_ENV}/bin/torchrun
 PYTHON=${CONDA_ENV}/bin/python
 cd "$(dirname "$(realpath "$0")")"
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 NGPU=${2:-$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F, '{print NF}')}
 
 export WANDB_BASE_URL=https://api.wandb.ai

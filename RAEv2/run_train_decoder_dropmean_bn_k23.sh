@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 # ============================================================
-#  ALL-LAYER dropmean, LN projector, NO SIGReg (ablation twin)
-#  (src/train_decoder_mls_dropmean_sigreg.py)
+#  ABLATION: dropmean + BN projector, SIGReg OFF (layers 1..23, raev2 k23 set)
+#  (src/train_decoder_mls_dropmean_bn_sigreg.py with --sigreg-w 0)
 #
-#  Encoder:  DINOv3-L (frozen) — ALL 24 blocks (L0..L23)
+#  Encoder:  DINOv3-L (frozen), layers 1..23 (same as official raev2 k23)
 #  Combine:  per-sample random layer dropout 0.3, renormalized mean
-#  Projector: skip + ffn(LayerNorm(z0))   [original LN recipe, w/ LOO+solo probes]
-#  SIGReg:   OFF (weight 0, logged only)
-#  Decoder:  ViT-XL from scratch; L1+LPIPS+GAN(from ep2)+SIGReg
+#  Projector: fc -> BN(hidden, B*N tokens) -> GELU -> fc (+skip)  [LeWM recipe]
+#  SIGReg:   OFF (weight 0) — isolates the BN projector + dropmean from SIGReg.
+#  Decoder:  ViT-XL from scratch; L1+LPIPS+GAN(from ep2)
 #
-#  Purpose: per-epoch LOO/solo probes map EVERY layer's contribution;
-#  final figure: plot_layer_usage_all.py -> output_full/layer_usage_all24.png
+#  Ablation pair: vs dropmean_bn (WITH sigreg 0.02) -> effect of SIGReg;
+#  vs dropmean_plain (no projector, no sigreg) -> effect of the BN projector.
+#  Per-epoch val PSNR+SSIM on 1000 val images; LOO/solo probes at the final epoch.
 # ============================================================
 set -euo pipefail
 
 CONDA_ENV=/opt/conda/envs/rae
 TORCHRUN=${CONDA_ENV}/bin/torchrun
 PYTHON=${CONDA_ENV}/bin/python
-SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls_dropmean_sigreg.py
+SCRIPT=$(dirname "$(realpath "$0")")/src/train_decoder_mls_dropmean_bn_sigreg.py
 
 cd "$(dirname "$(realpath "$0")")"
 
@@ -25,17 +26,17 @@ cd "$(dirname "$(realpath "$0")")"
 NGPU=4
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}   # GPUs 4-7 busy with another job
 DATA=/datasets/imagenet-256-full
-OUT_DIR=output_full/train_decoder_mls_dropmean_ln_nosig_all24
+OUT_DIR=output_full/train_decoder_mls_dropmean_bn_nosig_k23
 
-EPOCHS=5
+EPOCHS=10
 BATCH=32
 LR=8e-4
 PRECISION=bf16
-LAYERS=$(seq -s' ' 0 23)        # ALL DINOv3-L blocks
+LAYERS=$(seq -s' ' 1 23)        # 1..23, same as official raev2 k23
 LAYER_DROP=0.3
 
 LPIPS_W=1.0
-SIGREG_W=0.0          # SIGReg OFF (logged only): isolates projector+dropout
+SIGREG_W=0.02                    # ABLATION: SIGReg OFF
 DISC_WEIGHT=0.75
 DISC_START=1
 
@@ -52,7 +53,7 @@ WANDB_ENTITY=uscgvl
 # -------------------------------------------------------------
 
 echo "========================================================"
-echo "  ALL-24-layer dropmean + LN projector, SIGReg OFF"
+echo "  ABLATION: dropmean + BN projector, SIGReg OFF (k23 layers 1..23)"
 echo "  GPUs: ${NGPU}  Batch: ${BATCH}/GPU (global $((BATCH * NGPU)))"
 echo "  Epochs: ${EPOCHS}  |  layer_drop ${LAYER_DROP}  |  Layers: ${LAYERS}"
 echo "  Output: ${OUT_DIR}"

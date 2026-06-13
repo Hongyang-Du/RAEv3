@@ -1,48 +1,32 @@
 #!/usr/bin/env python3
 """
-Multi-GPU DDP training: DROP-MEAN MLS latent -> BN-Projector (global SIGReg) -> ViT Decoder.
+Multi-GPU DDP training: PURE raev2 + DROP LAYER — no projector, no BN, no SIGReg.
 
-BN variant of train_decoder_mls_dropmean_sigreg.py (which is kept untouched as the
-provenance of the finished K7 run). Two changes, matching the e2e recipe:
-  1. Projector MLP norm: pre-LayerNorm residual -> LeWM recipe
-     (fc1 -> BatchNorm1d(hidden, over B*N token samples) -> GELU -> fc2, + skip;
-     output is a bare Linear so SIGReg sees an unconstrained distribution).
-  2. SIGReg computed GLOBALLY across ranks (differentiable all-reduce of the ECF
-     means) instead of per-rank.
-Intended first use: ALL DINOv3-L layers (--layers 0..23) to map every layer's
-contribution via the built-in per-epoch LOO/solo probes.
-
-Drop-mean variant of train_decoder_mls_nogate_sigreg.py: the K MLS layers are combined
-by an EQUAL-WEIGHT mean over a RANDOM SUBSET of layers (per-sample layer dropout,
---layer-drop). There is NO learnable gate at all — any learnable per-layer weight
-(free sigmoid OR softmax+dropout) collapses to the shallowest layer under the
-recon+GAN objective, because with a weight to learn the optimum IS that layer. Here
-nothing can be biased: all layers enter with weight 1/|subset|, and the decoder is
-forced to reconstruct from every random subset — including subsets WITHOUT the
-shallowest layer — so it must learn to use the deep layers. Eval uses the full
-equal-weight mean (= RAEv2 / nogate combine); stats match training because the
-subset combine is a renormalized mean, not a sum.
+The minimal "raev2 baseline + layer dropout" ablation. raev2's fixed MLS mean is
+replaced by an EQUAL-WEIGHT mean over a RANDOM per-sample layer SUBSET (dropmean),
+fed STRAIGHT to the decoder — there is NO projector MLP, NO BatchNorm, NO SIGReg,
+NO learnable gate, NO CLS surrogate. The ONLY trainable module is the decoder
+(same as the raev2 baseline train_decoder_mls.py). This isolates the effect of
+layer dropout ALONE; vs dropmean_ln_nosig the only difference is the removed
+projector, vs the raev2 baseline the only difference is the random subset combine.
 
 Architecture:
-  DINOv3-L (frozen, layers [11,13,15,17,19,21,23])
-       v
-  drop-mean combine (no params):                   z0 [B, 256, 1024]
-    train: mean over random per-sample layer subset
+  DINOv3-L (frozen, --layers, e.g. 0..23)
+       v  K x [B, 256, 1024]
+  drop-mean combine (NO params):                   z [B, 256, 1024]
+    train: mean over random per-sample layer subset (>=1 kept, --layer-drop)
     eval:  mean over all K layers
-       v
-  Projector (learnable, per-token residual MLP)    z  [B, 256, latent]   <- SIGReg here
        v
   ViT Decoder (trained from scratch)               x_rec [B, 3, 256, 256]
 
-Loss: L1 + LPIPS + GAN + sigreg_w * SIGReg
-  - recon/LPIPS/GAN train projector + decoder (end-to-end)
-  - SIGReg pushes z toward N(0, I); its gradient flows into the projector only
-    (encoder + MLS are frozen/param-free).
+Loss: L1 + LPIPS + GAN   (SIGReg has no trainable params upstream of z, so it is
+computed for LOGGING ONLY; keep --sigreg-w 0). Per-epoch LOO/solo probes map
+per-layer reliance, same as the dropmean_bn / dropmean_ln twins.
 
 Usage:
-    torchrun --nproc_per_node=8 src/train_decoder_mls_dropmean_sigreg.py \
-        --data /datasets/imagenet-256 \
-        --epochs 100 --batch-size 64 --sigreg-w 1 --layer-drop 0.3 --wandb
+    torchrun --nproc_per_node=8 src/train_decoder_mls_dropmean_plain.py \
+        --data /datasets/imagenet-256-full --layers $(seq 0 23) \
+        --epochs 5 --batch-size 32 --layer-drop 0.3 --sigreg-w 0 --wandb
 """
 
 import sys, os, math, argparse, time, glob
@@ -67,44 +51,39 @@ from stage1.disc.diffaug import DiffAug
 # --- Projector ----------------------------------------------------------------
 
 class MLSProjector(nn.Module):
-    """Drop-mean combine (equal-weight mean over a random layer subset) + per-token residual MLP.
+    """PLAIN drop-mean combine: z = mean over a random per-sample layer subset.
+    NOTHING learnable — NO projector MLP, NO BN, NO SIGReg, NO gate.
 
-    NO gate parameter: collapse to the shallowest layer is structurally impossible
-    because there is no weight the recon/GAN objective could push there. During
-    training each SAMPLE keeps each layer independently with prob (1 - p_drop)
-    (>= 1 layer always kept) and z0 is the mean over its kept subset, so within one
-    batch the decoder sees many different layer subsets — including deep-only ones.
-    Eval falls back to the full mean over all K layers (= RAEv2 / nogate combine).
+    The purest "raev2 + drop layer" ablation: the only thing between the frozen
+    encoder and the decoder is the equal-weight mean over a random kept subset
+    (dropmean), fed straight to the decoder. Isolates layer dropout ALONE, with
+    the projector MLP that dropmean_ln / dropmean_bn add removed (so the only
+    difference vs dropmean_ln_nosig is the absence of the projector). No CLS
+    surrogate, matching the dropmean family. Eval uses the full equal-weight
+    mean over all K layers.
+
+    forward(layer_tokens, idx=None): idx (positions) lets the eval probes decode
+    arbitrary subsets (equal-weight mean over the subset) for LOO/solo.
     """
-    def __init__(self, dim: int = 1024, out_dim: int = 1024, mult: int = 4,
-                 p_drop: float = 0.3):
+    def __init__(self, n_layers: int, dim: int = 1024, out_dim: int = 1024,
+                 mult: int = 4, p_drop: float = 0.3):
         super().__init__()
-        self.p_drop = p_drop
-        self.skip = nn.Linear(dim, out_dim) if dim != out_dim else nn.Identity()
-        # LeWM recipe: no pre-norm, BatchNorm on the HIDDEN dim over B*N token
-        # samples; output stays a bare Linear (nothing constrains the
-        # distribution SIGReg shapes)
-        self.fc1 = nn.Linear(dim, dim * mult)
-        self.bn = nn.BatchNorm1d(dim * mult)
-        self.fc2 = nn.Linear(dim * mult, out_dim)
+        self.p_drop = p_drop                                 # per-sample random layer dropout
 
-    def forward(self, layer_tokens) -> torch.Tensor:        # K x [B, N, dim] -> [B, N, out_dim]
+    def forward(self, layer_tokens, idx=None) -> torch.Tensor:  # K x [B,N,dim] -> [B,N,dim]
         stk = torch.stack(layer_tokens, dim=0)              # [K, B, N, dim]
+        K, B = stk.shape[0], stk.shape[1]
+        if idx is not None:                                 # probe subset: plain mean over it
+            return stk[list(idx)].mean(0)
         if self.training and self.p_drop > 0:
-            K, B = stk.shape[0], stk.shape[1]
             keep = torch.rand(K, B, device=stk.device) > self.p_drop   # per-sample subset
-            dead = ~keep.any(0)                             # samples that dropped every layer
+            dead = ~keep.any(0)
             if dead.any():                                  # always keep >= 1 layer
                 keep[torch.randint(K, (int(dead.sum()),), device=stk.device), dead] = True
             w = keep.to(stk.dtype)
-            w = w / w.sum(0, keepdim=True)                  # equal weight over the kept subset
-            z0 = (w.view(K, B, 1, 1) * stk).sum(0)          # [B, N, dim]
-        else:
-            z0 = stk.mean(0)                                # [B, N, dim]  full MLS mean (eval)
-        b, n, _ = z0.shape
-        h = self.fc1(z0)
-        h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
-        return self.skip(z0) + self.fc2(F.gelu(h))          # project to new space
+            w = w / w.sum(0, keepdim=True).clamp_min(1e-6)  # equal weight over kept subset
+            return (w.view(K, B, 1, 1) * stk).sum(0)        # [B, N, dim]
+        return stk.mean(0)                                   # full equal-weight mean (eval)
 
 
 # --- EMA ----------------------------------------------------------------------
@@ -166,7 +145,7 @@ def main():
     parser.add_argument("--batch-size",   type=int, default=64, help="Per-GPU batch size")
     parser.add_argument("--lr",           type=float, default=2e-4)
     parser.add_argument("--warmup-epochs",type=int, default=2)
-    parser.add_argument("--sigreg-w",     type=float, default=0.1)
+    parser.add_argument("--sigreg-w",     type=float, default=0.0)  # SIGReg off by default (no trainable params upstream)
     parser.add_argument("--layer-drop",   type=float, default=0.3,
                         help="Per-sample per-layer dropout prob in the drop-mean combine; 0 = plain nogate mean")
     parser.add_argument("--lpips-w",      type=float, default=1.0)
@@ -188,7 +167,7 @@ def main():
     parser.add_argument("--log-every",    type=int, default=50)
     parser.add_argument("--val-every",    type=int, default=500)
     parser.add_argument("--ckpt-every",   type=int, default=2)
-    parser.add_argument("--out-dir",      default="output/train_decoder_mls_dropmean_sigreg")
+    parser.add_argument("--out-dir",      default="output/train_decoder_mls_dropmean_plain")
     parser.add_argument("--wandb",        action="store_true")
     parser.add_argument("--wandb-project",default="raev3")
     parser.add_argument("--wandb-entity", default="hongyangd")
@@ -220,9 +199,9 @@ def main():
         import wandb
         wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
-            name=f"decoder-mls-dropmean-bn-sigreg-k{len(args.layers)}",
+            name=f"decoder-mls-dropmean-plain-k{len(args.layers)}",
             config={**vars(args), "global_batch": args.batch_size * world_size},
-            tags=["decoder", "mls", "sigreg", "dropmean", "bn", "stage1", f"k{len(args.layers)}"],
+            tags=["decoder", "mls", "dropmean", "plain", "stage1", f"k{len(args.layers)}"],
         )
 
     # -- Data ------------------------------------------------------------------
@@ -280,9 +259,10 @@ def main():
             val_layers_fixed = [t.detach() for t in encode_layers(val_img_orig)]
         print(f"Val images pre-encoded: {len(val_paths)} from {val_dir}", flush=True)
 
-    # -- Projector (learnable) + Decoder (train from scratch) ------------------
-    projector = MLSProjector(dim=encoder.hidden_size, out_dim=args.latent_dim,
-                             p_drop=args.layer_drop).to(device)
+    # -- Combine (no params) + Decoder (train from scratch) --------------------
+    projector = MLSProjector(n_layers=len(args.layers),
+                             dim=encoder.hidden_size, out_dim=args.latent_dim,
+                             p_drop=args.layer_drop).to(device)   # dropmean only, 0 params
 
     from omegaconf import OmegaConf
     from stage1.rae import _load_decoder
@@ -295,7 +275,7 @@ def main():
         pretrained_path=None,
     ).to(device)
 
-    projector_ddp = DDP(projector, device_ids=[local_rank])
+    projector_ddp = projector            # param-free dropmean combine: no DDP wrap
     decoder_ddp   = DDP(decoder,   device_ids=[local_rank])
 
     ema_proj = deepcopy(projector); ema_proj.requires_grad_(False); ema_proj.eval()
@@ -500,7 +480,8 @@ def main():
                 out = ema_dec(z, drop_cls_token=False).logits
                 return ema_dec.unpatchify(out) * enc_std + enc_mean
             vpsnr, vssim = val_recon_psnr_npz(
-                _recon, args.val_npz, device, n=args.val_n, seed=0, want_ssim=True)
+                _recon, args.val_npz, device, n=args.val_n, seed=0,
+                want_ssim=True)
             print(f"  Val PSNR (EMA, {args.val_n} val imgs): {vpsnr:.3f} dB  "
                   f"SSIM={vssim:.4f}", flush=True)
             if args.wandb:
@@ -508,19 +489,22 @@ def main():
                 wandb.log({"val/psnr": vpsnr, "val/ssim": vssim}, step=global_step)
 
         if is_main and val_layers_fixed is not None:
-            # layer-usage probe (LOO/solo): FINAL EPOCH ONLY — per-epoch
-            # validation is just the full-mean inference PSNR above.
+
+            # layer-usage probe (LOO/solo, gate-aware): FINAL EPOCH ONLY —
+            # per-epoch validation is just the full-mix inference PSNR above.
+            # (Gate collapse is tracked continuously via the gate=[...] log line.)
             if (epoch + 1) == args.epochs:
               with torch.no_grad():
-                def _subset_psnr(toks):
-                    sz  = ema_proj(toks)
+                def _subset_psnr(toks, idx):
+                    sz  = ema_proj(toks, idx=idx)           # softmax renormalized over subset
                     sd  = ema_dec(sz, drop_cls_token=False).logits
                     sr  = (ema_dec.unpatchify(sd) * enc_std + enc_mean).clamp(0, 1)
                     return psnr(sr, val_img_orig)
                 K_val = len(val_layers_fixed)
-                loo  = [_subset_psnr([t for j, t in enumerate(val_layers_fixed) if j != i])
+                loo  = [_subset_psnr([t for j, t in enumerate(val_layers_fixed) if j != i],
+                                     [j for j in range(K_val) if j != i])
                         for i in range(K_val)]
-                solo = [_subset_psnr([val_layers_fixed[i]]) for i in range(K_val)]
+                solo = [_subset_psnr([val_layers_fixed[i]], [i]) for i in range(K_val)]
               dloo = [val_ps - v for v in loo]
               print("  Val LOO dPSNR = [" + " ".join(f"{v:+.2f}" for v in dloo)
                     + f"]  layers={args.layers}", flush=True)

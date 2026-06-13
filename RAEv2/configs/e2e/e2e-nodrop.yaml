@@ -3,7 +3,7 @@
 # Pure end-to-end: all three modules from scratch (init-stage1 empty).
 data: /datasets/imagenet-256-full
 out-dir: output_full/train_e2e_nodrop
-epochs: 10
+epochs: 20
 batch-size: 24
 lr-pd: 2.0e-4
 lr-dit: 2.0e-4
