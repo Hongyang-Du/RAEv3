@@ -24,9 +24,9 @@ data:
   data_dir: /datasets/imagenet-256-full
   image_size: 256
   val_npz: data_eval/imagenet-256-val.npz
-  val_n: 1000
+  val_n: 100
 training:
-  epochs: 10
+  epochs: 5
   batch_size: 32
   lr: 8.0e-4
   warmup_epochs: 2
