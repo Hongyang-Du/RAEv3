@@ -23,8 +23,8 @@ cd "$(dirname "$(realpath "$0")")"
 
 # -- config ---------------------------------------------------
 NGPU=4
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}   # GPUs 4-7 busy with another job
-DATA=/datasets/imagenet-256-full
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
+DATA=/datasets/imagenet-256          # PARTIAL ImageNet (~93K): quick 5-ep gate-collapse test
 OUT_DIR=output_full/train_decoder_mls_softgate_all24
 
 EPOCHS=5

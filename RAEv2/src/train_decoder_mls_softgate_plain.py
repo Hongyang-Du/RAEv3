@@ -448,6 +448,13 @@ def main():
 
             global_step += 1
 
+            # per-step full-precision gate trace (24 floats/step, ~1 MB total)
+            if is_main:
+                gw = torch.softmax(projector.gate, dim=0).detach().tolist()
+                with open(os.path.join(args.out_dir, "gate_log.tsv"), "a") as gf:
+                    gf.write(f"{global_step}\t{int(use_gan)}\t"
+                             + "\t".join(f"{v:.5f}" for v in gw) + "\n")
+
             # -- logging -------------------------------------------------------
             if is_main and global_step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
