@@ -9,7 +9,7 @@ L1+LPIPS+GAN, optional SIGReg, EMA, val-1k PSNR/SSIM, LOO/solo probes) is shared
 
 Usage:
     torchrun --nproc_per_node=4 src/train_decoder.py \
-        --config configs/stage1/decoder/dropmean-bn-sigreg-k23.yaml
+        --config configs/stage1/decoder/random-drop-layer-mls-mlp-sigreg-k23.yaml
 """
 
 import sys, os, math, argparse, time, glob

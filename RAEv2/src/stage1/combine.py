@@ -6,17 +6,21 @@ turns them into the latent z [B, N, out_dim] the ViT decoder consumes. All the
 forked train_decoder_mls*.py scripts differ ONLY in this combine — here it is
 parameterized by four knobs:
 
-  weighting      mean | dropmean | softgate    how the K layers are mixed
-  p_drop         float                          per-sample layer dropout prob
-  cls_surrogate  bool                           add L_last token-mean (raev2)
+  weighting      mean | random_drop | softgate  how the K layers are mixed
+  p_drop         float                          per-sample random LAYER-drop prob
+  cls_surrogate  bool                           add L_last token-mean (raev2 code)
   projector      none | ln | bn                 per-token residual MLP after mix
 
+`random_drop` = "Random Drop Layer MLS": each sample keeps each layer with prob
+(1 - p_drop) (>=1 kept) and z0 is the equal-weight mean over the kept subset.
+Drops whole LAYERS (not units) -> structurally collapse-proof; eval = full mean.
+
 Variant map (the three kept experiments + the legacy ones):
-  raev2 K=23           weighting=mean,     projector=none, cls_surrogate=true
-  Random Drop+Decoder  weighting=dropmean, projector=none, cls_surrogate=false
-  Random Drop+MLP+SIG  weighting=dropmean, projector=bn,   cls_surrogate=false
-  nogate (legacy)      weighting=mean,     projector=ln
-  softgate (legacy)    weighting=softgate, projector=ln|none
+  raev2 K=23              weighting=mean,        projector=none, cls_surrogate=false
+  Random Drop Layer MLS   weighting=random_drop, projector=none, cls_surrogate=false
+  Random Drop Layer + MLP weighting=random_drop, projector=bn,   cls_surrogate=false
+  nogate (legacy)         weighting=mean,        projector=ln
+  softgate (legacy)       weighting=softgate,    projector=ln|none
 
 forward(layer_tokens, idx=None):
   layer_tokens : list of K tensors, each [B, N, dim]
@@ -25,7 +29,7 @@ forward(layer_tokens, idx=None):
                  probes from a single trained model with no retraining.
   returns      : z [B, N, out_dim]
 
-DDP note: with weighting in {mean, dropmean} and projector=none the module has
+DDP note: with weighting in {mean, random_drop} and projector=none the module has
 ZERO parameters. DDP errors on a param-free module, so the trainer must call it
 directly (not wrap it in DDP) when has_params is False.
 """
@@ -38,7 +42,7 @@ import torch.nn.functional as F
 class MLSCombine(nn.Module):
     def __init__(self,
                  layers,
-                 weighting: str = "dropmean",
+                 weighting: str = "random_drop",
                  p_drop: float = 0.3,
                  cls_surrogate: bool = False,
                  projector: str = "none",
@@ -46,7 +50,7 @@ class MLSCombine(nn.Module):
                  out_dim: int = 1024,
                  mult: int = 4):
         super().__init__()
-        assert weighting in ("mean", "dropmean", "softgate"), weighting
+        assert weighting in ("mean", "random_drop", "softgate"), weighting
         assert projector in ("none", "ln", "bn"), projector
         self.layers = list(layers)
         self.K = len(self.layers)
@@ -93,7 +97,7 @@ class MLSCombine(nn.Module):
                 return (gate_w.view(-1, 1, 1, 1) * sub).sum(0)
             return sub.mean(0)
 
-        if self.training and self.weighting in ("dropmean", "softgate") and self.p_drop > 0:
+        if self.training and self.weighting in ("random_drop", "softgate") and self.p_drop > 0:
             keep = torch.rand(K, B, device=stk.device) > self.p_drop
             dead = ~keep.any(0)
             if dead.any():                                  # always keep >= 1 layer
@@ -106,7 +110,7 @@ class MLSCombine(nn.Module):
 
         if gate_w is not None:
             return (gate_w.view(K, 1, 1, 1) * stk).sum(0)
-        return stk.mean(0)                                   # mean / dropmean eval
+        return stk.mean(0)                                   # mean / random_drop eval
 
     def forward(self, layer_tokens, idx=None) -> torch.Tensor:
         stk = torch.stack(layer_tokens, dim=0)              # [K, B, N, dim]
