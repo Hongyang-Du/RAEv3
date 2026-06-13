@@ -17,9 +17,10 @@ decoder:
 loss:
   lpips_w: 1.0
   sigreg:
-    weight: 0.02
-    distributed: true
-    scale_by_n: true
+    weight: 1.0            # gradient-probe: sigreg = 0.30x recon projector-grad (gentle)
+    distributed: true      # global ECF mean across ranks (correct cross-GPU statistic)
+    scale_by_n: false      # MEAN ECF discrepancy, NOT x N -> batch-independent regularizer
+                           # (scale_by_n=true + w=0.02 was ~1942x too strong at N=65536)
   gan:
     disc_weight: 0.75
     disc_start: 1
