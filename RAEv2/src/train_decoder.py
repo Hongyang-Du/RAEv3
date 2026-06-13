@@ -259,6 +259,29 @@ def main():
             update_ema(ema_dec, decoder, T.ema_decay)
             global_step += 1
 
+            # -- step-interval val: PSNR/SSIM on a FIXED random val-N subset ----
+            # (seed 0 -> identical images every step and across runs -> the curve
+            #  reflects model improvement, not sampling noise). Rank 0 evaluates;
+            #  a barrier keeps the other ranks in sync.
+            if T.val_every_steps > 0 and global_step % T.val_every_steps == 0:
+                if is_main and D.val_npz and os.path.exists(D.val_npz):
+                    def _recon(imgs01):
+                        return decode_imgs(ema_dec, ema_combine(encode_layers(imgs01)))
+                    vpsnr, vssim = val_recon_psnr_npz(_recon, D.val_npz, device,
+                                                      n=D.val_n, seed=0, want_ssim=True)
+                    tsv = os.path.join(T.out_dir, "val_psnr_steps.tsv")
+                    if not os.path.exists(tsv):
+                        with open(tsv, "w") as f:
+                            f.write("step\tpsnr\tssim\n")
+                    with open(tsv, "a") as f:
+                        f.write(f"{global_step}\t{vpsnr:.4f}\t{vssim:.4f}\n")
+                    print(f"  [val@{global_step}] PSNR={vpsnr:.3f} dB  SSIM={vssim:.4f}  "
+                          f"({D.val_n} val imgs)", flush=True)
+                    if cfg.wandb.enabled:
+                        import wandb
+                        wandb.log({"val/psnr": vpsnr, "val/ssim": vssim}, step=global_step)
+                dist.barrier()
+
             if is_main and global_step % T.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 zd = gaussian_diag(z); ps = psnr(x_rec, imgs)

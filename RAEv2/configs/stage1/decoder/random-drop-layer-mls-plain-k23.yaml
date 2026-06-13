@@ -33,6 +33,7 @@ training:
   precision: bf16
   ckpt_every: 1
   log_every: 50
+  val_every_steps: 1000
   seed: 42
   out_dir: output_full/decoder_random_drop_layer_mls_plain_k23
 probe:
