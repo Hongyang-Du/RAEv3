@@ -47,8 +47,8 @@ WARMUP_EPOCHS=2
 PRECISION=bf16
 
 W_REC=1.0
-SIGREG_W=0.02           # official LeJEPA lambda — pairs with the N-scaled global
-                        # statistic (loss floor O(1) under H0, batch-size independent)
+SIGREG_W=1.0            # gentle regularizer with the UNSCALED global statistic
+                        # (~0.30x recon projector-grad); 0.02 here would be ~off
 W_FM=1.0
 W_PIX=0.0               # 0 = minimal design (recon + SIGReg + latent FM w/ live target;
                         # FM alone already updates DiT AND projector). >0 adds the
