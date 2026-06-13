@@ -216,6 +216,39 @@ def psnr(x: torch.Tensor, target: torch.Tensor, eps: float = 1e-10) -> float:
     return (-10.0 * torch.log10(mse + eps)).mean().item()
 
 
+_VAL_NPZ_CACHE = {}
+
+
+@torch.no_grad()
+def val_recon_psnr_npz(recon_fn, npz_path, device, n=1000, seed=0, batch=32,
+                       want_ssim=False):
+    """Per-image recon PSNR (+ optional SSIM) over a fixed random subset of an
+    ImageNet val npz ([N,256,256,3] uint8). recon_fn: imgs01 [B,3,256,256] in
+    [0,1] -> reconstruction in [0,1]. Cached array load; same (seed,n) -> same
+    images across epochs/runs. Returns (psnr, ssim or None)."""
+    import numpy as np
+    if npz_path not in _VAL_NPZ_CACHE:
+        z = np.load(npz_path, mmap_mode="r")
+        _VAL_NPZ_CACHE[npz_path] = z[z.files[0]] if hasattr(z, "files") else z
+    arr = _VAL_NPZ_CACHE[npz_path]
+    idx = torch.randperm(len(arr), generator=torch.Generator().manual_seed(seed))[:n].tolist()
+    ssim_metric = None
+    if want_ssim:
+        from torchmetrics.image import StructuralSimilarityIndexMeasure
+        ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    psnrs = []
+    for i in range(0, len(idx), batch):
+        imgs = torch.stack([torch.from_numpy(arr[j].copy()) for j in idx[i:i + batch]])
+        imgs = imgs.permute(0, 3, 1, 2).float().to(device) / 255
+        rec = recon_fn(imgs).clamp(0, 1).float()
+        mse = ((rec - imgs) ** 2).flatten(1).mean(1)
+        psnrs.append(-10.0 * torch.log10(mse + 1e-10))
+        if ssim_metric is not None:
+            ssim_metric.update(rec, imgs)
+    psnr_val = torch.cat(psnrs).mean().item()
+    return psnr_val, (ssim_metric.compute().item() if ssim_metric is not None else None)
+
+
 # ─── Token Upsampler: 4 register tokens → 256 patch positions ────────────────
 
 class TokenUpsampler(nn.Module):

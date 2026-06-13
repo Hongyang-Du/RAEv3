@@ -193,7 +193,8 @@ def euler_sample(dit, noise, labels, num_steps=50, t_eps=0.05):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data",          required=True)
+    parser.add_argument("--config", default=None, help="flat YAML config (configs/e2e/*.yaml)")
+    parser.add_argument("--data",          default=None)
     parser.add_argument("--image-size",    type=int, default=256)
     parser.add_argument("--epochs",        type=int, default=10)
     parser.add_argument("--batch-size",    type=int, default=24, help="Per-GPU batch size")
@@ -239,7 +240,15 @@ def main():
     parser.add_argument("--num-workers",   type=int, default=4)
     parser.add_argument("--seed",          type=int, default=42)
     parser.add_argument("--precision",     type=str, default="bf16", choices=["fp32", "bf16"])
+    # YAML config provides defaults; explicit CLI flags still override them.
+    cfg_ns, _ = parser.parse_known_args()
+    if cfg_ns.config:
+        import yaml
+        ycfg = yaml.safe_load(open(cfg_ns.config)) or {}
+        parser.set_defaults(**{k.replace("-", "_"): v for k, v in ycfg.items()})
     args = parser.parse_args()
+    if args.data is None:
+        parser.error("--data is required (set it in --config or on the CLI)")
 
     # -- DDP init --------------------------------------------------------------
     dist.init_process_group("nccl")

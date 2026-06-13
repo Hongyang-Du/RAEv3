@@ -1,0 +1,49 @@
+# Experiment 1: Random Drop + MLP + SIGReg
+# dropmean combine -> BN-MLP projector (LeWM recipe) -> SIGReg(lambda 0.02, global, N-scaled)
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: dropmean
+    p_drop: 0.3
+    cls_surrogate: false
+    projector: bn
+    dim: 1024
+    out_dim: 1024
+    mult: 4
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg:
+    weight: 0.02
+    distributed: true
+    scale_by_n: true
+  gan:
+    disc_weight: 0.75
+    disc_start: 1
+data:
+  data_dir: /datasets/imagenet-256-full
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 1000
+training:
+  epochs: 10
+  batch_size: 32
+  lr: 8.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: output_full/decoder_dropmean_bn_sigreg_k23
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: decoder-dropmean-bn-sigreg-k23

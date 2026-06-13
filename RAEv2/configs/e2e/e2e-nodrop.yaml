@@ -1,0 +1,25 @@
+# E2E joint training (projector + decoder + DiT), nodrop variant.
+# Flat YAML: keys map to train_e2e_sigreg_dit.py argparse dest names.
+# Pure end-to-end: all three modules from scratch (init-stage1 empty).
+data: /datasets/imagenet-256-full
+out-dir: output_full/train_e2e_nodrop
+epochs: 10
+batch-size: 24
+lr-pd: 2.0e-4
+lr-dit: 2.0e-4
+warmup-epochs: 2
+w-rec: 1.0
+lpips-w: 1.0
+sigreg-w: 0.02          # official LeJEPA lambda (paired with N-scaled global stat)
+w-fm: 1.0
+w-pix: 0.0              # minimal design: live FM target already reaches the projector
+layer-drop: 0.0        # nodrop: deterministic FM target
+init-stage1: ""        # from scratch
+ema-decay: 0.9995
+ckpt-every: 2
+log-every: 50
+sample-every: 2500
+val-image: assets/samples/sample_1.png
+wandb: true
+wandb-project: raev3-full
+wandb-entity: uscgvl
