@@ -67,7 +67,6 @@ class TrainingConfig:
     precision: str = "bf16"       # fp32 | bf16
     ckpt_every: int = 1
     log_every: int = 50
-    val_every_steps: int = 1000   # eval val-N PSNR/SSIM every N optimizer steps (0 = off)
     seed: int = 42
     out_dir: str = "output_full/decoder_run"
 
