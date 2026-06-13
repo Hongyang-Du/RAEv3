@@ -307,6 +307,8 @@ def main():
         if is_main:
             print(f"Warm-started projector+decoder from {args.init_stage1} (ep {ck.get('epoch')})")
         del ck
+    elif is_main:
+        print("No --init-stage1: projector + decoder trained FROM SCRATCH (pure e2e)")
 
     dit = DiTwDDTHeadIG(
         input_size=16, patch_size=[1, 1], in_channels=args.latent_dim,

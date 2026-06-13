@@ -23,24 +23,27 @@ cd "$(dirname "$(realpath "$0")")"
 NGPU=8
 DATA=/datasets/imagenet-256-full
 
+# PURE end-to-end: projector + decoder + DiT all trained FROM SCRATCH (no warm-start).
+# INIT_STAGE1 empty -> random init for all three. Set it to a stage-1 ckpt to warm-start.
 case "${VARIANT}" in
   nodrop)   # plain mean (nogate-style), deterministic FM target
     OUT_DIR=output_full/train_e2e_nodrop
     LAYER_DROP=0.0
-    INIT_STAGE1=output_full/train_decoder_mls_nogate_sigreg/ckpt_latest.pt
+    INIT_STAGE1=""
     ;;
   drop)     # dropmean-style random layer dropout 0.3 (stochastic FM target)
     OUT_DIR=output_full/train_e2e_drop
     LAYER_DROP=0.3
-    INIT_STAGE1=output_full/train_decoder_mls_dropmean_sigreg/ckpt_latest.pt
+    INIT_STAGE1=""
     ;;
   *) echo "unknown variant: ${VARIANT} (use nodrop|drop)"; exit 1 ;;
 esac
 
-EPOCHS=10
+EPOCHS=10              # from-scratch: decoder+DiT both need more than the 10-ep warm-start budget
 BATCH=24                # per GPU; e2e holds DiT+decoder+projector -> heavier than either stage
-LR_PD=1e-4              # projector+decoder AdamW (warm-started, fine-tune pace)
+LR_PD=2e-4             # projector+decoder AdamW (from scratch -> faster than the 1e-4 fine-tune pace)
 LR_DIT=2e-4             # DiT gmuon, same as stage-2 baselines
+WARMUP_EPOCHS=2
 PRECISION=bf16
 
 W_REC=1.0
@@ -73,7 +76,7 @@ echo "========================================================"
 echo "  E2E projector(SIGReg)+decoder+DiT  variant=${VARIANT}"
 echo "  GPUs: ${NGPU}  Batch: ${BATCH}/GPU (global $((BATCH * NGPU)))"
 echo "  Epochs: ${EPOCHS}  |  lr_pd ${LR_PD}  lr_dit ${LR_DIT}  |  w_fm ${W_FM}  w_pix ${W_PIX}  layer_drop ${LAYER_DROP}"
-echo "  Init stage-1: ${INIT_STAGE1}"
+echo "  Init stage-1: ${INIT_STAGE1:-<none, train from scratch>}"
 echo "  Output: ${OUT_DIR}"
 echo "========================================================"
 
@@ -84,6 +87,10 @@ fi
 INIT_DIT_ARGS=""
 if [[ -n "${INIT_DIT}" ]]; then
     INIT_DIT_ARGS="--init-dit ${INIT_DIT}"
+fi
+INIT_STAGE1_ARGS=""
+if [[ -n "${INIT_STAGE1}" ]]; then
+    INIT_STAGE1_ARGS="--init-stage1 ${INIT_STAGE1}"
 fi
 
 MASTER_PORT=$(${PYTHON} -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
@@ -104,12 +111,12 @@ PYTORCH_ALLOC_CONF=expandable_segments:True ${TORCHRUN} --nproc_per_node=${NGPU}
     --w-fm         "${W_FM}" \
     --w-pix        "${W_PIX}" \
     --layer-drop   "${LAYER_DROP}" \
-    --init-stage1  "${INIT_STAGE1}" \
+    --warmup-epochs "${WARMUP_EPOCHS}" \
     --ckpt-every   "${CKPT_EVERY}" \
     --log-every    "${LOG_EVERY}" \
     --sample-every "${SAMPLE_EVERY}" \
     --val-image    "${VAL_IMAGE}" \
-    ${INIT_DIT_ARGS} ${EXTRA_FLAGS} ${WANDB_ARGS}
+    ${INIT_STAGE1_ARGS} ${INIT_DIT_ARGS} ${EXTRA_FLAGS} ${WANDB_ARGS}
 
 echo ""
 echo "Done. Outputs in ${OUT_DIR}/"
