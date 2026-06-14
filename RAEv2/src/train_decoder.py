@@ -12,7 +12,7 @@ Usage:
         --config configs/stage1/decoder/random-drop-layer-mls-mlp-sigreg-k23.yaml
 """
 
-import sys, os, math, argparse, time, glob
+import sys, os, math, argparse, time, glob, threading
 from copy import deepcopy
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -89,6 +89,10 @@ def main():
         wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity,
                    name=cfg.wandb.name, config=OmegaConf.to_container(OmegaConf.structured(cfg)),
                    tags=["decoder", "stage1"])
+        # val runs async (background thread, after training has advanced past this
+        # step), so give val/* its own x-axis -> wandb won't drop it for a step regression
+        wandb.define_metric("val/step")
+        wandb.define_metric("val/*", step_metric="val/step")
 
     # -- data ------------------------------------------------------------------
     train_loader, train_sampler = make_loader(
@@ -216,6 +220,75 @@ def main():
         m = dec.module if isinstance(dec, DDP) else dec
         return (m.unpatchify(out) * enc_std + enc_mean).clamp(0, 1)
 
+    # -- async val/ckpt: rank 0 snapshots (frozen EMA copy + CPU-cloned ckpt),
+    # then a daemon thread runs val + torch.save while the next epoch trains.
+    # The snapshot makes it race-free; no collective inside -> no deadlock.
+    def _to_cpu(obj):
+        if torch.is_tensor(obj):
+            return obj.detach().to("cpu", copy=True)
+        if isinstance(obj, dict):
+            return {k: _to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_to_cpu(v) for v in obj]
+        return obj
+
+    def _async_val_save(sn_combine, sn_dec, ckpt_cpu, ep, gstep, do_probe):
+        wb = None
+        if cfg.wandb.enabled:
+            import wandb as wb
+        # -- demo val
+        if val_layers_fixed is not None:
+            with torch.no_grad():
+                vrec = decode_imgs(sn_dec, sn_combine(val_layers_fixed))
+            vps_demo = psnr(vrec, val_img_orig)
+            print(f"  [val ep{ep}] PSNR (EMA, {vrec.shape[0]} demo imgs): {vps_demo:.2f} dB", flush=True)
+            if wb is not None:
+                wb.log({"val/psnr_demo": vps_demo, "val/step": gstep})
+        # -- val-N subset (functional SSIM: no Metric.compute() PG sync)
+        if val_eval_imgs is not None:
+            from torchmetrics.functional.image import structural_similarity_index_measure as _ssim_fn
+            psnrs, ssims = [], []
+            with torch.no_grad():
+                for i in range(0, val_eval_imgs.shape[0], 32):
+                    vb = val_eval_imgs[i:i + 32].to(device).float() / 255
+                    rec = decode_imgs(sn_dec, sn_combine(encode_layers(vb))).clamp(0, 1).float()
+                    mse = ((rec - vb) ** 2).flatten(1).mean(1)
+                    psnrs.append(-10.0 * torch.log10(mse + 1e-10))
+                    ssims.append(_ssim_fn(rec, vb, data_range=1.0).item() * rec.shape[0])
+            vpsnr = torch.cat(psnrs).mean().item()
+            vssim = sum(ssims) / val_eval_imgs.shape[0]
+            print(f"  [val ep{ep}] PSNR (EMA, {D.val_n} val imgs): {vpsnr:.3f} dB  SSIM={vssim:.4f}", flush=True)
+            tsv = os.path.join(T.out_dir, "val_psnr_steps.tsv")
+            if not os.path.exists(tsv):
+                with open(tsv, "w") as f:
+                    f.write("step\tpsnr\tssim\n")
+            with open(tsv, "a") as f:
+                f.write(f"{gstep}\t{vpsnr:.4f}\t{vssim:.4f}\n")
+            if wb is not None:
+                wb.log({"val/psnr": vpsnr, "val/ssim": vssim, "val/step": gstep})
+        # -- LOO/solo probes (final epoch only by default)
+        if do_probe and val_layers_fixed is not None:
+            with torch.no_grad():
+                def _sub_psnr(idx):
+                    return psnr(decode_imgs(sn_dec, sn_combine(val_layers_fixed, idx=idx)), val_img_orig)
+                full = psnr(decode_imgs(sn_dec, sn_combine(val_layers_fixed)), val_img_orig)
+                K = len(val_layers_fixed)
+                loo = [_sub_psnr([j for j in range(K) if j != i]) for i in range(K)]
+                solo = [_sub_psnr([i]) for i in range(K)]
+            dloo = [full - v for v in loo]
+            print("  [val ep%d] LOO dPSNR = [" % ep + " ".join(f"{v:+.2f}" for v in dloo) + f"]  layers={layers}", flush=True)
+            print("  [val ep%d] solo PSNR = [" % ep + " ".join(f"{v:.2f}" for v in solo) + "]", flush=True)
+            if wb is not None:
+                wb.log({**{f"val/loo_dpsnr_L{l}": v for l, v in zip(layers, dloo)},
+                        **{f"val/solo_psnr_L{l}": v for l, v in zip(layers, solo)}, "val/step": gstep})
+        # -- checkpoint (CPU-cloned, safe to save while training mutates the live model)
+        torch.save(ckpt_cpu, latest)
+        if ep % T.ckpt_every == 0:
+            torch.save(ckpt_cpu, os.path.join(T.out_dir, f"ckpt_ep{ep:03d}.pt"))
+        print(f"  [val ep{ep}] saved ckpt", flush=True)
+
+    val_thread = None
+
     # -- training loop ---------------------------------------------------------
     for epoch in range(start_epoch, T.epochs):
         train_sampler.set_epoch(epoch)
@@ -294,73 +367,33 @@ def main():
         if is_main:
             print(f"Epoch {epoch+1}/{T.epochs}  time={time.time()-t0:.0f}s", flush=True)
 
-        # -- per-epoch val ------------------------------------------------------
-        if is_main and val_layers_fixed is not None:
-            with torch.no_grad():
-                vrec = decode_imgs(ema_dec, ema_combine(val_layers_fixed))
-            vps_demo = psnr(vrec, val_img_orig)
-            print(f"  Val PSNR (EMA, {vrec.shape[0]} demo imgs): {vps_demo:.2f} dB", flush=True)
-            if cfg.wandb.enabled:
-                import wandb; wandb.log({"val/psnr_demo": vps_demo}, step=global_step)
-
-        if is_main and val_eval_imgs is not None:
-            from torchmetrics.image import StructuralSimilarityIndexMeasure
-            ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-            psnrs = []
-            with torch.no_grad():
-                for i in range(0, val_eval_imgs.shape[0], 32):
-                    vb = val_eval_imgs[i:i + 32].to(device).float() / 255      # [b,3,256,256]
-                    rec = decode_imgs(ema_dec, ema_combine(encode_layers(vb))).clamp(0, 1).float()
-                    mse = ((rec - vb) ** 2).flatten(1).mean(1)
-                    psnrs.append(-10.0 * torch.log10(mse + 1e-10))
-                    ssim_metric.update(rec, vb)
-            vpsnr = torch.cat(psnrs).mean().item()
-            vssim = ssim_metric.compute().item()
-            print(f"  Val PSNR (EMA, {D.val_n} val imgs): {vpsnr:.3f} dB  SSIM={vssim:.4f}", flush=True)
-            # append to TSV (epoch, step, psnr, ssim) for plot_val_psnr_steps.py
-            tsv = os.path.join(T.out_dir, "val_psnr_steps.tsv")
-            if not os.path.exists(tsv):
-                with open(tsv, "w") as f:
-                    f.write("step\tpsnr\tssim\n")
-            with open(tsv, "a") as f:
-                f.write(f"{global_step}\t{vpsnr:.4f}\t{vssim:.4f}\n")
-            if cfg.wandb.enabled:
-                import wandb; wandb.log({"val/psnr": vpsnr, "val/ssim": vssim}, step=global_step)
-
-        # -- LOO/solo probes ----------------------------------------------------
-        do_probe = (P.loo_solo == "every") or (P.loo_solo == "final" and epoch + 1 == T.epochs)
-        if is_main and do_probe and val_layers_fixed is not None:
-            with torch.no_grad():
-                def _sub_psnr(idx):
-                    return psnr(decode_imgs(ema_dec, ema_combine(val_layers_fixed, idx=idx)), val_img_orig)
-                full = psnr(decode_imgs(ema_dec, ema_combine(val_layers_fixed)), val_img_orig)
-                K = len(val_layers_fixed)
-                loo = [_sub_psnr([j for j in range(K) if j != i]) for i in range(K)]
-                solo = [_sub_psnr([i]) for i in range(K)]
-            dloo = [full - v for v in loo]
-            print("  Val LOO dPSNR = [" + " ".join(f"{v:+.2f}" for v in dloo) + f"]  layers={layers}", flush=True)
-            print("  Val solo PSNR = [" + " ".join(f"{v:.2f}" for v in solo) + "]", flush=True)
-            if cfg.wandb.enabled:
-                import wandb
-                wandb.log({**{f"val/loo_dpsnr_L{l}": v for l, v in zip(layers, dloo)},
-                           **{f"val/solo_psnr_L{l}": v for l, v in zip(layers, solo)}}, step=global_step)
-
-        # -- checkpoint ---------------------------------------------------------
+        # -- async val + ckpt ---------------------------------------------------
+        # rank 0 takes a frozen snapshot (EMA deepcopy + CPU-cloned ckpt), hands
+        # it to a daemon thread, then hits the barrier immediately. val + save run
+        # concurrently with the next epoch's training -> no epoch-boundary stall.
         if is_main:
-            ckpt = {"epoch": epoch + 1, "global_step": global_step, "layers": layers,
-                    "combine": combine.state_dict(), "decoder": decoder.state_dict(),
-                    "ema_combine": ema_combine.state_dict(), "ema_dec": ema_dec.state_dict(),
-                    "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
-                    "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()}
-            torch.save(ckpt, latest)
-            if (epoch + 1) % T.ckpt_every == 0:
-                torch.save(ckpt, os.path.join(T.out_dir, f"ckpt_ep{epoch+1:03d}.pt"))
-            print(f"  Saved ckpt (ep{epoch+1})", flush=True)
+            if val_thread is not None:
+                val_thread.join()                 # serialize: prev epoch's val/save done
+            sn_combine = deepcopy(ema_combine).eval()
+            sn_dec = deepcopy(ema_dec).eval()
+            ckpt_cpu = _to_cpu({
+                "epoch": epoch + 1, "global_step": global_step, "layers": layers,
+                "combine": combine.state_dict(), "decoder": decoder.state_dict(),
+                "ema_combine": ema_combine.state_dict(), "ema_dec": ema_dec.state_dict(),
+                "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
+                "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
+            do_probe = (P.loo_solo == "every") or (P.loo_solo == "final" and epoch + 1 == T.epochs)
+            val_thread = threading.Thread(
+                target=_async_val_save,
+                args=(sn_combine, sn_dec, ckpt_cpu, epoch + 1, global_step, do_probe),
+                daemon=True)
+            val_thread.start()
 
-        # all ranks wait for rank 0's val + ckpt before starting the next epoch,
-        # so the others don't race ahead to the next SIGReg broadcast and time out
+        # cheap sync point (rank 0 only snapshotted, no slow work) so no rank drifts
         dist.barrier()
 
+    if is_main and val_thread is not None:
+        val_thread.join()                         # finish the last epoch's val + ckpt
     if cfg.wandb.enabled and is_main:
         import wandb; wandb.finish()
     dist.destroy_process_group()

@@ -42,8 +42,9 @@ Usage:
         --epochs 10 --batch-size 24 --wandb
 """
 
-import sys, os, math, argparse, time, glob
+import sys, os, math, argparse, time, glob, threading
 from copy import deepcopy
+from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -251,7 +252,10 @@ def main():
         parser.error("--data is required (set it in --config or on the CLI)")
 
     # -- DDP init --------------------------------------------------------------
-    dist.init_process_group("nccl")
+    # 30-min timeout (default 10min): rank 0's per-epoch ckpt save (DiT + decoder
+    # + EMA + 2 optimizers, several GB to NFS) can exceed 10min while ranks 1-7
+    # wait at the next epoch's first collective -> NCCL timeout crash.
+    dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     rank       = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -275,6 +279,10 @@ def main():
                         + (f"-drop{args.layer_drop}" if args.layer_drop > 0 else ""),
                    config={**vars(args), "global_batch": args.batch_size * world_size},
                    tags=["e2e", "sigreg", "dit", "stage1+2", f"k{len(args.layers)}"])
+        # val runs async (background thread, after training advances past this step),
+        # so give val/* its own x-axis -> wandb won't drop it for a step regression
+        wandb.define_metric("val/step")
+        wandb.define_metric("val/*", step_metric="val/step")
 
     # -- Data ------------------------------------------------------------------
     train_loader, train_sampler = make_loader(
@@ -420,6 +428,56 @@ def main():
         m = dec_module.module if isinstance(dec_module, DDP) else dec_module
         return (m.unpatchify(out) * enc_std + enc_mean).clamp(0, 1)
 
+    # -- async val/ckpt: rank 0 snapshots the live projector/decoder + EMA DiT
+    # (frozen deepcopies) and a CPU-cloned ckpt, then a daemon thread runs val +
+    # torch.save while the next epoch trains. Snapshots make it race-free; the
+    # thread issues no collective -> deadlock-free.
+    def _to_cpu(obj):
+        if torch.is_tensor(obj):
+            return obj.detach().to("cpu", copy=True)
+        if isinstance(obj, dict):
+            return {k: _to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_to_cpu(v) for v in obj]
+        return obj
+
+    def _async_val_save(sn_proj, sn_dec, sn_dit, ckpt_cpu, ep, gstep):
+        wb = None
+        if args.wandb:
+            import wandb as wb
+        if val_layers_fixed is not None:
+            with torch.no_grad():
+                vz_tok = sn_proj(val_layers_fixed)
+                v_rec  = decode_imgs(sn_dec, vz_tok)
+                val_ps = psnr(v_rec, val_img_orig)
+                print(f"  [val ep{ep}] PSNR: {val_ps:.2f} dB", flush=True)
+                vz_sp = tokens_to_spatial(vz_tok)
+                parts = []
+                for tv in (0.25, 0.5, 0.75, 0.95):
+                    xt_v = (1 - tv) * vz_sp + tv * val_eps
+                    tt = torch.full((vz_sp.shape[0],), tv, device=device)
+                    with autocast_ctx:
+                        pred = sn_dit(xt_v, tt, context=val_labels, attn_mask=None)
+                    if isinstance(pred, tuple):
+                        pred = pred[0]
+                    img = decode_imgs(sn_dec, spatial_to_tokens(pred.float()))
+                    parts.append((tv, psnr(img, val_img_orig)))
+                grid = "  ".join(f"t{int(tv*100)}={v:.2f}" for tv, v in parts)
+                print(f"  [val ep{ep}] Denoise PSNR: {grid}  ceil={val_ps:.2f} dB", flush=True)
+            if wb is not None:
+                wb.log({"val/psnr": val_ps,
+                        **{f"val/denoise_psnr_t{int(tv*100)}": v for tv, v in parts},
+                        "val/denoise_psnr_ceiling": val_ps, "val/step": gstep})
+        torch.save(ckpt_cpu, os.path.join(args.out_dir, "ckpt_latest.pt"))
+        if ep % args.ckpt_every == 0:
+            p = os.path.join(args.out_dir, f"ckpt_ep{ep:03d}.pt")
+            torch.save(ckpt_cpu, p)
+            print(f"  [val ep{ep}] saved {p}", flush=True)
+        else:
+            print(f"  [val ep{ep}] saved ckpt_latest.pt", flush=True)
+
+    val_thread = None
+
     # -- Training ------------------------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
@@ -541,39 +599,18 @@ def main():
         if is_main:
             print(f"Epoch {epoch+1}/{args.epochs}  time={time.time()-t0:.0f}s", flush=True)
 
-        # -- per-epoch probes on the LIVE projector/decoder (eval mode: BN uses
-        # running stats, layer-drop off) + EMA DiT --------------------------------
-        if is_main and val_layers_fixed is not None:
-            projector.eval(); decoder.eval()
-            with torch.no_grad():
-                vz_tok = projector(val_layers_fixed)
-                v_rec  = decode_imgs(decoder, vz_tok)
-                val_ps = psnr(v_rec, val_img_orig)
-                print(f"  Val PSNR (EMA): {val_ps:.2f} dB", flush=True)
-
-                vz_sp = tokens_to_spatial(vz_tok)
-                parts = []
-                for tv in (0.25, 0.5, 0.75, 0.95):
-                    xt_v = (1 - tv) * vz_sp + tv * val_eps
-                    tt = torch.full((vz_sp.shape[0],), tv, device=device)
-                    with autocast_ctx:
-                        pred = ema_dit(xt_v, tt, context=val_labels, attn_mask=None)
-                    if isinstance(pred, tuple):
-                        pred = pred[0]
-                    img = decode_imgs(decoder, spatial_to_tokens(pred.float()))
-                    parts.append((tv, psnr(img, val_img_orig)))
-                grid = "  ".join(f"t{int(tv*100)}={v:.2f}" for tv, v in parts)
-                print(f"  Denoise PSNR (EMA): {grid}  ceil={val_ps:.2f} dB", flush=True)
-            projector.train(); decoder.train()
-            if args.wandb:
-                import wandb
-                wandb.log({"val/psnr": val_ps,
-                           **{f"val/denoise_psnr_t{int(tv*100)}": v for tv, v in parts},
-                           "val/denoise_psnr_ceiling": val_ps}, step=global_step)
-
-        # -- checkpoint -------------------------------------------------------------
+        # -- async val + ckpt -------------------------------------------------------
+        # rank 0 snapshots the live projector/decoder + EMA DiT (frozen deepcopies,
+        # eval mode) and a CPU-cloned ckpt, hands them to a daemon thread, then hits
+        # the barrier immediately. val + save run concurrently with the next epoch's
+        # training -> no epoch-boundary stall, and the live modules are never toggled.
         if is_main:
-            ck = {
+            if val_thread is not None:
+                val_thread.join()                 # serialize: prev epoch's val/save done
+            sn_proj = deepcopy(projector).eval()
+            sn_dec  = deepcopy(decoder).eval()
+            sn_dit  = deepcopy(ema_dit).eval()
+            ckpt_cpu = _to_cpu({
                 "epoch": epoch + 1, "global_step": global_step,
                 "projector": projector.state_dict(), "decoder": decoder.state_dict(),
                 "dit": dit.state_dict(),
@@ -581,15 +618,18 @@ def main():
                 "opt_pd": opt_pd.state_dict(), "opt_dit": opt_dit.state_dict(),
                 "sched_pd": sched_pd.state_dict(), "sched_dit": sched_dit.state_dict(),
                 "layers": args.layers, "args": vars(args),
-            }
-            torch.save(ck, os.path.join(args.out_dir, "ckpt_latest.pt"))
-            if (epoch + 1) % args.ckpt_every == 0:
-                p = os.path.join(args.out_dir, f"ckpt_ep{epoch+1:03d}.pt")
-                torch.save(ck, p)
-                print(f"  Saved {p}", flush=True)
-            else:
-                print(f"  Saved ckpt_latest.pt (ep{epoch+1})", flush=True)
+            })
+            val_thread = threading.Thread(
+                target=_async_val_save,
+                args=(sn_proj, sn_dec, sn_dit, ckpt_cpu, epoch + 1, global_step),
+                daemon=True)
+            val_thread.start()
 
+        # cheap sync point (rank 0 only snapshotted, no slow work) so no rank drifts
+        dist.barrier()
+
+    if is_main and val_thread is not None:
+        val_thread.join()                         # finish the last epoch's val + ckpt
     if args.wandb and is_main:
         import wandb; wandb.finish()
     dist.destroy_process_group()
