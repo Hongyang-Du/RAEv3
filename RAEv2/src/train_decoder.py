@@ -211,7 +211,26 @@ def main():
         if is_main:
             print(f"Resumed from {latest} (epoch={start_epoch}, step={global_step})")
         del ck
+    elif getattr(T, "init_from", None):
+        # warm-start: load weights from an external ckpt but train fresh (epoch 0,
+        # new optimizer/scheduler/LR). Used to fine-tune a drop-trained model with
+        # full layers (p_drop=0) to close the train/inference gap.
+        ck = torch.load(T.init_from, map_location="cpu", weights_only=False)
+        combine.load_state_dict(ck["combine"]); decoder.load_state_dict(ck["decoder"])
+        ema_combine.load_state_dict(ck["ema_combine"]); ema_dec.load_state_dict(ck["ema_dec"])
+        if "disc" in ck:
+            disc.load_state_dict(ck["disc"])
+        if is_main:
+            print(f"Warm-started weights from {T.init_from} (fresh optimizer, epoch=0)")
+        del ck
 
+    # SIGReg regularizes the projector's latent -> it only has effect with a
+    # parametric projector, and the proven recipe (LeWM) is the BN-MLP. Forbid the
+    # silent no-op (projector=none) and the untested ln combo: sigreg => bn.
+    if L.sigreg is not None and C.params.get("projector") != "bn":
+        raise ValueError(
+            f"loss.sigreg is set but combine.projector={C.params.get('projector')!r}; "
+            "SIGReg requires projector: bn (BN-MLP). Set projector: bn or disable sigreg.")
     use_sig = L.sigreg is not None and combine_has_params
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=(T.precision == "bf16"))
 

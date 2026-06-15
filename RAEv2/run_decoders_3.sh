@@ -22,6 +22,7 @@ CONFIGS=(
   configs/stage1/decoder/random-drop-layer-mls-mlp-sigreg-k23.yaml
   configs/stage1/decoder/random-drop-layer-mls-plain-k23.yaml
   configs/stage1/decoder/raev2-k23.yaml
+  configs/stage1/decoder/random-drop-pfull-mls-mlp-sigreg-k23.yaml
 )
 
 banner () {

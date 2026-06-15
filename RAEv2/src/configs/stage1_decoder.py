@@ -69,6 +69,8 @@ class TrainingConfig:
     log_every: int = 50
     seed: int = 42
     out_dir: str = "output_full/decoder_run"
+    init_from: Optional[str] = None   # warm-start weights from an external ckpt
+                                      # (combine+decoder+ema+disc); fresh optimizer/epoch
 
 
 @dataclass

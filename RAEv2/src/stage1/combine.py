@@ -8,6 +8,8 @@ parameterized by four knobs:
 
   weighting      mean | random_drop | softgate  how the K layers are mixed
   p_drop         float                          per-sample random LAYER-drop prob
+  p_full         float                          per-sample prob of keeping ALL layers
+                                                (no drop) -> mixes full + dropped passes
   cls_surrogate  bool                           add L_last token-mean (raev2 code)
   projector      none | ln | bn                 per-token residual MLP after mix
 
@@ -44,6 +46,7 @@ class MLSCombine(nn.Module):
                  layers,
                  weighting: str = "random_drop",
                  p_drop: float = 0.3,
+                 p_full: float = 0.0,
                  cls_surrogate: bool = False,
                  projector: str = "none",
                  dim: int = 1024,
@@ -52,10 +55,12 @@ class MLSCombine(nn.Module):
         super().__init__()
         assert weighting in ("mean", "random_drop", "softgate"), weighting
         assert projector in ("none", "ln", "bn"), projector
+        assert 0.0 <= p_full <= 1.0, p_full
         self.layers = list(layers)
         self.K = len(self.layers)
         self.weighting = weighting
         self.p_drop = p_drop
+        self.p_full = p_full           # per-sample prob of keeping ALL layers (no drop)
         self.cls_surrogate = cls_surrogate
         self.projector = projector
 
@@ -102,6 +107,9 @@ class MLSCombine(nn.Module):
             dead = ~keep.any(0)
             if dead.any():                                  # always keep >= 1 layer
                 keep[torch.randint(K, (int(dead.sum()),), device=stk.device), dead] = True
+            if self.p_full > 0:                             # some samples keep ALL layers
+                full = torch.rand(B, device=stk.device) < self.p_full
+                keep[:, full] = True
             w = keep.to(stk.dtype)
             if gate_w is not None:
                 w = w * gate_w.view(K, 1)

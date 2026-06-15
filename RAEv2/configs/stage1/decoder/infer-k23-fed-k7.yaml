@@ -1,0 +1,26 @@
+# INFERENCE experiment: take the trained k=23 Random-Drop + MLP + SIGReg decoder
+# and feed it ONLY the raev2-default 7 layers [11,13,15,17,19,21,23] at inference
+# (a subset of its 23 trained layers). Tests whether one drop-trained model can be
+# run at a smaller layer budget and match a decoder trained specifically for k=7
+# (configs/.../raev2-k7.yaml). Eval-only -> read by src/eval_recon_subset.py.
+#
+# combine MUST match the k=23 training arch so the saved weights load.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: random_drop
+    p_drop: 0.3
+    p_full: 0.0
+    cls_surrogate: false
+    projector: bn
+    dim: 1024
+    out_dim: 1024
+    mult: 4
+eval:
+  ckpt: output_full/decoder_random_drop_layer_mls_mlp_sigreg_k23/ckpt_latest.pt
+  subset_layers: [11, 13, 15, 17, 19, 21, 23]   # feed only these (raev2 default K=7)
+  num_images: 1000
+  val_npz: data_eval/imagenet-256-val.npz
+  seed: 0
+  tag: k23_fed_raev2k7

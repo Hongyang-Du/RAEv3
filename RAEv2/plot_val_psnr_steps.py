@@ -13,6 +13,7 @@ RUNS = {
     "Random Drop Layer MLS + MLP + SIGReg": ("output_full/decoder_random_drop_layer_mls_mlp_sigreg_k23", "tab:red"),
     "Random Drop Layer MLS (-> decoder)":   ("output_full/decoder_random_drop_layer_mls_plain_k23",      "tab:blue"),
     "raev2 K=23":                            ("output_full/decoder_raev2_k23",                            "tab:gray"),
+    "Random Drop + p_full + L23 + MLP + SIGReg": ("output_full/decoder_random_drop_pfull_mls_mlp_sigreg_k23", "tab:green"),
 }
 
 
@@ -38,7 +39,7 @@ for name, (d, c) in RUNS.items():
             label=f"{name} (last {psnr[-1]:.2f} dB)")
 
 ax.set_xlabel("optimizer step")
-ax.set_ylabel("val PSNR [dB]  (1000 random ImageNet-val images, seed 0)")
+ax.set_ylabel("val PSNR [dB]  (100 random ImageNet-val images, seed 0)")
 ax.set_title("Stage-1 decoder reconstruction PSNR vs training step", fontsize=12)
 ax.legend(fontsize=9)
 ax.grid(alpha=0.3)

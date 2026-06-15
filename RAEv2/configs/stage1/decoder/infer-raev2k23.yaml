@@ -1,0 +1,19 @@
+# Our retrained raev2 k=23 baseline (mean over 23 layers, no drop, no projector,
+# no SIGReg). Eval-only handle for layer-usage / subset probing.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: mean
+    p_drop: 0.0
+    p_full: 0.0
+    cls_surrogate: false
+    projector: none
+    dim: 1024
+    out_dim: 1024
+eval:
+  ckpt: output_full/decoder_raev2_k23/ckpt_latest.pt
+  num_images: 100
+  val_npz: data_eval/imagenet-256-val.npz
+  seed: 0
+  tag: ours_raev2_k23
