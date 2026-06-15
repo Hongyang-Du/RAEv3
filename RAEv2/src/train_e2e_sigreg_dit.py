@@ -158,7 +158,7 @@ def _strip_prefixes(sd):
 
 def make_loader(data_dir, image_size, batch_size, num_workers, world_size, rank):
     t = transforms.Compose([
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
     ])
