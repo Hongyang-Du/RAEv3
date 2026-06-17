@@ -105,6 +105,13 @@ class TrainingConfig:
     sample_every: int = 2500
     virtual_epoch_steps: Optional[int] = None
     grad_accum_steps: int = 1
+    gate_lr: float = 0.01  # learned_gate: AdamW lr for the K-dim stage-1 layer gate
+    gate_recon_coeff: float = 0.0  # learned_gate: frozen-decoder L1 recon-anchor weight (0=off)
+    gate_recon_bs: int = 16        # learned_gate: #images per step decoded for the recon anchor
+    gate_accum_steps: int = 1      # learned_gate: accumulate gate grad over N DiT-steps before stepping
+    gate_recon_balance: float = 0.0  # learned_gate: keep ||grad_gate(recon)|| = this * ||grad_gate(diff)|| (0=off, use fixed coeff)
+    gate_entropy_balance: float = 0.0  # learned_gate: keep ||grad_gate(entropy-hinge)|| = this * ||grad_gate(diff)|| (0=off)
+    gate_balance_every: int = 50     # learned_gate: re-measure the gate-grad balance every N steps
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: Optional[SchedulerConfig] = None
     image_size: int = 256

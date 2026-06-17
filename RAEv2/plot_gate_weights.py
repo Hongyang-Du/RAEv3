@@ -34,26 +34,27 @@ gates = np.array(gates)                      # [T, 7]
 print(f"{len(steps)} log points, steps {steps[0]}..{steps[-1]}, GAN from s{gan_start}")
 
 fig, ax = plt.subplots(figsize=(9, 5))
-cmap = plt.get_cmap("viridis")
+cmap = plt.get_cmap("viridis")               # shallow -> dark, deep -> light
 for i, layer in enumerate(LAYERS):
     ax.plot(steps, gates[:, i], color=cmap(i / (len(LAYERS) - 1)),
-            lw=1.8, label=f"L{layer}")
+            lw=1.8, label=f"L{layer}", zorder=2)
 
-ax.axhline(1 / len(LAYERS), color="k", ls=":", lw=1.0, alpha=0.6)
-ax.text(steps[-1], 1 / len(LAYERS), " uniform 1/7", va="center", fontsize=8, alpha=0.7)
+# uniform-1/7 reference drawn ON TOP of the curves
+ax.axhline(1 / len(LAYERS), color="k", ls=":", lw=1.4, alpha=0.9, zorder=10)
+ax.text(steps[-1], 1 / len(LAYERS), " uniform 1/7", va="bottom", ha="right",
+        fontsize=8, alpha=0.9, zorder=11)
 
 if gan_start is not None:
-    ax.axvline(gan_start, color="crimson", ls="--", lw=1.5, alpha=0.8)
+    ax.axvline(gan_start, color="crimson", ls="--", lw=1.5, alpha=0.8, zorder=3)
     ax.text(gan_start, ax.get_ylim()[1] * 0.97, " GAN on", color="crimson",
-            va="top", fontsize=9)
+            va="top", fontsize=9, zorder=11)
 
 ax.set_xlabel("training step")
 ax.set_ylabel("softmax gate weight")
-ax.set_title("Softgate per-layer gate weights — collapse to the shallowest layer (L11)\n"
-             "(softmax gate + layer-dropout 0.2, run killed at epoch 3)", fontsize=11)
 ax.legend(title="DINOv3 layer\n(shallow → deep)", fontsize=9, ncol=2)
 ax.grid(alpha=0.3)
 fig.tight_layout()
-out = "output_full/gate_weights_softgate.png"
-fig.savefig(out, dpi=140, bbox_inches="tight")
-print(f"saved -> {out}")
+for ext in ("pdf", "png"):
+    out = f"output_full/gate_weights_softgate.{ext}"
+    fig.savefig(out, bbox_inches="tight")
+    print(f"saved -> {out}")

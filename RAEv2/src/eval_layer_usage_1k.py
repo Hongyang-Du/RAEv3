@@ -99,6 +99,15 @@ def build_variant(args, device):
             return dec.unpatchify(out) * std + mean
         return layers, encode_tokens, decode_subset
 
+    if v == "dropmean_plain":
+        # our random-drop, projector=none, NO cls surrogate (decoder_random_drop_layer
+        # _mls_plain_k23): combine = equal-weight renormalized subset mean -> decoder.
+        def decode_subset(toks, idx):
+            z = torch.stack([toks[i] for i in idx]).mean(0)
+            out = dec(z, drop_cls_token=False).logits
+            return dec.unpatchify(out) * std + mean
+        return layers, encode_tokens, decode_subset
+
     if v == "dropmean_bn":
         from train_decoder_mls_dropmean_bn_sigreg import MLSProjector
         proj = MLSProjector(dim=enc.hidden_size, out_dim=1024)
@@ -132,7 +141,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", required=True,
                     choices=["official", "raev2_ours", "nogate",
-                             "dropmean_bn", "dropmean_ln", "softgate"])
+                             "dropmean_plain", "dropmean_bn", "dropmean_ln", "softgate"])
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--num-images", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=16)

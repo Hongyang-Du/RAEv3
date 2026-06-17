@@ -84,9 +84,10 @@ class MLSProjector(nn.Module):
         self.bn = nn.BatchNorm1d(dim * mult)
         self.fc2 = nn.Linear(dim * mult, out_dim)
 
-    def forward(self, layer_tokens) -> torch.Tensor:        # K x [B, N, dim] -> [B, N, out_dim]
+    def forward(self, layer_tokens, drop=None) -> torch.Tensor:   # K x [B,N,dim] -> [B,N,out_dim]
         stk = torch.stack(layer_tokens, dim=0)               # [K, B, N, dim]
-        if self.training and self.p_drop > 0:
+        do_drop = (self.training if drop is None else drop) and self.p_drop > 0
+        if do_drop:
             K, B = stk.shape[0], stk.shape[1]
             keep = torch.rand(K, B, device=stk.device) > self.p_drop
             dead = ~keep.any(0)
@@ -216,6 +217,11 @@ def main():
     parser.add_argument("--layer-drop",    type=float, default=0.0,
                         help="dropmean-style random layer dropout prob (0 = off, plain mean). "
                              "Train-time only; makes z stochastic -> FM target jitters.")
+    parser.add_argument("--dit-full-dec-drop", action="store_true",
+                        help="split the latent: DiT (FM target + SIGReg) sees the FULL-layer "
+                             "latent (no drop, stable target), the DECODER's recon loss sees the "
+                             "DROPPED latent (random subset, --layer-drop prob). Decouples a clean "
+                             "generation target from a drop-robust decoder. Requires --layer-drop>0.")
     parser.add_argument("--detach-fm-target",  action="store_true")
     parser.add_argument("--detach-xt",         action="store_true")
     parser.add_argument("--detach-pix-target", action="store_true")
@@ -250,6 +256,9 @@ def main():
     args = parser.parse_args()
     if args.data is None:
         parser.error("--data is required (set it in --config or on the CLI)")
+    if args.dit_full_dec_drop and args.layer_drop <= 0:
+        parser.error("--dit-full-dec-drop needs --layer-drop>0 (else dropped==full and "
+                     "the decoder/DiT latents are identical)")
 
     # -- DDP init --------------------------------------------------------------
     # 30-min timeout (default 10min): rank 0's per-epoch ckpt save (DiT + decoder
@@ -492,14 +501,23 @@ def main():
             opt_dit.zero_grad(set_to_none=True)
 
             with autocast_ctx:
-                # branch 1: representation + reconstruction
-                z_tok = projector_ddp(layer_tokens)             # [B,256,1024]
-                x_rec = decode_imgs(decoder_ddp, z_tok)
+                # latent(s): default one shared z. With --dit-full-dec-drop the
+                # DECODER sees the DROPPED latent (robustness) while the DiT + SIGReg
+                # see the FULL-layer latent (stable, jitter-free generation target).
+                if args.dit_full_dec_drop:
+                    z_dec_tok = projector_ddp(layer_tokens, drop=True)    # -> decoder
+                    z_gen_tok = projector_ddp(layer_tokens, drop=False)   # -> DiT + SIGReg
+                else:
+                    z_dec_tok = projector_ddp(layer_tokens)               # [B,256,1024]
+                    z_gen_tok = z_dec_tok
+
+                # branch 1: representation + reconstruction (decoder sees z_dec)
+                x_rec = decode_imgs(decoder_ddp, z_dec_tok)
                 loss_l1    = F.l1_loss(x_rec, imgs)
                 loss_lpips = lpips_all(x_rec * 2 - 1, imgs * 2 - 1).mean()
 
-                # branch 2: generation (flow matching on the LIVE latent)
-                z_sp = tokens_to_spatial(z_tok)
+                # branch 2: generation (flow matching on z_gen)
+                z_sp = tokens_to_spatial(z_gen_tok)
                 z_xt = z_sp.detach() if args.detach_xt else z_sp
                 z_tg = z_sp.detach() if args.detach_fm_target else z_sp
                 t = sample_t(z_sp.shape[0], device, args.t_shift)
@@ -536,7 +554,7 @@ def main():
             # statistic is x N (~65536) and any weight near the recon scale
             # swamps recon's gradient (~575x at w=0.02). Unscaled + sigreg_w 1.0
             # = ~0.30x recon projector-grad (gradient-probed).
-            loss_sig = sigreg_loss(z_tok.float().reshape(-1, args.latent_dim),
+            loss_sig = sigreg_loss(z_gen_tok.float().reshape(-1, args.latent_dim),
                                    distributed=True, scale_by_n=False)
             loss_rec = loss_l1 + args.lpips_w * loss_lpips
 
@@ -555,7 +573,7 @@ def main():
             global_step += 1
 
             if is_main and global_step % args.log_every == 0:
-                zd = gaussian_diag(z_tok)
+                zd = gaussian_diag(z_gen_tok)            # DiT latent (the SIGReg-shaped one)
                 ps = psnr(x_rec, imgs)
                 print(f"  ep{epoch+1} s{global_step}"
                       f"  loss={loss.item():.4e}"

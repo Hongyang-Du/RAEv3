@@ -41,8 +41,8 @@ STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--num-images", type=int, default=32)
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--num-images", type=int, default=256)
+    ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--perms", type=int, default=64, help="random permutations (subset samples per size)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--val-npz", default="data_eval/imagenet-256-val.npz")
@@ -58,6 +58,7 @@ def main():
                          device=device, resolution=256).eval()
     for p in enc.parameters():
         p.requires_grad_(False)
+    enc.to(torch.bfloat16)        # bf16 weights to fit alongside a running job (compute is bf16 anyway)
 
     def encode(imgs01):
         return list(enc.model.get_intermediate_layers(
@@ -73,6 +74,7 @@ def main():
         dec = _load_decoder("configs/decoder/ViTXL", hidden_size=1024, patch_size=16,
                             num_patches=256, pretrained_path=None).to(device).eval()
         dec.load_state_dict(ck["ema_dec"])
+        combine.to(torch.bfloat16); dec.to(torch.bfloat16)   # bf16 weights to fit beside a running job
         del ck
 
         def recon(toks, S):
@@ -86,9 +88,8 @@ def main():
         return recon
 
     models = {
-        "ours_raev2":       load_ours("configs/stage1/decoder/infer-raev2k23.yaml"),
-        "ours_drop+SIGReg": load_ours("configs/stage1/decoder/infer-k23-fed-k7.yaml"),
-        "ours_drop_plain":  load_ours("configs/stage1/decoder/infer-k23plain-fed-k7.yaml"),
+        "RAEv2":          load_ours("configs/stage1/decoder/infer-raev2k23.yaml"),
+        "RAEv2.5 (Ours)": load_ours("configs/stage1/decoder/infer-k23plain-fed-k7.yaml"),
     }
 
     # fixed permutations (same subsets for every model)
@@ -142,42 +143,69 @@ def main():
         pc = {k: np.concatenate(val_psnr[m][k]) for k in sizes}
         mc = {k: np.concatenate(val_mse[m][k]) for k in sizes}
         curve = [float(pc[k].mean()) for k in sizes]
+        std = [float(pc[k].std()) for k in sizes]                       # std over images x subsets
         p10 = [float(np.percentile(pc[k], 10)) for k in sizes]
         p90 = [float(np.percentile(pc[k], 90)) for k in sizes]
         marg_db = [curve[i] - curve[i - 1] for i in range(1, len(sizes))]
         mse_mean = [float(mc[k].mean()) for k in sizes]
         marg_mse = [mse_mean[i - 1] - mse_mean[i] for i in range(1, len(sizes))]   # MSE reduction
         shap = (shap_sum[m] / np.maximum(shap_cnt[m], 1)).tolist()
-        res[m] = {"curve": curve, "p10": p10, "p90": p90, "marg_db": marg_db,
+        res[m] = {"curve": curve, "std": std, "p10": p10, "p90": p90, "marg_db": marg_db,
                   "marg_mse": marg_mse, "shapley": shap}
-        print(f"[{m}] v(1)={curve[0]:.2f}  v(N)={curve[-1]:.2f} dB   "
-              f"band@k=2 = [{p10[1]:.1f},{p90[1]:.1f}]", flush=True)
+        print(f"[{m}] v(1)={curve[0]:.2f}  v(N)={curve[-1]:.2f} dB   std@k=2={std[1]:.2f}", flush=True)
 
-    # ---- plot ----
-    colors = {"ours_raev2": "tab:gray", "ours_drop+SIGReg": "tab:red", "ours_drop_plain": "tab:blue"}
-    fig, ax = plt.subplots(2, 2, figsize=(15, 10))
-    a, b, c, d = ax[0, 0], ax[0, 1], ax[1, 0], ax[1, 1]
+    # ---- plot: 4 SEPARATE figures ----
+    colors = {"RAEv2": "gray", "RAEv2.5 (Ours)": "#F6850C"}
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    base = args.out[:-4] if args.out.endswith(".png") else args.out
+
+    def save(fig, suffix):
+        for ext in ("png", "pdf"):
+            out = f"{base}_{suffix}.{ext}"
+            fig.savefig(out, dpi=130, bbox_inches="tight")
+        print(f"saved -> {base}_{suffix}.png")
+        plt.close(fig)
+
+    # 1) value v(S) vs |S|  (line = mean, band = mean +/- std over images x subsets)
+    fig, a = plt.subplots(figsize=(7.5, 5))
     for m in models:
         col = colors[m]
-        a.plot(sizes, res[m]["curve"], "o-", ms=3, color=col, label=m)
-        a.fill_between(sizes, res[m]["p10"], res[m]["p90"], color=col, alpha=0.15)
-        b.plot(sizes[1:], res[m]["marg_db"], "o-", ms=3, color=col, label=m)
-        c.plot(sizes[1:], res[m]["marg_mse"], "o-", ms=3, color=col, label=m)
-        d.plot(LAYERS, res[m]["shapley"], "o-", ms=3, color=col, label=m)
-    a.set_title("Value  v(S) = PSNR  vs  |S|   (line=mean, band=10/90 pct over subsets)")
-    a.set_xlabel("|S| (number of layers)"); a.set_ylabel("PSNR [dB]"); a.grid(alpha=0.3); a.legend(fontsize=8)
-    b.set_title("Marginal  d(k) = v(k)-v(k-1)  [dB]   (decreasing = submodular/redundant)")
-    b.set_xlabel("k-th layer added"); b.set_ylabel("dPSNR [dB]"); b.grid(alpha=0.3); b.legend(fontsize=8)
+        cu = np.array(res[m]["curve"]); sd = np.array(res[m]["std"])
+        a.plot(sizes, cu, "o-", ms=3, color=col, label=m)
+        a.fill_between(sizes, cu - sd, cu + sd, color=col, alpha=0.15)
+    a.set_title("Value  v(S) = PSNR  vs  |S|   (line = mean, band = ± std)")
+    a.set_xlabel("|S| (number of layers)"); a.set_ylabel("PSNR [dB]")
+    a.grid(alpha=0.3); a.legend(fontsize=10)
+    save(fig, "1_value")
+
+    # 2) marginal d(k) in dB
+    fig, b = plt.subplots(figsize=(7.5, 5))
+    for m in models:
+        b.plot(sizes[1:], res[m]["marg_db"], "o-", ms=3, color=colors[m], label=m)
+    b.set_title("Marginal  d(k) = v(k) - v(k-1)  [dB]   (decreasing = submodular/redundant)")
+    b.set_xlabel("k-th layer added"); b.set_ylabel("ΔPSNR [dB]")
+    b.grid(alpha=0.3); b.legend(fontsize=10)
+    save(fig, "2_marginal_db")
+
+    # 3) marginal MSE reduction
+    fig, c = plt.subplots(figsize=(7.5, 5))
+    for m in models:
+        c.plot(sizes[1:], res[m]["marg_mse"], "o-", ms=3, color=colors[m], label=m)
     c.set_title("Marginal  MSE reduction  [MSE domain]   (scale-dependence check)")
-    c.set_xlabel("k-th layer added"); c.set_ylabel("MSE(k-1)-MSE(k)"); c.grid(alpha=0.3); c.legend(fontsize=8)
+    c.set_xlabel("k-th layer added"); c.set_ylabel("MSE(k-1) - MSE(k)")
+    c.grid(alpha=0.3); c.legend(fontsize=10)
+    save(fig, "3_marginal_mse")
+
+    # 4) Monte-Carlo Shapley per layer
+    fig, d = plt.subplots(figsize=(7.5, 5))
+    for m in models:
+        d.plot(LAYERS, res[m]["shapley"], "o-", ms=3, color=colors[m], label=m)
     d.set_title("Monte-Carlo Shapley per layer  (avg marginal contribution, dB)")
-    d.set_xlabel("DINOv3 layer"); d.set_ylabel("Shapley [dB]"); d.grid(alpha=0.3); d.legend(fontsize=8)
-    fig.suptitle(f"Layer-subset value sweep  (N={args.num_images} imgs x {args.perms} perms)", fontsize=14)
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    fig.savefig(args.out, dpi=130, bbox_inches="tight")
-    print(f"saved -> {args.out}")
-    with open(args.out.replace(".png", ".json"), "w") as f:
+    d.set_xlabel("DINOv3 layer"); d.set_ylabel("Shapley [dB]")
+    d.grid(alpha=0.3); d.legend(fontsize=10)
+    save(fig, "4_shapley")
+
+    with open(base + ".json", "w") as f:
         json.dump({"layers": LAYERS, "num_images": args.num_images, "perms": args.perms,
                    "results": res}, f, indent=2)
 

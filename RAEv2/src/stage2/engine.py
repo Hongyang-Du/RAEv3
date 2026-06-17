@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections import defaultdict
 from typing import Dict, Optional
@@ -44,6 +45,7 @@ def train_one_epoch(
     eval_sampler,
     dataloader,
     optimizer: torch.optim.Optimizer,
+    gate_optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler,
     autocast_kwargs: dict,
     device: torch.device,
@@ -108,12 +110,25 @@ def train_one_epoch(
     # Training loop
     #########################################################
     dataloader.set_epoch(epoch)
+    # learned_gate: accumulate the gate gradient (diffusion + small-batch recon) over
+    # gate_accum_steps DiT-steps before stepping -> larger effective batch, stable gate.
+    gate_accum = getattr(config.training, "gate_accum_steps", 1) if gate_optimizer is not None else 1
+    if gate_optimizer is not None and not hasattr(gate_optimizer, "_accum_i"):
+        gate_optimizer._accum_i = 0
     for step, (images, y) in enumerate(dataloader):
         images = images.to(device)
 
-        # Encode images to latents and compute REPA targets
+        # Encode images to latents and compute REPA targets.
+        # learned_gate: the gate-weighted latent must carry gradient (grad-enabled
+        # encode_train); otherwise the latent is the frozen, detached diffusion target.
+        use_gate = gate_optimizer is not None and getattr(rae, "has_learnable_gate", False)
+        z_tokens = None
+        if use_gate:
+            z, z_tokens = rae.encode_train(images)
+        else:
+            with torch.no_grad():
+                z = rae.encode(images)
         with torch.no_grad():
-            z = rae.encode(images)
             if repa_target_encoder is not None:
                 raw_images = images.clone() * 255.0
                 raw_img_preprocessed = repa_target_encoder.preprocess(raw_images)
@@ -159,6 +174,48 @@ def train_one_epoch(
             loss_repa = loss_dict.get("loss_repa", torch.tensor(0.0, device=device)).mean()
             loss = loss_diff + loss_repa if config.repa.use_repa else loss_diff
 
+            # learned_gate recon anchor: decode the RAW gate-weighted latent with the
+            # FROZEN decoder -> L1 recon loss whose gradient reaches ONLY the gate.
+            loss_recon = None
+            recon_coeff = getattr(config.training, "gate_recon_coeff", 0.0) if use_gate else 0.0
+            gbal = getattr(config.training, "gate_recon_balance", 0.0) if use_gate else 0.0
+            if recon_coeff > 0 or gbal > 0:
+                rbs = getattr(config.training, "gate_recon_bs", 16)
+                rec = rae.recon_from_tokens(z_tokens[:rbs])
+                loss_recon = (rec - images[:rbs]).abs().mean()
+
+        # ---- learned_gate regularizers on the gate, each MAGNITUDE-MATCHED to the
+        # diffusion gate-gradient so neither overpowers it:
+        #   recon anchor : ||grad_gate(recon)||   = gbal * ||grad_gate(diffusion)||
+        #   entropy hinge: ||grad_gate(H_pen)||   = gent * ||grad_gate(diffusion)||
+        # H_pen = relu(log k - H(gate))^2 fires ONLY when the softmax starts collapsing
+        # below ~k effective layers (keeps the kept-set spread, not winner-take-all).
+        # Norms re-measured every gate_balance_every steps via autograd.grad, held between.
+        gent = getattr(config.training, "gate_entropy_balance", 0.0) if use_gate else 0.0
+        topk = getattr(rae.combine, "topk", 0) if use_gate else 0
+        H_pen = None
+        if gent > 0 and topk:
+            wg = torch.softmax(rae.combine.gate_logits / rae.combine.tau, dim=0)
+            H = -(wg * (wg + 1e-9).log()).sum()
+            H_pen = torch.relu(math.log(topk) - H).pow(2)
+
+        if use_gate and (gbal > 0 or H_pen is not None):
+            g = rae.combine.gate_logits
+            if step % max(1, getattr(config.training, "gate_balance_every", 50)) == 0:
+                gd = torch.autograd.grad(loss_diff, g, retain_graph=True)[0].norm()
+                gate_optimizer._gd = gd.item()
+                if loss_recon is not None and gbal > 0:
+                    gr = torch.autograd.grad(loss_recon, g, retain_graph=True)[0].norm()
+                    gate_optimizer._recon_w = float((gbal * gd / (gr + 1e-8)).clamp(0, 1e4))
+                    gate_optimizer._gr = gr.item()
+                if H_pen is not None and H_pen.item() > 1e-8:
+                    ge = torch.autograd.grad(H_pen, g, retain_graph=True)[0].norm()
+                    gate_optimizer._ent_w = float((gent * gd / (ge + 1e-8)).clamp(0, 1e4))
+        if loss_recon is not None:
+            loss = loss + getattr(gate_optimizer, "_recon_w", recon_coeff) * loss_recon
+        if H_pen is not None:
+            loss = loss + getattr(gate_optimizer, "_ent_w", 0.0) * H_pen
+
         loss = loss / config.training.grad_accum_steps
 
         is_accum_step = (step + 1) % config.training.grad_accum_steps != 0
@@ -173,6 +230,20 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), config.training.clip_grad)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if gate_optimizer is not None:
+                # accumulate the gate grad over gate_accum DiT-steps, then sync + step.
+                # (grad keeps accumulating on gate_logits across these steps; we do NOT
+                # zero it until we actually step.)
+                gate_optimizer._accum_i += 1
+                if gate_optimizer._accum_i >= gate_accum:
+                    gp = rae.combine.gate_logits
+                    if gp.grad is not None and world_size > 1:
+                        # rae is NOT DDP-wrapped -> manually average the gate grad across ranks
+                        dist.all_reduce(gp.grad)
+                        gp.grad /= world_size
+                    gate_optimizer.step()
+                    gate_optimizer.zero_grad(set_to_none=True)
+                    gate_optimizer._accum_i = 0
             if scheduler is not None:
                 scheduler.step()
             update_ema(ema_model, ddp_model.module, decay=config.training.ema_decay)
@@ -196,6 +267,26 @@ def train_one_epoch(
                 stats["train/loss_repa"] = loss_repa.item()
             if "loss_base" in loss_dict:
                 stats["train/loss_base"] = loss_dict["loss_base"].mean().item()
+            if gate_optimizer is not None:
+                w = rae.gate_weights()                       # [K] current softmax gate
+                ent = -(w * (w + 1e-9).log()).sum().item()   # entropy: log(K) -> 0 = polarized
+                stats["gate/entropy"] = ent
+                stats["gate/max"] = w.max().item()
+                stats["gate/n_active"] = (w > 0.5 / w.numel()).sum().item()
+                if loss_recon is not None:
+                    stats["gate/recon_loss"] = loss_recon.item()
+                if getattr(gate_optimizer, "_gd", None) is not None:
+                    stats["gate/recon_w"] = getattr(gate_optimizer, "_recon_w", 0.0)
+                    stats["gate/ent_w"] = getattr(gate_optimizer, "_ent_w", 0.0)
+                    stats["gate_grad/diff_norm"] = gate_optimizer._gd        # ||grad_gate(diffusion)||
+                    stats["gate_grad/recon_unit_norm"] = getattr(gate_optimizer, "_gr", 0.0)
+                topk = getattr(rae.combine, "topk", 0)
+                if topk and 0 < topk < w.numel():
+                    top = torch.topk(w, topk).indices.sort().values.tolist()
+                    sel = [rae.combine.layers[i] for i in top]
+                    logger.info(f"[gate top-{topk} layers] {sel}")
+                for li, lyr in enumerate(rae.combine.layers):
+                    stats[f"gate/L{lyr}"] = w[li].item()
             logger.info(
                 f"[Epoch {epoch} | Step {global_step}] "
                 + ", ".join(f"{k}: {v:.4f}" for k, v in stats.items())

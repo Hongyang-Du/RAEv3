@@ -1,0 +1,28 @@
+# E2E joint training, SPLIT-DROP variant: the DiT (FM target + SIGReg) sees the
+# FULL-layer latent (stable, jitter-free generation target), while the DECODER's
+# reconstruction loss sees the DROPPED latent (random subset, layer-drop 0.3).
+# Decouples a clean generation target from a drop-robust decoder -> the DiT no
+# longer chases per-step target jitter, the decoder still learns subset robustness.
+data: /datasets/imagenet-256-full
+out-dir: output_full/train_e2e_dit_full_dec_drop
+epochs: 20
+batch-size: 24
+lr-pd: 2.0e-4
+lr-dit: 2.0e-4
+warmup-epochs: 2
+w-rec: 1.0
+lpips-w: 1.0
+sigreg-w: 0.5
+w-fm: 1.0
+w-pix: 0.0
+layer-drop: 0.3            # decoder sees this random-subset dropout
+dit-full-dec-drop: true    # DiT/SIGReg latent = FULL (no drop); decoder latent = dropped
+init-stage1: ""
+ema-decay: 0.9995
+ckpt-every: 2
+log-every: 50
+sample-every: 2500
+val-image: assets/samples/sample_1.png
+wandb: true
+wandb-project: raev3-full
+wandb-entity: uscgvl

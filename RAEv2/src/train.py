@@ -161,6 +161,14 @@ def main():
         config.training.optimizer,
     )
 
+    # learned_gate: a small AdamW over the K-dim layer-gate (NOT gmuon — that is for
+    # matrix params). Grads are all-reduced manually in the engine (rae is not DDP).
+    gate_optimizer = None
+    if getattr(rae, "has_learnable_gate", False):
+        gate_lr = getattr(config.training, "gate_lr", 1e-2)
+        gate_optimizer = torch.optim.AdamW(rae.gate_parameters(), lr=gate_lr, weight_decay=0.0)
+        logger.info(f"learned_gate: AdamW gate optimizer (lr={gate_lr}, {rae.combine.K} logits)")
+
     #########################################################
     # Steps per epoch setup
     #########################################################
@@ -230,6 +238,7 @@ def main():
             eval_sampler=eval_sampler,
             dataloader=dataloader,
             optimizer=optimizer,
+            gate_optimizer=gate_optimizer,
             scheduler=scheduler,
             autocast_kwargs=autocast_kwargs,
             device=device,

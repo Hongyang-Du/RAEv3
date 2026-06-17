@@ -51,9 +51,11 @@ class MLSCombine(nn.Module):
                  projector: str = "none",
                  dim: int = 1024,
                  out_dim: int = 1024,
-                 mult: int = 4):
+                 mult: int = 4,
+                 tau: float = 1.0,
+                 topk: int = 0):
         super().__init__()
-        assert weighting in ("mean", "random_drop", "softgate"), weighting
+        assert weighting in ("mean", "random_drop", "softgate", "learned_gate"), weighting
         assert projector in ("none", "ln", "bn"), projector
         assert 0.0 <= p_full <= 1.0, p_full
         self.layers = list(layers)
@@ -66,6 +68,14 @@ class MLSCombine(nn.Module):
 
         if weighting == "softgate":
             self.gate = nn.Parameter(torch.zeros(self.K))   # softmax logits, init uniform
+
+        # learned_gate: a TRAINABLE softmax over the K layers, learned by the
+        # stage-2 DiT denoising loss (the "DiT picks its own layers" experiment).
+        # No random drop; eval == train (deterministic softmax-weighted mean).
+        self.tau = tau
+        self.topk = topk               # learned_gate: keep exactly top-k layers (0 = full softmax)
+        if weighting == "learned_gate":
+            self.gate_logits = nn.Parameter(torch.zeros(self.K))  # init uniform 1/K
 
         if projector == "none":
             self.skip = None
@@ -87,6 +97,25 @@ class MLSCombine(nn.Module):
     def _mix(self, stk, idx):
         """stk [K, B, N, dim] -> z0 [B, N, dim] (weighted combine over layers)."""
         K, B = stk.shape[0], stk.shape[1]
+
+        # learned_gate: deterministic softmax-weighted mean, grad flows to gate_logits.
+        if self.weighting == "learned_gate":
+            w = torch.softmax(self.gate_logits / self.tau, dim=0)   # [K]
+            if idx is not None:                                     # probe subset (renorm)
+                w = w[list(idx)]
+                w = w / w.sum().clamp_min(1e-6)
+                return (w.view(-1, 1, 1, 1) * stk[list(idx)]).sum(0)
+            if self.topk and 0 < self.topk < self.K:
+                # straight-through top-k: forward = EQUAL mean over the current top-k
+                # layers (== what the fixed-k DiT will use); backward flows through the
+                # soft softmax so the gate keeps learning WHICH k to keep. Guarantees the
+                # DiT never trains on fewer than k layers (no collapse to 1).
+                topi = torch.topk(w, self.topk).indices
+                hard = torch.zeros_like(w)
+                hard[topi] = 1.0 / self.topk
+                w = w + (hard - w).detach()                        # forward=hard, grad=soft
+            return (w.view(K, 1, 1, 1) * stk).sum(0)
+
         if self.weighting == "softgate":
             gate_w = torch.softmax(self.gate, dim=0)
             if idx is not None:

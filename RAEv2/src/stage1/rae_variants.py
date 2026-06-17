@@ -122,6 +122,17 @@ class _RAEVariantBase(nn.Module):
             z = (z - latent_mean) / torch.sqrt(latent_var + self.eps)
         return z
 
+    def _tokens_to_latent_train(self, z: torch.Tensor) -> torch.Tensor:
+        """[B, N, C] tokens -> [B, C, H, W] per-batch unit-variance latent (grad-safe).
+        Used by learned_gate: standardize per-channel over the batch so the gate cannot
+        minimize the denoising loss by shrinking the target magnitude."""
+        b, n, c = z.shape
+        h = w = int(sqrt(n))
+        z = z.transpose(1, 2).view(b, c, h, w)
+        mu = z.mean(dim=(0, 2, 3), keepdim=True)
+        var = z.var(dim=(0, 2, 3), keepdim=True, unbiased=False)
+        return (z - mu) / torch.sqrt(var + self.eps)
+
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         if self.do_normalization:
             latent_mean = self.latent_mean.to(z.device) if self.latent_mean is not None else 0
@@ -179,4 +190,100 @@ class RAEProjected(_RAEVariantBase):
             x, n=self.encoder.layer_indices, reshape=False,
             return_class_token=False, norm=True))
         z = self.projector(layer_tokens)                              # [B, N, latent]
+        return self._tokens_to_latent(z)
+
+
+class RAECombine(_RAEVariantBase):
+    """Our NEW MLSCombine stage-1 (src/stage1/combine.py): random-drop / sigreg /
+    plain. The diffusion latent is the combine output (ema_combine).
+
+    With drop=True the per-step latent uses per-sample random LAYER dropout (combine
+    kept in train mode so MLSCombine._mix fires its Bernoulli keep-mask) but the BN
+    projector runs with FROZEN running stats (its submodule forced to eval). So the
+    DiT trains on the dropped-latent DISTRIBUTION, exactly the augmentation the user
+    asked for, without touching the (frozen) projector weights/stats."""
+
+    def __init__(self, combine_config, drop: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        from omegaconf import OmegaConf
+        from utils.model_utils import get_obj_from_str
+        cc = OmegaConf.to_container(combine_config, resolve=True) \
+            if OmegaConf.is_config(combine_config) else dict(combine_config)
+        self.combine = get_obj_from_str(cc["target"])(**cc["params"])
+        if self._ckpt is not None:
+            key = 'ema_combine' if self.use_ema else 'combine'
+            # learned_gate adds a fresh gate_logits param absent from the pretrained
+            # combine ckpt -> load non-strict so it keeps its uniform init.
+            strict = cc["params"].get("weighting") != "learned_gate"
+            missing, unexpected = self.combine.load_state_dict(self._ckpt[key], strict=strict)
+            print(f"RAECombine: loaded combine[{key}]  (drop={drop}, strict={strict}, "
+                  f"missing={list(missing)}, unexpected={list(unexpected)})")
+        for p in self.combine.parameters():
+            p.requires_grad_(False)
+        # learned_gate: the K-dim softmax over layers stays TRAINABLE (learned by the
+        # stage-2 DiT denoising loss); everything else in the combine stays frozen.
+        self.has_learnable_gate = getattr(self.combine, "weighting", None) == "learned_gate"
+        if self.has_learnable_gate:
+            self.combine.gate_logits.requires_grad_(True)
+            print(f"RAECombine: learned_gate ENABLED (K={self.combine.K}, trainable softmax)")
+        self.drop = drop
+        self._apply_combine_mode()
+        self._ckpt = None
+
+    def gate_parameters(self):
+        return [self.combine.gate_logits] if self.has_learnable_gate else []
+
+    @torch.no_grad()
+    def gate_weights(self):
+        """current softmax gate over the K layers [K], for logging."""
+        return torch.softmax(self.combine.gate_logits / self.combine.tau, dim=0)
+
+    def encode_train(self, x: torch.Tensor):
+        """Grad-enabled encode for learned_gate: encoder runs frozen (no_grad), the
+        gate-weighted combine carries gradient so the DiT loss can train the gate.
+        Returns (z_norm, z_tok):
+          z_norm : per-batch unit-variance standardized latent [B,C,H,W] -> DiT target
+                   (the gate cannot cheat by shrinking magnitude = true layer selection).
+          z_tok  : RAW gate-weighted combine tokens [B,N,C] -> frozen-decoder recon anchor."""
+        x = self._imgs_to_norm(x)
+        with torch.no_grad():
+            layer_tokens = list(self.encoder.model.get_intermediate_layers(
+                x, n=self.encoder.layer_indices, reshape=False,
+                return_class_token=False, norm=True))
+        z_tok = self.combine(layer_tokens)                # gate_logits has grad
+        return self._tokens_to_latent_train(z_tok), z_tok
+
+    def recon_from_tokens(self, z_tok: torch.Tensor) -> torch.Tensor:
+        """Decode the RAW gate-weighted combine tokens [B,N,C] with the FROZEN decoder
+        (gradient flows to the gate, not the decoder). Returns image in [0,1]. This is
+        the recon anchor that pulls the gate away from the single most-diffusable layer
+        toward layer mixes the decoder can actually reconstruct."""
+        out = self.decoder(z_tok, drop_cls_token=False).logits
+        return self.decoder.unpatchify(out) * self.img_std + self.img_mean
+
+    def _apply_combine_mode(self):
+        self.encoder.eval()                               # frozen DINOv3: ALWAYS deterministic
+        self.decoder.eval()                               # (no encoder dropout/droppath)
+        if self.drop:
+            self.combine.train()                          # MLSCombine._mix random drop on
+            for m in self.combine.modules():              # but keep BN on running stats
+                if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                    m.eval()
+        else:
+            self.combine.eval()
+
+    def train(self, mode: bool = True):
+        # frozen stage-1: never propagate train mode to encoder/decoder. Only the
+        # combine's random-drop sampling needs training=True (BN stays on running stats).
+        self.training = mode
+        self._apply_combine_mode()
+        return self
+
+    @torch.no_grad()
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._imgs_to_norm(x)
+        layer_tokens = list(self.encoder.model.get_intermediate_layers(
+            x, n=self.encoder.layer_indices, reshape=False,
+            return_class_token=False, norm=True))
+        z = self.combine(layer_tokens)                    # per-sample random drop if self.drop
         return self._tokens_to_latent(z)
