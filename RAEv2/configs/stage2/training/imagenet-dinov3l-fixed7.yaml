@@ -94,19 +94,6 @@ training:
     final_lr: 2.0e-04      # 10x the k7 baseline
     warmup_from_zero: false
   image_size: 256
-eval:
-  eval_interval: 5000
-  eval_model: false
-  eval_dir: results/stage2/eval
-  datasets:
-    imagenet:
-      type: hf
-      data_dir: /datasets/imagenet-256-full
-      split: val
-      condition_type: label
-      metrics:
-      - fid
-      - inception_score
 misc:
   latent_size:
   - 1024
