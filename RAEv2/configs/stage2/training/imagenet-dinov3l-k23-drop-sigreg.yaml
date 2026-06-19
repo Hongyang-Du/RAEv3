@@ -4,7 +4,7 @@ stage_1:
     encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
     resolution: 256
     decoder_config_path: configs/decoder/ViTXL
-    stage1_ckpt_path: output_full/decoder_random_drop_layer_mls_mlp_sigreg_k23/ckpt_latest.pt
+    stage1_ckpt_path: output_full/RAEv2.5_decoder_dropmean_sigreg_k23.pt
     use_ema: true
     latent_dim: 1024
     normalization_stat_path: output_full/decoder_random_drop_layer_mls_mlp_sigreg_k23/latent_stats.pt
