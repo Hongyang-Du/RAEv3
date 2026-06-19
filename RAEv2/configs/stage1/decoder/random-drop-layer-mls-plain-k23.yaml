@@ -1,9 +1,30 @@
-# Experiment 2: Random Drop Layer MLS + Decoder
-# random_drop combine fed STRAIGHT to the decoder - no projector, no SIGReg.
 combine:
   target: stage1.combine.MLSCombine
   params:
-    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    layers:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
     weighting: random_drop
     p_drop: 0.3
     cls_surrogate: false
@@ -15,7 +36,7 @@ decoder:
   latent_dim: 1024
 loss:
   lpips_w: 1.0
-  sigreg: null                  # SIGReg off (no trainable params upstream anyway)
+  sigreg: null
   gan:
     disc_weight: 0.75
     disc_start: 1
@@ -25,9 +46,9 @@ data:
   val_npz: data_eval/imagenet-256-val.npz
   val_n: 100
 training:
-  epochs: 5
+  epochs: 16
   batch_size: 32
-  lr: 8.0e-4
+  lr: 0.0008
   warmup_epochs: 2
   ema_decay: 0.9995
   precision: bf16
