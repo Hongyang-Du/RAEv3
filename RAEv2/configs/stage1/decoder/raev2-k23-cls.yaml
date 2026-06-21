@@ -1,32 +1,12 @@
+# raev2 K=23 FIXED mean + cls ON, 5 epochs, GAN from epoch 1, lr 8e-4.
+# Control vs random-drop-layer-mls-plain-cls-k23 (5ep): same recipe, only
+# weighting=mean (fixed) instead of random_drop. Isolates fixed vs random-drop.
 combine:
   target: stage1.combine.MLSCombine
   params:
-    layers:
-    - 1
-    - 2
-    - 3
-    - 4
-    - 5
-    - 6
-    - 7
-    - 8
-    - 9
-    - 10
-    - 11
-    - 12
-    - 13
-    - 14
-    - 15
-    - 16
-    - 17
-    - 18
-    - 19
-    - 20
-    - 21
-    - 22
-    - 23
-    weighting: random_drop
-    p_drop: 0.3
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: mean
+    p_drop: 0.0
     cls_surrogate: true
     projector: none
     dim: 1024
@@ -39,23 +19,23 @@ loss:
   sigreg: null
   gan:
     disc_weight: 0.75
-    disc_start: 8
+    disc_start: 1
 data:
   data_dir: /datasets/imagenet-256-full
   image_size: 256
   val_npz: data_eval/imagenet-256-val.npz
   val_n: 100
 training:
-  epochs: 16
+  epochs: 5
   batch_size: 32
-  lr: 0.0002
+  lr: 8.0e-4
   warmup_epochs: 2
   ema_decay: 0.9995
   precision: bf16
   ckpt_every: 1
   log_every: 50
   seed: 42
-  out_dir: output_full/decoder_random_drop_layer_mls_plain_cls_k23_16ep_gan8
+  out_dir: output_full/decoder_raev2_k23_cls_5ep
 probe:
   loo_solo: final
   val_image: assets/samples/sample_1.png
@@ -63,4 +43,4 @@ wandb:
   enabled: true
   project: raev3-full
   entity: uscgvl
-  name: decoder-random-drop-layer-mls-plain-k23
+  name: decoder-raev2-k23-cls-5ep
