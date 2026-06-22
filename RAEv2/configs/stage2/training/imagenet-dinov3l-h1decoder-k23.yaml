@@ -75,11 +75,11 @@ dataset:
 training:
   epochs: 80
   global_batch_size: 1024
-  grad_accum_steps: 1
+  grad_accum_steps: 4          # 8xH100: 1024/(8*4)=32 imgs/GPU (~53GB peak). global batch stays 1024 = raev2-aligned (4xH100 used grad_accum 8)
   ema_decay: 0.9995
   num_workers: 4
   log_interval: 100
-  checkpoint_interval: 1
+  checkpoint_interval: 5        # 5-epoch cadence (limits crash-loss); keep-last-only pruning keeps just the latest (~10.5 GB)
   sample_every: 5000
   clip_grad: 1.0
   global_seed: 42
@@ -99,19 +99,9 @@ training:
     final_lr: 2.0e-05
     warmup_from_zero: false
   image_size: 256
-eval:
-  eval_interval: 5000
-  eval_model: false
-  eval_dir: results/stage2/eval
-  datasets:
-    imagenet:
-      type: hf
-      data_dir: ./data/imagenet-256
-      split: val
-      condition_type: label
-      metrics:
-      - fid
-      - inception_score
+eval: null   # disabled for this box: dataset backup is train-only (no val split / FID reference npz),
+             # and ImageNetHFDataset raises FileNotFoundError on split=val at startup. Re-enable once
+             # val data + reference are available.
 misc:
   latent_size:
   - 1152

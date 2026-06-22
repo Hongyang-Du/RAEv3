@@ -82,6 +82,15 @@ def save_stage2_checkpoint(
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)
+    # keep-last-only: after writing the new ckpt, prune older ep-*.pt in this dir so the
+    # on-disk footprint stays ~1 checkpoint (~10.5 GB) instead of one per epoch.
+    ckpt_dir, keep = os.path.dirname(path), os.path.basename(path)
+    for f in os.listdir(ckpt_dir):
+        if f.startswith("ep-") and f.endswith(".pt") and f != keep:
+            try:
+                os.remove(os.path.join(ckpt_dir, f))
+            except OSError:
+                pass
 
 
 def load_stage2_checkpoint(

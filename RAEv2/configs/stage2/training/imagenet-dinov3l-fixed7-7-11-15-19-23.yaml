@@ -63,14 +63,14 @@ guidance:
 dataset:
   target: imagenet
   type: hf
-  data_dir: /datasets/imagenet-256-full
+  data_dir: /sensei-fs-3/users/yunfeix/datasets_backup/imagenet-256-full
   split: train
   condition_type: label
   shared_tmpdir: ~/tmp
 training:
   epochs: 80
   global_batch_size: 1024
-  grad_accum_steps: 4   # 4-GPU: 1024/(4*4)=64 micro/GPU (fits ~75GB), global batch unchanged
+  grad_accum_steps: 8   # 4-GPU: 1024/(4*8)=32 micro/GPU (64 OOM'd on 80GB H100), global batch unchanged
   ema_decay: 0.9995
   num_workers: 4
   log_interval: 100
