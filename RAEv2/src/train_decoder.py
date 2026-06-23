@@ -309,19 +309,27 @@ def main():
     val_thread = None
 
     # -- training loop ---------------------------------------------------------
+    # grad_accum: micro-batch of T.batch_size, optimizer steps every `accum`
+    # micro-batches -> effective batch = batch_size * world * accum. global_step
+    # counts MICRO-batches (so disc_start_step/total_steps/val timing are unchanged
+    # and resume stays consistent); scheduler steps per micro-batch so the LR-vs-
+    # progress curve is identical regardless of accum (len(loader) scales with bs).
+    accum = max(1, T.grad_accum_steps)
+    optimizer.zero_grad(set_to_none=True)
+    disc_optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, T.epochs):
         train_sampler.set_epoch(epoch)
         if combine_has_params:
             combine_ddp.train()
         decoder_ddp.train()
         t0 = time.time()
-        for imgs, _ in train_loader:
+        for micro_idx, (imgs, _) in enumerate(train_loader):
             imgs = imgs.to(device)
             with torch.no_grad():
                 layer_tokens = encode_layers(imgs)
             use_gan = (global_step >= disc_start_step) and (L.gan.disc_weight > 0)
+            is_accum_step = ((micro_idx + 1) % accum == 0)
 
-            optimizer.zero_grad(set_to_none=True)
             with autocast_ctx:
                 z = combine_ddp(layer_tokens)
                 x_rec = decode_imgs(decoder_ddp, z)
@@ -348,24 +356,30 @@ def main():
 
             sig_w = L.sigreg.weight if use_sig else 0.0
             loss = loss_rec + sig_w * loss_sig + L.gan.disc_weight * adp_w * loss_gan
-            loss.backward()
-            if T.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(trainable, T.clip_grad)
-            optimizer.step(); scheduler.step()
+            (loss / accum).backward()
+            if is_accum_step:
+                if T.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable, T.clip_grad)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
             if use_gan:
                 disc_ddp.train()
-                disc_optimizer.zero_grad(set_to_none=True)
                 with autocast_ctx:
                     real_aug = disc_aug.aug(imgs[:half] * 2 - 1)
                     fake_aug = disc_aug.aug(x_rec[:half].detach() * 2 - 1)
                     logits_real, _ = disc_ddp(real_aug, None)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                     loss_d = hinge_d_loss(logits_real, logits_fake)
-                loss_d.backward(); disc_optimizer.step()
+                (loss_d / accum).backward()
+                if is_accum_step:
+                    disc_optimizer.step()
+                    disc_optimizer.zero_grad(set_to_none=True)
 
-            update_ema(ema_combine, combine, T.ema_decay)
-            update_ema(ema_dec, decoder, T.ema_decay)
+            if is_accum_step:
+                update_ema(ema_combine, combine, T.ema_decay)
+                update_ema(ema_dec, decoder, T.ema_decay)
             global_step += 1
 
             if is_main and global_step % T.log_every == 0:

@@ -28,36 +28,39 @@ combine:
     weighting: random_drop
     p_drop: 0.3
     cls_surrogate: true
-    projector: none
+    projector: bn
     dim: 1024
-    noise_tau: 0.8
     out_dim: 1024
+    noise_tau: 0.8
+    mult: 4
 decoder:
   config_path: configs/decoder/ViTXL
   latent_dim: 1024
 loss:
   lpips_w: 1.0
-  sigreg: null
+  sigreg:
+    weight: 1.0
+    distributed: true
+    scale_by_n: false
   gan:
     disc_weight: 0.75
-    disc_start: 8
+    disc_start: 1
 data:
   data_dir: /mnt/localssd/imagenet-256-full
   image_size: 256
   val_npz: data_eval/imagenet-256-val.npz
   val_n: 100
 training:
-  epochs: 30
+  epochs: 16
   batch_size: 32
-  grad_accum_steps: 2
-  lr: 0.0002
+  lr: 0.0008
   warmup_epochs: 2
   ema_decay: 0.9995
   precision: bf16
   ckpt_every: 1
   log_every: 50
   seed: 42
-  out_dir: output_full/decoder_random_drop_layer_mls_plain_cls_k23_16ep_gan8
+  out_dir: output_full/decoder_random_drop_layer_mls_mlp_sigreg_k23
 probe:
   loo_solo: final
   val_image: assets/samples/sample_1.png
@@ -65,4 +68,4 @@ wandb:
   enabled: true
   project: raev3-full
   entity: uscgvl
-  name: decoder-random-drop-layer-mls-plain-k23
+  name: decoder-random-drop-layer-mls-mlp-sigreg-k23
