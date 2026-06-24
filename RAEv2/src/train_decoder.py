@@ -336,7 +336,7 @@ def main():
             loss_gan = torch.zeros(1, device=device)
             if use_gan:
                 disc_ddp.eval()
-                half = x_rec.shape[0]   # full-batch GAN (was x_rec.shape[0] // 2)
+                half = max(1, x_rec.shape[0] // 2)   # half-batch GAN
                 with autocast_ctx:
                     fake_aug = disc_aug.aug(x_rec[:half] * 2 - 1)
                     logits_fake, _ = disc_ddp(fake_aug, None)
