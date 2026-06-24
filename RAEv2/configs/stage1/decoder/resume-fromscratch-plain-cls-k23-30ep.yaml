@@ -30,7 +30,7 @@ combine:
     cls_surrogate: true
     projector: none
     dim: 1024
-    noise_tau: 0
+    noise_tau: 0.8
     out_dim: 1024
 decoder:
   config_path: configs/decoder/ViTXL
@@ -47,9 +47,9 @@ data:
   val_npz: data_eval/imagenet-256-val.npz
   val_n: 100
 training:
-  epochs: 16
+  epochs: 30
   batch_size: 32
-  grad_accum_steps: 4
+  grad_accum_steps: 2
   lr: 0.0002
   warmup_epochs: 2
   ema_decay: 0.9995

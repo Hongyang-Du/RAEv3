@@ -44,7 +44,7 @@ loss:
     scale_by_n: false
   gan:
     disc_weight: 0.75
-    disc_start: 1
+    disc_start: 8
 data:
   data_dir: /mnt/localssd/imagenet-256-full
   image_size: 256
@@ -53,11 +53,11 @@ data:
 training:
   epochs: 16
   batch_size: 32
-  lr: 0.0008
+  lr: 0.0002
   warmup_epochs: 2
   ema_decay: 0.9995
   precision: bf16
-  ckpt_every: 1
+  ckpt_every: 5
   log_every: 50
   seed: 42
   out_dir: output_full/decoder_random_drop_layer_mls_mlp_sigreg_k23

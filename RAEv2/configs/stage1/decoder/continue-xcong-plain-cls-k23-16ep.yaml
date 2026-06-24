@@ -1,3 +1,10 @@
+# Continue-training the downloaded xcong plain k23 decoder (ckpt ep14) to 16 epochs.
+# Params reverse-engineered from the ckpt to match the original 32-GPU run exactly:
+#   base_lr 0.0008, warmup 2ep, cosine decay over 16ep, global_batch 256.
+# On 8 GPUs: batch_size 32 x 8 = global 256 (no accum) -> same step cadence (5004/ep),
+# so the resumed scheduler (last_epoch=70056) continues its LR curve seamlessly.
+# combine: plain (projector none) + cls_surrogate true (confirmed by eval: PSNR 30 @ cls-on).
+# noise_tau 0.0 — the original xcong run did NOT use latent-noise aug.
 combine:
   target: stage1.combine.MLSCombine
   params:
@@ -30,7 +37,7 @@ combine:
     cls_surrogate: true
     projector: none
     dim: 1024
-    noise_tau: 0
+    noise_tau: 0.0
     out_dim: 1024
 decoder:
   config_path: configs/decoder/ViTXL
@@ -49,15 +56,14 @@ data:
 training:
   epochs: 16
   batch_size: 32
-  grad_accum_steps: 4
-  lr: 0.0002
+  lr: 0.0008
   warmup_epochs: 2
   ema_decay: 0.9995
   precision: bf16
-  ckpt_every: 5
+  ckpt_every: 1
   log_every: 50
   seed: 42
-  out_dir: output_full/decoder_random_drop_layer_mls_plain_cls_k23_16ep_gan8
+  out_dir: output_full/decoder_xcong_plain_k23_continue16ep
 probe:
   loo_solo: final
   val_image: assets/samples/sample_1.png
@@ -65,4 +71,4 @@ wandb:
   enabled: true
   project: raev3-full
   entity: uscgvl
-  name: decoder-random-drop-layer-mls-plain-k23
+  name: continue-xcong-plain-cls-k23-16ep
