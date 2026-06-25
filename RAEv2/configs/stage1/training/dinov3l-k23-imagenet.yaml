@@ -14,7 +14,7 @@ dataset:
   condition_type: label
 
 training:
-  epochs: 16
+  epochs: 50
   ema_decay: 0.9978
   global_batch_size: 512
   num_workers: 4

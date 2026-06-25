@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--tag", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--seed", type=int, default=None, help="override eval.seed (subset sampling)")
     args = ap.parse_args()
     device = "cuda"
 
@@ -50,7 +51,7 @@ def main():
         ap.error("no ckpt: pass --ckpt or set eval.ckpt in the config")
     val_npz = ev.get("val_npz", "data_eval/imagenet-256-val.npz")
     num_images = args.num_images or ev.get("num_images", 1000)
-    seed = ev.get("seed", 0)
+    seed = args.seed if args.seed is not None else ev.get("seed", 0)
     batch = args.batch
 
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)

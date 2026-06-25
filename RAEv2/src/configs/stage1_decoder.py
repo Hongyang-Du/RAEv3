@@ -59,7 +59,8 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     epochs: int = 10
-    batch_size: int = 32          # per GPU
+    batch_size: int = 32          # per GPU (micro-batch when grad_accum_steps > 1)
+    grad_accum_steps: int = 1     # accumulate N micro-batches per optimizer step
     lr: float = 8.0e-4
     warmup_epochs: int = 2
     ema_decay: float = 0.9995

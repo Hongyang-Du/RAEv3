@@ -53,7 +53,8 @@ class MLSCombine(nn.Module):
                  out_dim: int = 1024,
                  mult: int = 4,
                  tau: float = 1.0,
-                 topk: int = 0):
+                 topk: int = 0,
+                 noise_tau: float = 0.0):
         super().__init__()
         assert weighting in ("mean", "random_drop", "softgate", "learned_gate"), weighting
         assert projector in ("none", "ln", "bn"), projector
@@ -65,6 +66,9 @@ class MLSCombine(nn.Module):
         self.p_full = p_full           # per-sample prob of keeping ALL layers (no drop)
         self.cls_surrogate = cls_surrogate
         self.projector = projector
+        # RAEv2 latent-noise augmentation (mirrors stage1.rae.RAE.noising): train-time
+        # only, per-sample sigma ~ U[0, noise_tau] added to the final latent. 0 = off.
+        self.noise_tau = noise_tau
 
         if weighting == "softgate":
             self.gate = nn.Parameter(torch.zeros(self.K))   # softmax logits, init uniform
@@ -149,6 +153,13 @@ class MLSCombine(nn.Module):
             return (gate_w.view(K, 1, 1, 1) * stk).sum(0)
         return stk.mean(0)                                   # mean / random_drop eval
 
+    def _noise(self, z: torch.Tensor, idx) -> torch.Tensor:
+        """RAEv2 latent-noise aug: train-time only, skip on probe/eval (idx given)."""
+        if idx is not None or not self.training or self.noise_tau <= 0:
+            return z
+        sigma = self.noise_tau * torch.rand((z.size(0),) + (1,) * (z.dim() - 1), device=z.device)
+        return z + sigma * torch.randn_like(z)
+
     def forward(self, layer_tokens, idx=None) -> torch.Tensor:
         stk = torch.stack(layer_tokens, dim=0)              # [K, B, N, dim]
         z0 = self._mix(stk, idx)                            # [B, N, dim]
@@ -156,11 +167,11 @@ class MLSCombine(nn.Module):
             z0 = z0 + stk[-1].mean(dim=1, keepdim=True)     # raev2 L_last token-mean (fixed)
 
         if self.projector == "none":
-            return z0
+            return self._noise(z0, idx)
         if self.projector == "ln":
-            return self.skip(z0) + self.ffn(self.norm(z0))
+            return self._noise(self.skip(z0) + self.ffn(self.norm(z0)), idx)
         # bn
         b, n, _ = z0.shape
         h = self.fc1(z0)
         h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
-        return self.skip(z0) + self.fc2(F.gelu(h))
+        return self._noise(self.skip(z0) + self.fc2(F.gelu(h)), idx)
