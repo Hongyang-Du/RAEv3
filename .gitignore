@@ -4,6 +4,7 @@
 *.ckpt
 *.safetensors
 
+RAEv2/.venv
 # Outputs / experiments
 RAE/output/
 RAEv2/output/

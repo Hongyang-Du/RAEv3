@@ -1,13 +1,13 @@
-# Stage-2 DiT that diffuses h1 = the hidden state after the FIRST transformer block of
-# our random-drop / no-sigreg k=23 decoder (RAEDecoderH1), instead of the encoder combine
-# latent. Decode runs decoder blocks 1..N-1 from h1 + a dataset-mean CLS. No REPA (h1 is
-# already a decoder-internal recon-aligned representation). Everything outside stage_1 /
-# the latent channel count is aligned with imagenet-dinov3l-k23.yaml (80 epochs, same
-# DDT-XL, same gmuon schedule, global batch 1024).
+# EXP-1: Stage-2 DiT that diffuses h1 = hidden state after the FIRST decoder block of the
+# PLAIN (xcong) random-drop MLS k=23 decoder, with CLS ON (cls_surrogate: true).
+# Decode runs decoder blocks 1..N-1 from h1 + dataset-mean CLS. No REPA.
 #
-# Before training: compute h1 stats once ->
+# cls-on = MLSCombine cls_surrogate: true (adds L23 token-mean to the combine latent).
+# The xcong plain decoder is confirmed cls-on decodable (PSNR 30 @ cls-on).
+#
+# Before training: compute cls-on h1 stats once ->
 #   torchrun --nproc_per_node=1 src/compute_h1_stats.py --config <this> \
-#       --num-samples 50000 --out output_full/h1_decoder_k23_stats.pt
+#       --num-samples 50000 --batch 256 --out output_full/h1_decoder_plain_cls_k23_stats.pt
 stage_1:
   target: stage1.rae_decoder_h1.RAEDecoderH1
   params:
@@ -18,7 +18,7 @@ stage_1:
     use_ema: true
     latent_dim: 1024
     drop: false
-    h1_stats_path: output_full/h1_decoder_k23_stats.pt
+    h1_stats_path: output_full/h1_decoder_plain_cls_k23_stats.pt
     combine_config:
       target: stage1.combine.MLSCombine
       params:
@@ -26,7 +26,7 @@ stage_1:
         weighting: mean
         p_drop: 0.0
         p_full: 0.0
-        cls_surrogate: true
+        cls_surrogate: true        # cls ON
         projector: none
         dim: 1024
         out_dim: 1024
@@ -37,7 +37,7 @@ stage_2:
     patch_size:
     - 1
     - 1
-    in_channels: 1152          # decoder_hidden_size (h1), was 1024 for the encoder latent
+    in_channels: 1152          # decoder_hidden_size (h1) for ViT-XL
     hidden_size:
     - 1440
     - 2048
@@ -75,11 +75,11 @@ dataset:
 training:
   epochs: 80
   global_batch_size: 1024
-  grad_accum_steps: 1
+  grad_accum_steps: 2          # 64/GPU on 8x80GB (128/GPU OOMs); keeps global batch 1024
   ema_decay: 0.9995
   num_workers: 4
   log_interval: 100
-  checkpoint_interval: 1
+  checkpoint_interval: 10        # save every 10 epochs
   sample_every: 5000
   clip_grad: 1.0
   global_seed: 42
@@ -99,24 +99,14 @@ training:
     final_lr: 2.0e-05
     warmup_from_zero: false
   image_size: 256
-eval:
-  eval_interval: 5000
-  eval_model: false
-  eval_dir: results/stage2/eval
-  datasets:
-    imagenet:
-      type: hf
-      data_dir: ./data/imagenet-256
-      split: val
-      condition_type: label
-      metrics:
-      - fid
-      - inception_score
+# eval disabled during training (no val split downloaded; gFID is a separate offline step).
+# To re-enable, restore the imagenet val dataset block once data/imagenet-256/imagenet-latents-images/val exists.
+eval: null
 misc:
   latent_size:
   - 1152
   - 16
   - 16
   num_classes: 1000
-  time_dist_shift_dim: 294912   # 256 * 1152 (N * Cdec), was 262144 (256*1024)
+  time_dist_shift_dim: 294912   # 256 * 1152 (N * Cdec)
   time_dist_shift_base: 4096
