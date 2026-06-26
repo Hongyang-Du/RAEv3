@@ -59,13 +59,16 @@ def create_eval_dataloader(dataset, rank: int, world_size: int,
 
 
 def gather_and_cleanup_shards(temp_dir: str, prefix: str, global_step: int,
-                              world_size: int, num_samples: int) -> np.ndarray:
-    """Rank-0 only: load all NPZ shards, concatenate, truncate, shuffle, delete shards.
+                              world_size: int, num_samples: int, shuffle: bool = True) -> np.ndarray:
+    """Rank-0 only: load all NPZ shards, concatenate, truncate, (optionally) shuffle, delete shards.
 
     The shuffle is fixed-seed (0) and removes the class-ordered bias from
     label-conditioned sampling. Without it, splitting `combined` into N chunks
     for Inception Score deflates the score (each chunk covers only ~100 classes
     so per-chunk `p(y)` is too peaked). FID / FDR / MIND are shuffle-invariant.
+    Pass shuffle=False for RECONSTRUCTION eval: there the gathered recons are
+    paired index-by-index with an unshuffled reference, so shuffling would
+    scramble PSNR/SSIM/LPIPS (rFID stays correct since FID is set-based).
     """
     all_arrays = []
     for r in range(world_size):
@@ -75,9 +78,10 @@ def gather_and_cleanup_shards(temp_dir: str, prefix: str, global_step: int,
 
     combined = np.concatenate(all_arrays, axis=0)[:num_samples]
 
-    rng = np.random.default_rng(0)
-    perm = rng.permutation(combined.shape[0])
-    combined = combined[perm]
+    if shuffle:
+        rng = np.random.default_rng(0)
+        perm = rng.permutation(combined.shape[0])
+        combined = combined[perm]
 
     # Cleanup shards
     for r in range(world_size):

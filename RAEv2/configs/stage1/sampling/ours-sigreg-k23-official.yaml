@@ -1,0 +1,40 @@
+# Official-protocol reconstruction eval for OUR sigreg k23 decoder (RAECombine).
+# Uses RAE.forward (encode->decode) + the official imagenet-256 val reference npz,
+# via offline_eval_stage1.py + evaluate_reconstruction_distributed (calculate_rfid).
+stage_1:
+  target: stage1.RAECombine
+  params:
+    encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
+    resolution: 256
+    decoder_config_path: configs/decoder/ViTXL
+    stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/decoder_random_drop_layer_mls_mlp_sigreg_k23/ckpt_latest.pt
+    use_ema: true
+    latent_dim: 1024
+    normalization_stat_path: /sensei-fs-3/users/hongyangd/ckpt/decoder_random_drop_layer_mls_mlp_sigreg_k23/latent_stats.pt
+    drop: false
+    combine_config:
+      target: stage1.combine.MLSCombine
+      params:
+        layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+        weighting: mean
+        p_drop: 0.0
+        p_full: 0.0
+        cls_surrogate: true
+        projector: bn
+        dim: 1024
+        out_dim: 1024
+        mult: 4
+training:
+  global_batch_size: 256
+  num_workers: 4
+  image_size: 256
+eval:
+  eval_dir: results/stage1/eval
+  datasets:
+    imagenet:
+      type: hf
+      data_dir: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256
+      split: val
+      condition_type: label
+      reference_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+      metrics: [psnr, ssim, lpips, rfid]

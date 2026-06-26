@@ -38,3 +38,17 @@ def calculate_rfid(
 
     metrics = calculate_metrics(**metrics_kwargs)
     return metrics["frechet_inception_distance"]
+
+
+def calculate_fid_isc(arr1, arr2, bs=64, device="cuda"):
+    """Return (FID, Inception-Score-mean). FID is arr1-vs-arr2; IS is computed on
+    arr1 (the generated set). Single torch-fidelity pass."""
+    metrics = calculate_metrics(
+        input1=ImgArrDataset(arr1),
+        input2=ImgArrDataset(arr2),
+        batch_size=bs,
+        fid=True,
+        isc=True,
+        cuda=(device == "cuda"),
+    )
+    return metrics["frechet_inception_distance"], metrics["inception_score_mean"]

@@ -1,0 +1,21 @@
+# Self-paired rFID for OUR plain k23 decoder on the OFFICIAL val npz.
+# eval_recon_subset_rfid.py: source==reference (byte-identical), so NO source/ref
+# pipeline mismatch is possible. Decisive test of whether 0.995 is real decoder
+# behavior or a pipeline artifact. Full 23 layers, combine params == ours-plain-k23-official.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: mean
+    p_drop: 0.0
+    p_full: 0.0
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+eval:
+  ckpt: /sensei-fs-3/users/hongyangd/ckpt/decoder_random_drop_layer_mls_plain_k23/ckpt_latest.pt
+  num_images: 10000
+  val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+  seed: 0
+  tag: selfpair_plain_k23_officialnpz

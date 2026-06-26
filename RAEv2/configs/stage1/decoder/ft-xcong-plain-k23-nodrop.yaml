@@ -1,0 +1,54 @@
+# Fine-tune the xcong plain k23 decoder (ckpt ep14/16) a few more epochs, NO-DROP.
+# Warm-start (training.init_from) loads combine+decoder+disc weights but trains a
+# FRESH schedule from epoch 0. Goal: close the train/inference gap (it was trained
+# with random_drop p=0.3 but evaluated with all-23 mean) and refine rFID.
+#   combine: weighting=mean (all 23, deterministic — no drop), cls_surrogate=true
+#            (confirmed correct: PSNR 28.8 @ cls-on vs 21.7 @ cls-off), projector=none.
+#   GAN on from step 0 (disc weights warm-started); eval against OFFICIAL val npz.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: mean
+    p_drop: 0.0
+    p_full: 0.0
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+    noise_tau: 0.0
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 0            # GAN on immediately (disc warm-started from init_from)
+    disc_ckpt: /sensei-fs-3/users/hongyangd/pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth
+data:
+  data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256-full
+  image_size: 256
+  val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+  val_n: 1000
+training:
+  epochs: 4
+  batch_size: 32
+  lr: 1.0e-4               # gentle: ~1/8 of the original 8e-4, for a few-epoch refine
+  warmup_epochs: 0
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  init_from: /sensei-fs-3/users/hongyangd/ckpt/decoder_random_drop_layer_mls_plain_k23/ckpt_latest.pt
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/decoder_xcong_plain_k23_ft_nodrop
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: omnirae
+  entity: uscgvl
+  name: ft-xcong-plain-k23-nodrop

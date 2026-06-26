@@ -127,7 +127,9 @@ def evaluate_reconstruction_distributed(
     # Rank 0 computes metrics
     metrics = None
     if rank == 0:
-        combined_recons = gather_and_cleanup_shards(temp_dir, "recon", global_step, world_size, num_samples)
+        # shuffle=False: keep recon in original index order to stay aligned with the
+        # unshuffled reference npz (paired PSNR/SSIM/LPIPS); rFID is shuffle-invariant.
+        combined_recons = gather_and_cleanup_shards(temp_dir, "recon", global_step, world_size, num_samples, shuffle=False)
         print(f"[Eval] Combined reconstruction NPZ shape: {combined_recons.shape}")
 
         ref_npz_path = reference_npz_path

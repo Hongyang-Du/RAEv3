@@ -1,0 +1,51 @@
+# 4-node (32-GPU) variant of ft-xcong-plain-k23-nodrop.yaml.
+# batch_size 8/GPU x 32 GPU = global 256 -> SAME batch statistics & step cadence
+# (~5004 steps/epoch) as the original xcong run, which keeps the GAN stable during
+# fine-tune. Separate out_dir so it never collides with a local 8-GPU run.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: mean
+    p_drop: 0.0
+    p_full: 0.0
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+    noise_tau: 0.0
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 0
+    disc_ckpt: /sensei-fs-3/users/hongyangd/pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth
+data:
+  data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256-full
+  image_size: 256
+  val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+  val_n: 1000
+training:
+  epochs: 4
+  batch_size: 8            # x 32 GPU = global 256 (matches original)
+  lr: 1.0e-4               # gentle refine (~1/8 of original 8e-4) at the same global batch
+  warmup_epochs: 0
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  init_from: /sensei-fs-3/users/hongyangd/ckpt/decoder_random_drop_layer_mls_plain_k23/ckpt_latest.pt
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/decoder_xcong_plain_k23_ft_nodrop_4node
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: omnirae
+  entity: uscgvl
+  name: ft-xcong-plain-k23-nodrop-4node
