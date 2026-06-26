@@ -17,6 +17,12 @@ done
 : "${REPO:?could not find RAEv3/RAEv2 on the sensei mount}"
 cd "$REPO"
 
+# tee ALL output of this pod (incl. tracebacks) to the shared FS so failures on any
+# node are readable from anywhere. One file per pod: logs/<job>-node<RANK>.log
+mkdir -p "$ROOT/logs"
+exec > >(tee -a "$ROOT/logs/${JOB_NAME:-omnirae}-node${RANK:-0}.log") 2>&1
+echo "================ $(date '+%F %T')  host=$(hostname)  rank=${RANK:-0}  ================"
+
 PY="$ROOT/rae_env/bin/python"
 TR="$ROOT/rae_env/bin/torchrun"
 [ -x "$PY" ] || { echo "FATAL: portable env not found at $ROOT/rae_env"; exit 1; }

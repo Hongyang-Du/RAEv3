@@ -11,6 +11,11 @@ done
 : "${REPO:?could not find RAEv3/RAEv2 on the sensei mount}"
 cd "$REPO"
 
+# tee ALL output of this pod (incl. tracebacks) to the shared FS for easy debugging.
+mkdir -p "$ROOT/logs"
+exec > >(tee -a "$ROOT/logs/${JOB_NAME:-omnirae}-node${RANK:-0}.log") 2>&1
+echo "================ $(date '+%F %T')  host=$(hostname)  rank=${RANK:-0}  ================"
+
 PY="$ROOT/rae_env/bin/python"
 TR="$ROOT/rae_env/bin/torchrun"
 [ -x "$PY" ] || { echo "FATAL: portable env not found at $ROOT/rae_env (run build_portable_env.sh first)"; exit 1; }
