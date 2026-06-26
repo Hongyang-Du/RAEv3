@@ -102,6 +102,20 @@ def train_one_epoch(
         logger.info(f"Saving checkpoint at epoch {epoch}...")
         ckpt_path = f"{checkpoint_dir}/ep-{epoch:07d}.pt"
         save_stage2_checkpoint(ckpt_path, global_step, epoch, ddp_model, ema_model, optimizer, scheduler)
+        # optional retention (CKPT_KEEP_RECENT>0): keep every-CKPT_KEEP_EVERY-epoch
+        # milestones + the most recent N, prune the rest to bound disk. Default unset =
+        # keep everything (unchanged for other users).
+        keep_recent = int(os.environ.get("CKPT_KEEP_RECENT", "0"))
+        if keep_recent > 0:
+            import re
+            keep_every = int(os.environ.get("CKPT_KEEP_EVERY", "10"))
+            eps = sorted(int(m.group(1)) for f in os.listdir(checkpoint_dir)
+                         if (m := re.fullmatch(r"ep-(\d+)\.pt", f)))
+            keep = set(eps[-keep_recent:]) | {e for e in eps if keep_every > 0 and e % keep_every == 0}
+            for e in eps:
+                if e not in keep:
+                    try: os.remove(f"{checkpoint_dir}/ep-{e:07d}.pt")
+                    except OSError: pass
         if args.sync_checkpoints:
             sync_checkpoint_async(checkpoint_dir, logger)
             if do_eval: sync_evals_async(eval_dir, logger)

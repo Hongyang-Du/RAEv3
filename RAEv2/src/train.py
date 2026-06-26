@@ -57,6 +57,10 @@ def main():
     rank, world_size, device = setup_distributed()
     config: Stage2Config = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(Stage2Config), OmegaConf.load(args.config)))
     config.post_process()
+    # GRAD_ACCUM_OVERRIDE lets a launch script set grad_accum_steps without editing the
+    # shared config (e.g. accum=1 at 32 GPUs vs accum=2 at 8 GPUs); global_batch is unchanged.
+    if os.environ.get("GRAD_ACCUM_OVERRIDE"):
+        config.training.grad_accum_steps = int(os.environ["GRAD_ACCUM_OVERRIDE"])
     validate_stage2_config(config)
 
     seed = config.training.global_seed * world_size + rank

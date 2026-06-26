@@ -79,7 +79,7 @@ training:
   ema_decay: 0.9995
   num_workers: 4
   log_interval: 100
-  checkpoint_interval: 10        # save every 10 epochs
+  checkpoint_interval: 2         # save every 2 epochs (resume granularity); retention bounds disk
   sample_every: 5000
   clip_grad: 1.0
   global_seed: 42

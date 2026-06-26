@@ -76,12 +76,19 @@ def save_stage2_checkpoint(
         "step": step,
         "epoch": epoch,
         "model": model.module.state_dict(),
-        "ema": ema_model.state_dict(),
+        # STAGE2_NO_EMA_CKPT=1 omits the EMA copy to save ~1/3 of each checkpoint
+        # (set when EMA is not used downstream). EMA is still tracked in-memory during
+        # training; only the saved file skips it. On resume EMA re-inits from `model`.
+        "ema": None if os.environ.get("STAGE2_NO_EMA_CKPT") else ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(state, path)
+    # atomic write: a crash mid-save leaves the .tmp (ignored by resume), never a
+    # half-written ep-*.pt — so the previous complete checkpoint stays usable.
+    tmp = f"{path}.tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
 
 
 def load_stage2_checkpoint(
@@ -94,7 +101,9 @@ def load_stage2_checkpoint(
     """Load Stage 2 training checkpoint. Returns (epoch, step)."""
     checkpoint = torch.load(path, map_location="cpu")
     model.module.load_state_dict(checkpoint["model"])
-    ema_model.load_state_dict(checkpoint["ema"])
+    # tolerate checkpoints saved without EMA (STAGE2_NO_EMA_CKPT): re-init EMA from model
+    ema_state = checkpoint.get("ema")
+    ema_model.load_state_dict(ema_state if ema_state is not None else checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler") is not None:
         scheduler.load_state_dict(checkpoint["scheduler"])
