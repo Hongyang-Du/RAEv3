@@ -75,15 +75,20 @@ def initialize(args, entity, exp_name, project_name):
         else:
             # assert already logged in
             pass
-        wandb.init(
+        init_kwargs = dict(
             entity=entity,
             project=project_name,
             name=exp_name,
             config=config_dict,
-            id=generate_run_id(exp_name),
-            resume="allow",
             reinit=True,
         )
+        # WANDB_FRESH_RUN=1: start a brand-new run each launch (wandb auto-generates a
+        # unique id). Avoids resuming a deterministic-id run whose logged step got ahead
+        # of the last checkpoint after a restart — that makes wandb ignore the re-logged
+        # (lower) steps ("ignoring partial history record") and the run shows as crashed.
+        if not os.environ.get("WANDB_FRESH_RUN"):
+            init_kwargs.update(id=generate_run_id(exp_name), resume="allow")
+        wandb.init(**init_kwargs)
 
 
 def log(stats, step=None):

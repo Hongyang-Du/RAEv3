@@ -28,6 +28,7 @@ export CKPT_KEEP_EVERY=10     # plus keep every-10-epoch milestones (for gFID-vs
 # --- wandb (set WANDB_KEY as a job Vault Secret / env var) ---
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
 export WANDB_PROJECT="${WANDB_PROJECT:-omnirae}"
+export WANDB_FRESH_RUN=1   # fresh wandb run each launch (avoids resume step-collision / crashed status)
 
 case "${1:-}" in
   exp1) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k23.yaml; export EXPERIMENT_NAME=omnirae-dit-h1-plain-cls-k23 ;;

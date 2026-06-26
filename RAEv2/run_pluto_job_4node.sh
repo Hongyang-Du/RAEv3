@@ -31,6 +31,7 @@ export CKPT_KEEP_RECENT=6
 export CKPT_KEEP_EVERY=10
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
 export WANDB_PROJECT="${WANDB_PROJECT:-omnirae}"
+export WANDB_FRESH_RUN=1   # fresh wandb run each launch (avoids resume step-collision / crashed status)
 
 NUM_NODES="${NUM_NODES:?set NUM_NODES to the job replica count (e.g. 4)}"
 NPROC="${NUM_OF_GPUS:-8}"                       # GPUs per node (Pluto sets NUM_OF_GPUS)
