@@ -80,6 +80,9 @@ def main():
     if os.environ.get("DISC_START_OVERRIDE"): L.gan.disc_start = int(os.environ["DISC_START_OVERRIDE"])
     if os.environ.get("OUT_DIR_OVERRIDE"): T.out_dir = os.environ["OUT_DIR_OVERRIDE"]
     if os.environ.get("NUM_WORKERS_OVERRIDE"): D.num_workers = int(os.environ["NUM_WORKERS_OVERRIDE"])
+    # preemption resilience: also save ckpt_latest every N steps (not just per epoch), so
+    # a preempted job resumes from a recent step instead of restarting the epoch from zero.
+    ckpt_every_steps = int(os.environ.get("CKPT_EVERY_STEPS", "0") or "0")
 
     from datetime import timedelta
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))   # NFS ckpt saves can be slow
@@ -352,6 +355,7 @@ def main():
         print(f"  [val ep{ep}] saved ckpt", flush=True)
 
     val_thread = None
+    step_save_thread = None
 
     # -- training loop ---------------------------------------------------------
     # grad_accum: micro-batch of T.batch_size, optimizer steps every `accum`
@@ -441,6 +445,24 @@ def main():
                                "train/sigreg": loss_sig.item(), "train/gan_g": loss_gan.item(),
                                "train/z_mean": zd["mean"], "train/z_std": zd["std"],
                                "train/z_var_mean": zd["var_mean"], "train/lr": lr}, step=global_step)
+
+            # -- step-based ckpt_latest (preemption resilience) ------------------
+            # epoch=`epoch` (not +1) so resume redoes the current epoch from its start
+            # but with the model/optimizer/scheduler/global_step restored (no weight loss).
+            if is_main and ckpt_every_steps > 0 and global_step % ckpt_every_steps == 0:
+                if step_save_thread is not None:
+                    step_save_thread.join()
+                _snap = _to_cpu({
+                    "epoch": epoch, "global_step": global_step, "layers": layers,
+                    "combine": combine.state_dict(), "decoder": decoder.state_dict(),
+                    "ema_combine": ema_combine.state_dict(), "ema_dec": ema_dec.state_dict(),
+                    "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
+                    "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
+                def _save_latest(s):
+                    _t = latest + ".tmp"; torch.save(s, _t); os.replace(_t, latest)
+                step_save_thread = threading.Thread(target=_save_latest, args=(_snap,), daemon=True)
+                step_save_thread.start()
+                print(f"  [step-ckpt] saved ckpt_latest @ step {global_step}", flush=True)
 
         if is_main:
             print(f"Epoch {epoch+1}/{T.epochs}  time={time.time()-t0:.0f}s", flush=True)

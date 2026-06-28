@@ -37,6 +37,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export HF_HUB_ENABLE_HF_TRANSFER=1
 mkdir -p /mnt/localssd/raev2-wds-cache 2>/dev/null || true
 export CKPT_KEEP_RECENT="${CKPT_KEEP_RECENT:-4}"   # keep recent N ckpt_ep*.pt (virtualized epochs -> many)
+export CKPT_EVERY_STEPS="${CKPT_EVERY_STEPS:-500}" # also save ckpt_latest every N steps -> survives Porter preemption (resume, not restart-from-zero)
 # wandb: train_decoder.py reads cfg.wandb.enabled; it needs an API key in the env.
 [ -n "${WANDB_KEY:-}" ] && export WANDB_API_KEY="${WANDB_KEY}"
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
@@ -69,7 +70,55 @@ PYEOF
 )"
     echo "### 4src auto: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
     ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|general-4src>"; exit 1 ;;
+  general-4src-local)
+    # Pre-download the 3 streaming sources to THIS node's localssd, then train from local.
+    # Steady fast local reads -> no Pluto-autorecovery "hang" restarts (the streaming
+    # variant stalls on cold HF reads and gets killed). imagenet stays on the shared FS.
+    CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src-local.yaml
+    DEST=/mnt/localssd/raev2-data
+    mkdir -p "$DEST"
+    echo "### $(date '+%F %T') downloading RAEv2 4src to $DEST (per-node, ~1.9TB, hf_transfer)..."
+    HF_HUB_ENABLE_HF_TRANSFER=1 "$ROOT/rae_env/bin/hf" download nanovisionx/RAEv2-data \
+      --repo-type dataset --local-dir "$DEST" \
+      --include "rendertext-256/**" "scale-rae-256/**" \
+                "blip3o-256/short-caption/**" "blip3o-256/long-caption/**"
+      dl_rc=$?
+    echo "### $(date '+%F %T') download exit=$dl_rc ; tars: rt=$(ls "$DEST"/rendertext-256/*.tar 2>/dev/null|wc -l) flux=$(ls "$DEST"/scale-rae-256/*.tar 2>/dev/null|wc -l) blip=$(ls "$DEST"/blip3o-256/*/*.tar 2>/dev/null|wc -l)"
+    [ "$dl_rc" -ne 0 ] && { echo "FATAL: download failed"; exit 1; }
+    eval "$("$PY" - "$NUM_NODES" "$NPROC" <<'PYEOF'
+import sys, math
+nodes, nproc = int(sys.argv[1]), int(sys.argv[2])
+g = 32 * nodes * nproc
+print(f"export BATCH_SIZE_OVERRIDE=32")
+print(f"export LR_OVERRIDE={2e-4*math.sqrt(g/512):.6e}")
+PYEOF
+)"
+    echo "### 4src-local: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
+    ;;
+  general-4src-s3)
+    # Same as general-4src-local but pulls the data from OUR S3 bucket (same AWS region as
+    # Pluto -> fast, no HF rate-limits) instead of the HF Hub. Needs AWS creds in the job
+    # env (or an instance role with s3:GetObject on the bucket).
+    CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src-local.yaml
+    DEST=/mnt/localssd/raev2-data
+    S3=s3://hongyangd-raev2-backup/raev2-data
+    mkdir -p "$DEST"
+    echo "### $(date '+%F %T') syncing $S3 -> $DEST (per-node, ~1.9TB, AWS-internal)..."
+    aws s3 sync "$S3" "$DEST" --only-show-errors
+      dl_rc=$?
+    echo "### $(date '+%F %T') s3 sync exit=$dl_rc ; tars: rt=$(ls "$DEST"/rendertext-256/*.tar 2>/dev/null|wc -l) flux=$(ls "$DEST"/scale-rae-256/*.tar 2>/dev/null|wc -l) blip=$(ls "$DEST"/blip3o-256/*/*.tar 2>/dev/null|wc -l)"
+    [ "$dl_rc" -ne 0 ] && { echo "FATAL: s3 sync failed (creds? instance role?)"; exit 1; }
+    eval "$("$PY" - "$NUM_NODES" "$NPROC" <<'PYEOF'
+import sys, math
+nodes, nproc = int(sys.argv[1]), int(sys.argv[2])
+g = 32 * nodes * nproc
+print(f"export BATCH_SIZE_OVERRIDE=32")
+print(f"export LR_OVERRIDE={2e-4*math.sqrt(g/512):.6e}")
+PYEOF
+)"
+    echo "### 4src-s3: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
+    ;;
+  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
 esac
 
 echo "### $(date '+%F %T')  decoder-ft  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=$([ -n "${WANDB_API_KEY:-}" ] && echo on || echo off)"
@@ -81,5 +130,6 @@ exec "$TR" \
   --rdzv_backend=c10d \
   --rdzv_id="${JOB_NAME:-decoder-ft}-ftplain" \
   --rdzv_endpoint="${MASTER}:${MPORT}" \
+  --rdzv_conf=timeout=2400 \
   src/train_decoder.py \
   --config "$CFG"

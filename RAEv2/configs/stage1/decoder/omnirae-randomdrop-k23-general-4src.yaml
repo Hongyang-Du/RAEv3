@@ -37,8 +37,9 @@ loss:
     disc_ckpt: /sensei-fs-3/users/hongyangd/pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth
 data:
   image_size: 256
-  num_workers: 2            # x4 mix sources = 8 dataloader workers/rank (8 ranks/node ->
-                            # 64/node). Higher (8) spawns 256 procs/node and hangs at start.
+  num_workers: 4            # fork workers (cheap): x4 mix sources = 16/rank. Feeds H200
+                            # better than 2. (NOTE: loaders use fork now, not spawn —
+                            # spawn at high worker counts hangs at first batch.)
   val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
   val_n: 1000
   mix:

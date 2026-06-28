@@ -1,0 +1,22 @@
+stage_1:
+  target: stage1.RAE
+  params:
+    encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
+    resolution: 256
+    decoder_config_path: configs/decoder/ViTXL
+    pretrained_decoder_path: /tmp/claude-1000/-sensei-fs-3-users-hongyangd/8f39598d-1bb1-44f2-81f8-0fd62527c107/scratchpad/repro_ep16_decoder_ema.pt
+    noise_tau: 0.0
+training:
+  global_batch_size: 32
+  num_workers: 4
+  image_size: 256
+eval:
+  eval_dir: results/stage1/eval
+  datasets:
+    imagenet:
+      type: hf
+      data_dir: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256
+      split: val
+      condition_type: label
+      reference_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+      metrics: [psnr, ssim, rfid]

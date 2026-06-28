@@ -1,0 +1,72 @@
+# LOCAL variant of omnirae-randomdrop-k23-general-4src: reads blip3o/rendertext/flux
+# from /mnt/localssd (pre-downloaded by the launch script) instead of HF streaming.
+# Steady fast local reads -> no Pluto autorecovery "hang" restarts. imagenet stays on
+# the shared FS (small). Recipe identical to the streaming version.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: random_drop
+    p_drop: 0.3
+    p_full: 0.0
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+    noise_tau: 0.8
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+    disc_ckpt: /sensei-fs-3/users/hongyangd/pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth
+data:
+  image_size: 256
+  num_workers: 4
+  val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+  val_n: 1000
+  mix:
+    - target: imagenet
+      name: imagenet
+      weight: 1.0
+      data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256-full
+      split: train
+      condition_type: label
+    - target: blip3o
+      name: blip3o
+      weight: 1.0
+      data_dir: /mnt/localssd/raev2-data/blip3o-256
+      splits: [short-caption, long-caption]
+    - target: rendertext-256
+      name: rendertext
+      weight: 1.0
+      data_dir: /mnt/localssd/raev2-data/rendertext-256
+      subsets: [root]
+    - target: flux-synthetic-256
+      name: flux-synthetic
+      weight: 1.0
+      data_dir: /mnt/localssd/raev2-data/scale-rae-256
+      subsets: [root]
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 1
+  ema_decay: 0.9978
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omnirae-randomdrop-k23-general-4src
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: omnirae
+  entity: uscgvl
+  name: omnirae-randomdrop-k23-general-4src
