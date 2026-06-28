@@ -12,7 +12,7 @@ instantiate_from_config (target: stage1.combine.MLSCombine).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .shared import ModelConfig
 
@@ -54,6 +54,12 @@ class DataConfig:
     num_workers: int = 4
     val_npz: str = "data_eval/imagenet-256-val.npz"
     val_n: int = 1000
+    # Optional multi-source weighted mix (official general recipe). When set, the
+    # trainer builds the loader via prepare_unified_dataloader instead of the single
+    # data_dir loader. Each entry: {target, name, weight, ... + per-source loader keys
+    # (data_dir/splits/subsets/hf_repo/hf_paths/cache_dir/cache_size)}.
+    mix: Optional[List[Any]] = None
+    virtual_epoch_steps: Optional[int] = None   # cap mix epoch length (steps); None = full
 
 
 @dataclass

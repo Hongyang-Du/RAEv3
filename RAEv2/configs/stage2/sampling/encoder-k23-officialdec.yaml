@@ -1,0 +1,48 @@
+# Encoder DiT (omnirae-dit-encoder-cls-k23-4node) ep80 latents decoded by the
+# OFFICIAL RAEv2 k23 decoder, for gFID+IS vs the val-50k npz.
+#
+# stage_1 = stage1.RAE with the OFFICIAL k23 decoder weights, but the LOCAL
+# normalization stats — the DiT generates in the local-normalized latent space
+# (trained with output_full/decoder_random_drop_layer_mls_plain_k23/latent_stats.pt),
+# so decode() must de-normalize with those LOCAL stats before applying the decoder.
+stage_1:
+  target: stage1.RAE
+  params:
+    encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
+    resolution: 256
+    decoder_config_path: configs/decoder/ViTXL
+    pretrained_decoder_path: /sensei-fs-3/users/hongyangd/official_raev2/pretrained_models/stage1/imagenet/dinov3l-k23/decoder.pt
+    noise_tau: 0.0
+    normalization_stat_path: output_full/decoder_random_drop_layer_mls_plain_k23/latent_stats.pt
+stage_2:
+  target: stage2.models.DDT.DiTwDDTHeadIG
+  params:
+    input_size: 16
+    patch_size: [1, 1]
+    in_channels: 1024
+    hidden_size: [1440, 2048]
+    depth: [28, 2]
+    num_heads: [20, 16]
+    mlp_ratio: 4.0
+    base_model_depth: 8
+conditioning:
+  type: label
+  cfg_dropout_prob: 0.1
+  arch:
+    num_t_tokens: 4
+    num_c_tokens: 8
+transport:
+  prediction: x
+  time_dist_type: logit-normal_0_1
+sampler:
+  num_steps: 50
+guidance:
+  cfg: {scale: 1.0, t_min: 0.0, t_max: 1.0}
+  ig: {scale: 1.0, t_min: 0.10, t_max: 1.0}
+training:
+  image_size: 256
+misc:
+  latent_size: [1024, 16, 16]
+  num_classes: 1000
+  time_dist_shift_dim: 262144
+  time_dist_shift_base: 4096

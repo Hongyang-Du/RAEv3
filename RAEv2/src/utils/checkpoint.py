@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 from typing import Optional, Tuple
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
+
+
+def _prune_old_checkpoints(path: str) -> None:
+    """Retention for ep-*.pt siblings of `path`, guarded by env so default is keep-all.
+
+    CKPT_KEEP_RECENT=N  -> keep the N highest-epoch checkpoints.
+    CKPT_KEEP_EVERY=K   -> additionally keep every-K-epoch milestones.
+    Prevents the per-user disk quota from filling up (which truncates the next save
+    into a corrupt zip and sends resume into a crash loop).
+    """
+    keep_recent = int(os.environ.get("CKPT_KEEP_RECENT", "0") or "0")
+    keep_every = int(os.environ.get("CKPT_KEEP_EVERY", "0") or "0")
+    if keep_recent <= 0:
+        return
+    d = os.path.dirname(path)
+    cks = []
+    for f in glob.glob(os.path.join(d, "ep-*.pt")):
+        m = re.search(r"ep-(\d+)\.pt$", f)
+        if m:
+            cks.append((int(m.group(1)), f))
+    cks.sort()
+    keep = {f for _, f in cks[-keep_recent:]}
+    if keep_every > 0:
+        keep |= {f for e, f in cks if e % keep_every == 0}
+    for _, f in cks:
+        if f not in keep:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def save_stage1_checkpoint(
@@ -35,7 +67,21 @@ def save_stage1_checkpoint(
         "disc_scheduler": disc_scheduler.state_dict() if disc_scheduler is not None else None,
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(state, path)
+    # atomic write: save to a tmp then rename, so an interrupted save (preemption /
+    # quota-exceeded mid-write) never leaves a truncated/corrupt ep-*.pt that resume
+    # would then pick as "latest" and crash-loop on.
+    tmp = path + ".tmp"
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+    _prune_old_checkpoints(path)
 
 
 def load_stage1_checkpoint(

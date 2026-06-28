@@ -1,0 +1,89 @@
+# omnirae random-drop k23 decoder trained on the OFFICIAL general 4-source mix
+# (imagenet + blip3o + rendertext + flux/scale-rae, equal 1:1:1:1), to fix the
+# "undertrained" gap (the old random-drop saw only ImageNet's 1.28M).
+#
+# Data: imagenet from local arrow (shared FS); blip3o/rendertext/flux STREAMED from
+# the HF Hub and cached to /mnt/localssd (epoch-1 streams+caches, then reads local) —
+# no 2.1TB download, no shared-FS quota hit.
+#
+# Recipe = official general (lr 2e-4@512 base, noise_tau 0.8, ema 0.9978,
+# GAN disc_start@epoch 8, 16 epochs) + OUR random_drop combine (p_drop 0.3, cls_surrogate true).
+#
+# 16 REAL epochs = 16 full passes over the ~69.7M-sample mix. steps/epoch = 69.7M /
+# global_batch (varies with node count — that's fine). checkpoint every epoch (ckpt_every 1).
+# The launch script fixes per-GPU batch=32 (OOM-safe) and sqrt-scales lr with the actual
+# global batch; epochs/warmup/disc_start stay epoch-based (16/1/8) regardless of node count.
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: random_drop
+    p_drop: 0.3
+    p_full: 0.0
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+    noise_tau: 0.8
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8            # GAN on at epoch 8 (official)
+    disc_ckpt: /sensei-fs-3/users/hongyangd/pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth
+data:
+  image_size: 256
+  num_workers: 2            # x4 mix sources = 8 dataloader workers/rank (8 ranks/node ->
+                            # 64/node). Higher (8) spawns 256 procs/node and hangs at start.
+  val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+  val_n: 1000
+  mix:
+    - target: imagenet
+      name: imagenet
+      weight: 1.0
+      data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256-full
+      split: train
+      condition_type: label
+    - target: blip3o
+      name: blip3o
+      weight: 1.0
+      splits: [short-caption, long-caption]
+      hf_repo: nanovisionx/RAEv2-data
+      cache_dir: /mnt/localssd/raev2-wds-cache
+    - target: rendertext-256
+      name: rendertext
+      weight: 1.0
+      subsets: [root]
+      hf_repo: nanovisionx/RAEv2-data
+      hf_paths: [rendertext-256]
+      cache_dir: /mnt/localssd/raev2-wds-cache
+    - target: flux-synthetic-256
+      name: flux-synthetic
+      weight: 1.0
+      subsets: [root]
+      hf_repo: nanovisionx/RAEv2-data
+      hf_paths: [scale-rae-256]
+      cache_dir: /mnt/localssd/raev2-wds-cache
+training:
+  epochs: 16                # 16 REAL full passes over the mix
+  batch_size: 32            # per GPU (OOM-safe with GAN); launch script may override
+  lr: 2.0e-4               # base @ global 512; launch script sqrt-scales to actual global
+  warmup_epochs: 1          # 1 full pass warmup (official)
+  ema_decay: 0.9978
+  precision: bf16
+  ckpt_every: 1             # checkpoint every (real) epoch
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omnirae-randomdrop-k23-general-4src
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: omnirae
+  entity: uscgvl
+  name: omnirae-randomdrop-k23-general-4src

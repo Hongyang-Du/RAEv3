@@ -1,0 +1,27 @@
+# Official k23 decoder recon eval via OUR fork (official_raev2's eval pkg imports
+# t2v_metrics which isn't installed). stage1.RAE + the official decoder.pt + official
+# stats + official 50k center-crop val npz. 1 GPU (batch 32) -> single shard, no gather
+# shuffle, PSNR trustworthy. Apples-to-apples reference for our decoders.
+stage_1:
+  target: stage1.RAE
+  params:
+    encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
+    resolution: 256
+    decoder_config_path: configs/decoder/ViTXL
+    pretrained_decoder_path: /sensei-fs-3/users/hongyangd/official_raev2/pretrained_models/stage1/imagenet/dinov3l-k23/decoder.pt
+    normalization_stat_path: /sensei-fs-3/users/hongyangd/official_raev2/pretrained_models/stage1/imagenet/dinov3l-k23/stats.pt
+    noise_tau: 0.0
+training:
+  global_batch_size: 32
+  num_workers: 4
+  image_size: 256
+eval:
+  eval_dir: results/stage1/eval
+  datasets:
+    imagenet:
+      type: hf
+      data_dir: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256
+      split: val
+      condition_type: label
+      reference_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+      metrics: [psnr, ssim, rfid]

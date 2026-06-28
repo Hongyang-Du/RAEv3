@@ -35,6 +35,53 @@ def _filter_valid_samples(sample):
     return sample[0] is not None
 
 
+_SHARD_INDEX_JSON = Path(__file__).resolve().parents[2] / "data" / "raev2_hf_shards.json"
+
+
+def hf_tar_urls(hf_repo: str, hf_paths: List[str], revision: str = "main") -> List[str]:
+    """Resolve `*.tar` shard URLs under the given HF dataset path prefixes.
+
+    Streams shards straight from the Hub (no full download); each prefix is a folder
+    like 'rendertext-256', 'scale-rae-256', or 'blip3o-256/short-caption'.
+
+    Prefers a pre-baked static index (data/raev2_hf_shards.json) so that hundreds of
+    DDP ranks don't each hammer the HF tree API at startup (which triggers HTTP 429
+    rate-limiting). Falls back to a single live API listing only if the index is
+    missing a requested prefix.
+    """
+    import json
+
+    index = {}
+    if _SHARD_INDEX_JSON.exists():
+        try:
+            data = json.loads(_SHARD_INDEX_JSON.read_text())
+            if data.get("repo") == hf_repo:
+                index = data.get("paths", {})
+        except Exception:
+            index = {}
+
+    urls: List[str] = []
+    missing: List[str] = []
+    for prefix in hf_paths:
+        got = index.get(prefix.rstrip("/"))
+        if got:
+            urls.extend(got)
+        else:
+            missing.append(prefix)
+
+    if missing:
+        from huggingface_hub import HfApi
+        files = HfApi().list_repo_files(hf_repo, repo_type="dataset", revision=revision)
+        base = f"https://huggingface.co/datasets/{hf_repo}/resolve/{revision}"
+        for prefix in missing:
+            pfx = prefix.rstrip("/") + "/"
+            urls.extend(f"{base}/{f}" for f in files if f.startswith(pfx) and f.endswith(".tar"))
+
+    if not urls:
+        raise ValueError(f"No .tar shards found under {hf_paths} in {hf_repo}")
+    return sorted(urls)
+
+
 class GenericWebDataset:
     """WebDataset wrapper that globs `*.tar` from one or more subset directories.
 
@@ -51,6 +98,10 @@ class GenericWebDataset:
         image_size: int = 256,
         shuffle_buffer: int = 20000,
         seed: int = 42,
+        hf_repo: Optional[str] = None,
+        hf_paths: Optional[List[str]] = None,
+        cache_dir: Optional[str] = None,
+        cache_size: int = 0,
     ):
         """
         Args:
@@ -72,29 +123,43 @@ class GenericWebDataset:
         self.image_size = image_size
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
+        self.hf_repo = hf_repo
+        self.cache_dir = cache_dir
+        self.cache_size = cache_size
 
         meta = GENERIC_WDS_METADATA.get(dataset_name, {}) if dataset_name else {}
 
         self._total_samples = 0
         self._shard_urls: List[str] = []
 
-        for subset in self.subsets:
-            # 'root' is a sentinel for the data_dir itself (flat pool);
-            # everything else is a real sub-folder.
-            subset_dir = self.data_dir if subset == "root" else self.data_dir / subset
-            if not subset_dir.exists():
-                raise ValueError(f"Subset directory not found: {subset_dir}")
+        if hf_repo:
+            # Stream tar shards straight from the HF Hub (cached to cache_dir on first
+            # read; epoch 2+ reads local). hf_paths gives the HF folder prefix(es).
+            paths = hf_paths or self.subsets
+            self._shard_urls = hf_tar_urls(hf_repo, paths)
+            for subset in self.subsets:
+                if subset in meta:
+                    self._total_samples += meta[subset]["num_samples"]
+            if self._total_samples == 0:
+                self._total_samples = len(self._shard_urls) * 10_000
+        else:
+            for subset in self.subsets:
+                # 'root' is a sentinel for the data_dir itself (flat pool);
+                # everything else is a real sub-folder.
+                subset_dir = self.data_dir if subset == "root" else self.data_dir / subset
+                if not subset_dir.exists():
+                    raise ValueError(f"Subset directory not found: {subset_dir}")
 
-            tar_files = sorted(subset_dir.glob("*.tar"))
-            if not tar_files:
-                raise ValueError(f"No tar shards found in {subset_dir}")
-            self._shard_urls.extend(str(f) for f in tar_files)
+                tar_files = sorted(subset_dir.glob("*.tar"))
+                if not tar_files:
+                    raise ValueError(f"No tar shards found in {subset_dir}")
+                self._shard_urls.extend(str(f) for f in tar_files)
 
-            if subset in meta:
-                self._total_samples += meta[subset]["num_samples"]
-            else:
-                # Fallback: assume ~50k samples/shard (rough average for these sources).
-                self._total_samples += len(tar_files) * 50_000
+                if subset in meta:
+                    self._total_samples += meta[subset]["num_samples"]
+                else:
+                    # Fallback: assume ~50k samples/shard (rough average for these sources).
+                    self._total_samples += len(tar_files) * 50_000
 
         self._num_shards = len(self._shard_urls)
 
@@ -126,6 +191,8 @@ class GenericWebDataset:
                 nodesplitter=wds.split_by_node,
                 shardshuffle=1000,
                 seed=self.seed + epoch,
+                cache_dir=self.cache_dir,
+                cache_size=self.cache_size,
             )
             .shuffle(self.shuffle_buffer, initial=self.shuffle_buffer // 2)
             .decode("pil", handler=wds.ignore_and_continue)

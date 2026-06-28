@@ -70,6 +70,17 @@ def main():
         OmegaConf.structured(DecoderConfig), OmegaConf.load(args.config)))
     C, L, D, T, P = cfg.combine, cfg.loss, cfg.data, cfg.training, cfg.probe
 
+    # Node-count-agnostic overrides: fix per-GPU batch (OOM-safe) and let the launch
+    # script scale lr/epochs/warmup/disc_start with the actual global batch (= per-GPU
+    # batch x world_size), so the run trains ~the same total passes on any node count.
+    if os.environ.get("BATCH_SIZE_OVERRIDE"): T.batch_size = int(os.environ["BATCH_SIZE_OVERRIDE"])
+    if os.environ.get("LR_OVERRIDE"): T.lr = float(os.environ["LR_OVERRIDE"])
+    if os.environ.get("EPOCHS_OVERRIDE"): T.epochs = int(os.environ["EPOCHS_OVERRIDE"])
+    if os.environ.get("WARMUP_OVERRIDE"): T.warmup_epochs = int(os.environ["WARMUP_OVERRIDE"])
+    if os.environ.get("DISC_START_OVERRIDE"): L.gan.disc_start = int(os.environ["DISC_START_OVERRIDE"])
+    if os.environ.get("OUT_DIR_OVERRIDE"): T.out_dir = os.environ["OUT_DIR_OVERRIDE"]
+    if os.environ.get("NUM_WORKERS_OVERRIDE"): D.num_workers = int(os.environ["NUM_WORKERS_OVERRIDE"])
+
     from datetime import timedelta
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))   # NFS ckpt saves can be slow
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -95,10 +106,31 @@ def main():
         wandb.define_metric("val/*", step_metric="val/step")
 
     # -- data ------------------------------------------------------------------
-    train_loader, train_sampler = make_loader(
-        D.data_dir, D.image_size, T.batch_size, D.num_workers, world, rank)
-    if is_main:
-        print(f"Train: {len(train_loader.dataset)} images")
+    if getattr(D, "mix", None):
+        # Multi-source weighted mix (official general recipe): imagenet (local arrow)
+        # + blip3o/rendertext/flux streamed from HF (cached to localssd). Reuses the
+        # stage-1 MixedDataloader; it yields (image, cond) and acts as its own loader
+        # + sampler (set_epoch / __len__), so the loop below works unchanged.
+        from data import prepare_unified_dataloader
+        mix_cfg = {
+            "mix": OmegaConf.to_container(D.mix, resolve=True) if OmegaConf.is_config(D.mix) else D.mix,
+            "seed": T.seed,
+        }
+        mixed = prepare_unified_dataloader(
+            config=mix_cfg, image_size=D.image_size, batch_size=T.batch_size,
+            num_workers=D.num_workers, rank=rank, world_size=world,
+            transform=None, condition_type="label", shuffle=True,
+            virtual_epoch_steps=getattr(D, "virtual_epoch_steps", None),
+        )
+        train_loader = train_sampler = mixed   # MixedDataloader: loader + set_epoch + __len__
+        if is_main:
+            print(f"Train mix: {len(mixed)} steps/epoch over {mixed.dataset_size:,} weighted samples "
+                  f"({mixed.child_names})")
+    else:
+        train_loader, train_sampler = make_loader(
+            D.data_dir, D.image_size, T.batch_size, D.num_workers, world, rank)
+        if is_main:
+            print(f"Train: {len(train_loader.dataset)} images")
 
     # -- frozen DINOv3 encoder -------------------------------------------------
     layers = list(C.params["layers"])
@@ -301,9 +333,22 @@ def main():
                 wb.log({**{f"val/loo_dpsnr_L{l}": v for l, v in zip(layers, dloo)},
                         **{f"val/solo_psnr_L{l}": v for l, v in zip(layers, solo)}, "val/step": gstep})
         # -- checkpoint (CPU-cloned, safe to save while training mutates the live model)
-        torch.save(ckpt_cpu, latest)
+        # atomic write: tmp + rename so a preemption/quota-exceeded mid-save never leaves
+        # a truncated ckpt_latest that resume would crash-loop on.
+        _tmp = latest + ".tmp"
+        torch.save(ckpt_cpu, _tmp); os.replace(_tmp, latest)
         if ep % T.ckpt_every == 0:
-            torch.save(ckpt_cpu, os.path.join(T.out_dir, f"ckpt_ep{ep:03d}.pt"))
+            _epf = os.path.join(T.out_dir, f"ckpt_ep{ep:03d}.pt")
+            _t2 = _epf + ".tmp"; torch.save(ckpt_cpu, _t2); os.replace(_t2, _epf)
+            # retention: with virtualized epochs there can be hundreds of ckpt_ep files;
+            # keep only the most recent CKPT_KEEP_RECENT (env, default keep-all) so the
+            # per-user disk quota doesn't fill up.
+            _keep = int(os.environ.get("CKPT_KEEP_RECENT", "0") or "0")
+            if _keep > 0:
+                _eps = sorted(glob.glob(os.path.join(T.out_dir, "ckpt_ep*.pt")))
+                for _f in _eps[:-_keep]:
+                    try: os.remove(_f)
+                    except OSError: pass
         print(f"  [val ep{ep}] saved ckpt", flush=True)
 
     val_thread = None

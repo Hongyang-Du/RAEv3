@@ -38,6 +38,10 @@ class BLIP3OWebDataset:
         image_size: int = 256,
         shuffle_buffer: int = 20000,
         seed: int = 42,
+        hf_repo: Optional[str] = None,
+        hf_paths: Optional[List[str]] = None,
+        cache_dir: Optional[str] = None,
+        cache_size: int = 0,
     ):
         """
         Args:
@@ -55,27 +59,42 @@ class BLIP3OWebDataset:
         self.image_size = image_size
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
+        self.hf_repo = hf_repo
+        self.cache_dir = cache_dir
+        self.cache_size = cache_size
 
         # Collect shard URLs and calculate total samples
         self._total_samples = 0
         self._shard_urls = []
 
-        for split in self.splits:
-            split_dir = self.data_dir / split
-            if not split_dir.exists():
-                raise ValueError(f"Split directory not found: {split_dir}")
+        if hf_repo:
+            # Stream tar shards from the HF Hub (cached to cache_dir; epoch 2+ local).
+            # hf_paths defaults to 'blip3o-256/<split>' for each requested split.
+            from .wds_image_dataset import hf_tar_urls
+            paths = hf_paths or [f"blip3o-256/{s}" for s in self.splits]
+            self._shard_urls = hf_tar_urls(hf_repo, paths)
+            for split in self.splits:
+                if split in BLIP3O_METADATA:
+                    self._total_samples += BLIP3O_METADATA[split]["num_samples"]
+            if self._total_samples == 0:
+                self._total_samples = len(self._shard_urls) * 3500
+        else:
+            for split in self.splits:
+                split_dir = self.data_dir / split
+                if not split_dir.exists():
+                    raise ValueError(f"Split directory not found: {split_dir}")
 
-            tar_files = sorted(split_dir.glob("*.tar"))
-            self._shard_urls.extend([str(f) for f in tar_files])
+                tar_files = sorted(split_dir.glob("*.tar"))
+                self._shard_urls.extend([str(f) for f in tar_files])
 
-            if split in BLIP3O_METADATA:
-                self._total_samples += BLIP3O_METADATA[split]["num_samples"]
-            else:
-                # Fallback estimate: ~3500 samples per shard (BLIP3O average)
-                self._total_samples += len(tar_files) * 3500
+                if split in BLIP3O_METADATA:
+                    self._total_samples += BLIP3O_METADATA[split]["num_samples"]
+                else:
+                    # Fallback estimate: ~3500 samples per shard (BLIP3O average)
+                    self._total_samples += len(tar_files) * 3500
 
-        if not self._shard_urls:
-            raise ValueError(f"No tar shards found for splits {self.splits} in {data_dir}")
+            if not self._shard_urls:
+                raise ValueError(f"No tar shards found for splits {self.splits} in {data_dir}")
 
         self._num_shards = len(self._shard_urls)
 
@@ -127,6 +146,8 @@ class BLIP3OWebDataset:
                 nodesplitter=wds.split_by_node,
                 shardshuffle=1000,  # Shuffle buffer size for shards
                 seed=self.seed + epoch,
+                cache_dir=self.cache_dir,
+                cache_size=self.cache_size,
             )
             .shuffle(self.shuffle_buffer, initial=self.shuffle_buffer // 2)
             .decode("pil", handler=wds.ignore_and_continue)  # Skip corrupt images
