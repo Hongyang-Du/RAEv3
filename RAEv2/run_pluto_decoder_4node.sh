@@ -62,7 +62,7 @@ case "${1:-}" in
 import sys, math
 nodes, nproc = int(sys.argv[1]), int(sys.argv[2])
 g = 32 * nodes * nproc                 # global batch (per-GPU 32)
-lr = 2e-4 * math.sqrt(g / 512)
+lr = 8e-4 * math.sqrt(g / 256)        # base: drop0/sigreg reference (8e-4 @ gb=256)
 print(f"export BATCH_SIZE_OVERRIDE=32")
 print(f"export LR_OVERRIDE={lr:.6e}")
 print(f"# global_batch={g} lr={lr:.2e}  (16 real epochs; steps/epoch=69.7M/{g}={69_700_000//g})")
@@ -90,7 +90,7 @@ import sys, math
 nodes, nproc = int(sys.argv[1]), int(sys.argv[2])
 g = 32 * nodes * nproc
 print(f"export BATCH_SIZE_OVERRIDE=32")
-print(f"export LR_OVERRIDE={2e-4*math.sqrt(g/512):.6e}")
+print(f"export LR_OVERRIDE={8e-4*math.sqrt(g/256):.6e}")
 PYEOF
 )"
     echo "### 4src-local: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
@@ -113,7 +113,7 @@ import sys, math
 nodes, nproc = int(sys.argv[1]), int(sys.argv[2])
 g = 32 * nodes * nproc
 print(f"export BATCH_SIZE_OVERRIDE=32")
-print(f"export LR_OVERRIDE={2e-4*math.sqrt(g/512):.6e}")
+print(f"export LR_OVERRIDE={8e-4*math.sqrt(g/256):.6e}")
 PYEOF
 )"
     echo "### 4src-s3: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"

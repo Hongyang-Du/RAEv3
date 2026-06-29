@@ -57,7 +57,7 @@ case "${1:-}" in
 import sys, math
 nodes, nproc, pergpu = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 g = pergpu * nodes * nproc
-lr = 2e-4 * math.sqrt(g / 512)
+lr = 8e-4 * math.sqrt(g / 256)        # base: drop0/sigreg reference (8e-4 @ gb=256)
 print(f"export BATCH_SIZE_OVERRIDE={pergpu}")
 print(f"export LR_OVERRIDE={lr:.6e}")
 print(f"# global_batch={g} lr={lr:.2e} (16 real epochs; steps/epoch=69.7M/{g}={69_700_000//g})")
