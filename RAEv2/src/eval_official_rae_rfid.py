@@ -36,7 +36,7 @@ def per_image_psnr(rec, ref):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--decoder", required=True)
-    ap.add_argument("--stats", required=True)
+    ap.add_argument("--stats", required=False, default=None)
     ap.add_argument("--feed-layers", required=True, help="comma-sep encoder layers, e.g. 1,2,...,23")
     ap.add_argument("--val-npz", default="data_eval/imagenet-256-val.npz")
     ap.add_argument("--num-images", type=int, default=50000)

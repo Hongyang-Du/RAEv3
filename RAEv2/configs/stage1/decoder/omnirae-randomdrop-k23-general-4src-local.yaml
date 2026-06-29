@@ -57,7 +57,7 @@ training:
   epochs: 16
   batch_size: 32
   lr: 2.0e-4
-  warmup_epochs: 1
+  warmup_epochs: 2          # lr base raised to 8e-4@256, need longer warmup for stability
   ema_decay: 0.9978
   precision: bf16
   ckpt_every: 1

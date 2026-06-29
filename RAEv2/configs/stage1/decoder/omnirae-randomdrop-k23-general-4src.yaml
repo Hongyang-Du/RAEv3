@@ -73,7 +73,7 @@ training:
   epochs: 16                # 16 REAL full passes over the mix
   batch_size: 32            # per GPU (OOM-safe with GAN); launch script may override
   lr: 2.0e-4               # base @ global 512; launch script sqrt-scales to actual global
-  warmup_epochs: 1          # 1 full pass warmup (official)
+  warmup_epochs: 2          # 2 epochs warmup (lr base raised to 8e-4@256, match sigreg)
   ema_decay: 0.9978
   precision: bf16
   ckpt_every: 1             # checkpoint every (real) epoch

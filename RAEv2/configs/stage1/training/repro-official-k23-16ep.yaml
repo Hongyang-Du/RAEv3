@@ -23,8 +23,7 @@ dataset:
 training:
   epochs: 16
   ema_decay: 0.9978
-  global_batch_size: 256   # official is 512; 256 on single-node 8-GPU = 32/GPU (OOM-safe,
-                           # == the drop=0 run's batch for a fair head-to-head). lr unchanged.
+  global_batch_size: 512   # 512 = official recipe; 2-node 16-GPU -> 32/GPU, ~2500 steps/epoch
   num_workers: 4
   clip_grad: 0.0
   log_interval: 100
