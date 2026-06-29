@@ -26,7 +26,9 @@ loss:
     disc_ckpt: /sensei-fs-3/users/hongyangd/pretrained_models/encoders/dino/dino_vit_small_patch8_224.pth
 data:
   image_size: 256
-  num_workers: 4
+  num_workers: 0            # main-process loading: zero subprocesses -> no fork-after-CUDA
+                            # ENOMEM (512-GPU) and no spawn hang. Data is local (localssd),
+                            # decode (~50ms/batch) << GPU step, so GPU stays ~fed.
   val_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
   val_n: 1000
   mix:

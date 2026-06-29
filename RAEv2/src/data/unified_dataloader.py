@@ -127,7 +127,7 @@ def _prepare_arrow_eval_loader(
         pin_memory=True,
         drop_last=shuffle,
         persistent_workers=num_workers > 0,
-        multiprocessing_context="fork" if num_workers > 0 else None,
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
     )
 
     return DataloaderResult(
@@ -271,7 +271,7 @@ def _prepare_generic_wds_loader(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
-        multiprocessing_context="fork" if num_workers > 0 else None,
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
     )
     loader = loader.with_epoch(steps)
 
@@ -327,7 +327,7 @@ def _prepare_blip3o_loader(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
-        multiprocessing_context="fork" if num_workers > 0 else None,
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
     )
     # Bound epoch to exactly `steps` batches (with_epoch stops iteration, with_length only sets __len__)
     loader = loader.with_epoch(steps)
@@ -382,7 +382,7 @@ def _prepare_t2i_hf_loader(
         pin_memory=True,
         drop_last=shuffle,  # drop_last=True for train, False for eval
         persistent_workers=num_workers > 0,
-        multiprocessing_context="fork" if num_workers > 0 else None,
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
     )
 
     return DataloaderResult(
@@ -435,7 +435,7 @@ def _prepare_imagenet_loader(
         pin_memory=True,
         drop_last=shuffle,  # drop_last=True for train, False for eval
         persistent_workers=num_workers > 0,
-        multiprocessing_context="fork" if num_workers > 0 else None,
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
     )
 
     return DataloaderResult(
@@ -488,7 +488,7 @@ def _prepare_nwm_loader(
         pin_memory=True,
         drop_last=shuffle,
         persistent_workers=num_workers > 0,
-        multiprocessing_context="fork" if num_workers > 0 else None,
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
         collate_fn=nwm_collate_fn,
     )
 
