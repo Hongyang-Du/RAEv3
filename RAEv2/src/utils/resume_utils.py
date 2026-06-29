@@ -46,8 +46,11 @@ def get_checkpoint_epoch(ckpt_path: str) -> int:
     Returns:
         The epoch value stored in the checkpoint, or -1 if it cannot be read.
     """
-    # Extract epoch number from checkpoint filename
-    epoch = re.search(r'ep-(\d+)', ckpt_path)
+    # Extract epoch number from checkpoint filename. Match the basename only — the
+    # parent dir name may itself contain "ep-<digit>" (e.g. ".../repro-...-16ep-2node/"),
+    # which on the full path would mis-parse every checkpoint to the same wrong epoch
+    # and make find_resume_checkpoint() resume from an arbitrary (wrong) checkpoint.
+    epoch = re.search(r'ep-(\d+)', os.path.basename(ckpt_path))
     if epoch:
         return int(epoch.group(1))
     try:

@@ -34,6 +34,9 @@ export DINOV3_CKPT_DIR="$ROOT/pretrained_models/encoders/dinov3"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$ROOT/.cache/torch}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export CKPT_KEEP_RECENT="${CKPT_KEEP_RECENT:-4}"   # keep only 4 most recent ep-*.pt (~36GB);
+                                                   # multi-node 16ep run = 125GB+ otherwise ->
+                                                   # fills quota -> torch.save truncates -> crash-loop
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
 export WANDB_PROJECT="${WANDB_PROJECT:-omnirae}"
 export WANDB_FRESH_RUN=1   # fresh wandb run each launch (avoids resume step-collision)
