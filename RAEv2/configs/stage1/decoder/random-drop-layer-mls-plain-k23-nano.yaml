@@ -41,21 +41,21 @@ loss:
     disc_weight: 0.75
     disc_start: 1
 data:
-  data_dir: /datasets/imagenet-256-full
+  data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256   # nanovisionx (official RAEv2 imagenet)
   image_size: 256
   val_npz: data_eval/imagenet-256-val.npz
   val_n: 100
 training:
   epochs: 16
   batch_size: 32
-  lr: 0.0008
+  lr: 2.0e-4
   warmup_epochs: 2
   ema_decay: 0.9995
   precision: bf16
   ckpt_every: 1
   log_every: 50
   seed: 42
-  out_dir: output_full/decoder_random_drop_layer_mls_plain_k23
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/repro-nano-randomdrop-plain-k23
 probe:
   loo_solo: final
   val_image: assets/samples/sample_1.png
@@ -63,4 +63,4 @@ wandb:
   enabled: true
   project: raev3-full
   entity: uscgvl
-  name: decoder-random-drop-layer-mls-plain-k23
+  name: repro-nano-randomdrop-plain-k23

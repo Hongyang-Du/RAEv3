@@ -53,6 +53,21 @@ def compute_distributional_metrics(
     as fid_reference. Lets non-ImageNet datasets (e.g. NWM with recon_val_stats)
     plug in their own stats file.
     """
+    # Fast path: fid / inception_score via torch-fidelity (no fd_evaluator dependency,
+    # which isn't installed in this env). Only fdr*/mind* require fd_evaluator.
+    if set(metrics) <= {"fid", "inception_score"} and reference_npz:
+        from eval.fid import calculate_fid_isc
+        _ref = np.load(reference_npz)
+        _ref = _ref[_ref.files[0]] if hasattr(_ref, "files") else _ref
+        _fid, _isc = calculate_fid_isc(gen_arr, _ref, bs=batch_size,
+                                       device=("cuda" if device.type == "cuda" else "cpu"))
+        out = {}
+        if "fid" in metrics:
+            out["fid"] = float(_fid)
+        if "inception_score" in metrics:
+            out["inception_score"] = float(_isc)
+        return out
+
     from fd_evaluator import compute_metrics
 
     needs_mind = any(m.startswith("mind") for m in metrics)

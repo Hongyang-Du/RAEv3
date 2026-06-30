@@ -338,8 +338,8 @@ def main():
         # -- checkpoint (CPU-cloned, safe to save while training mutates the live model)
         # atomic write: tmp + rename so a preemption/quota-exceeded mid-save never leaves
         # a truncated ckpt_latest that resume would crash-loop on.
-        _tmp = latest + ".tmp"
-        torch.save(ckpt_cpu, _tmp); os.replace(_tmp, latest)
+        _tmp = latest + ".tmp.epoch"   # distinct tmp from the step-saver (.tmp.step), else
+        torch.save(ckpt_cpu, _tmp); os.replace(_tmp, latest)   # both race on one tmp -> os.replace FileNotFoundError -> ckpt_epNNN never saved
         if ep % T.ckpt_every == 0:
             _epf = os.path.join(T.out_dir, f"ckpt_ep{ep:03d}.pt")
             _t2 = _epf + ".tmp"; torch.save(ckpt_cpu, _t2); os.replace(_t2, _epf)
@@ -459,7 +459,7 @@ def main():
                     "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
                     "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
                 def _save_latest(s):
-                    _t = latest + ".tmp"; torch.save(s, _t); os.replace(_t, latest)
+                    _t = latest + ".tmp.step"; torch.save(s, _t); os.replace(_t, latest)
                 step_save_thread = threading.Thread(target=_save_latest, args=(_snap,), daemon=True)
                 step_save_thread.start()
                 print(f"  [step-ckpt] saved ckpt_latest @ step {global_step}", flush=True)

@@ -180,6 +180,11 @@ def main(args):
             data_dir=ds_info.data_dir,
         )
         if eval_stats is not None and rank == 0:
+            # echo the metrics to the log (not just the CSV) so they're visible in
+            # the run log / teed Pluto log without having to open the CSV.
+            logger.info(f"[RESULT] {experiment_name} | {ds_name}: " +
+                        ", ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
+                                  for k, v in eval_stats.items()))
             save_eval_to_csv(experiment_name, "ema", global_step, {'dataset': ds_name, **eval_stats}, eval_dir)
 
     dist.barrier()

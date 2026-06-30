@@ -52,6 +52,7 @@ MPORT="${MASTER_PORT:-29500}"
 case "${1:-}" in
   ft-plain)      CFG=configs/stage1/decoder/ft-xcong-plain-k23-nodrop-4node.yaml ;;
   drop0-scratch) CFG=configs/stage1/decoder/ourpipe-drop0-k23-16ep-4node.yaml ;;
+  nano-drop)     CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano.yaml ;;
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);

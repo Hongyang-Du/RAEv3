@@ -49,7 +49,8 @@ MPORT="${MASTER_PORT:-29500}"
 
 case "${1:-}" in
   repro-k23) CFG=configs/stage1/training/repro-official-k23-16ep.yaml; BASE=repro-official-k23-16ep ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_stage1_4node.sh <repro-k23>"; exit 1 ;;
+  nano-k23)  CFG=configs/stage1/training/repro-nano-k23-16ep.yaml;     BASE=repro-nano-k23-16ep ;;
+  *) echo "usage: NUM_NODES=2 bash run_pluto_stage1_4node.sh <repro-k23|nano-k23>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"
 
@@ -63,6 +64,7 @@ exec "$TR" \
   --rdzv_backend=c10d \
   --rdzv_id="${JOB_NAME:-stage1-repro}-${BASE}" \
   --rdzv_endpoint="${MASTER}:${MPORT}" \
+  --rdzv_conf=timeout=300 \
   src/train_stage1.py \
   --config "$CFG" \
   --results-dir "$ROOT/ckpt" \

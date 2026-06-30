@@ -84,7 +84,7 @@ class MLSProjector(nn.Module):
         self.bn = nn.BatchNorm1d(dim * mult)
         self.fc2 = nn.Linear(dim * mult, out_dim)
 
-    def forward(self, layer_tokens, drop=None) -> torch.Tensor:   # K x [B,N,dim] -> [B,N,out_dim]
+    def _combine(self, layer_tokens, drop):               # K x [B,N,dim] -> [B,N,dim]
         stk = torch.stack(layer_tokens, dim=0)               # [K, B, N, dim]
         do_drop = (self.training if drop is None else drop) and self.p_drop > 0
         if do_drop:
@@ -94,13 +94,27 @@ class MLSProjector(nn.Module):
             if dead.any():
                 keep[torch.randint(K, (int(dead.sum()),), device=stk.device), dead] = True
             w = keep.float() / keep.float().sum(0, keepdim=True)
-            z0 = (w.view(K, B, 1, 1) * stk).sum(0)
-        else:
-            z0 = stk.mean(0)
+            return (w.view(K, B, 1, 1) * stk).sum(0)
+        return stk.mean(0)
+
+    def _body(self, z0):                                  # [B,N,dim] -> [B,N,out_dim]
         b, n, _ = z0.shape
         h = self.fc1(z0)
         h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
         return self.skip(z0) + self.fc2(F.gelu(h))
+
+    def forward(self, layer_tokens, drop=None, split=False):  # K x [B,N,dim] -> [B,N,out_dim]
+        if split:
+            # dit-full-dec-drop: dropped latent (-> decoder) + full latent (-> DiT/SIGReg)
+            # via a SINGLE bn forward over the concatenated batch. Two separate forwards
+            # would each do the in-place BN running-stat update, corrupting the first
+            # forward's autograd graph ("variable modified by an inplace operation").
+            z0d = self._combine(layer_tokens, drop=True)
+            z0g = self._combine(layer_tokens, drop=False)
+            b = z0d.shape[0]
+            out = self._body(torch.cat([z0d, z0g], dim=0))
+            return out[:b], out[b:]
+        return self._body(self._combine(layer_tokens, drop))
 
     def load_ln_ckpt(self, sd):
         """Warm-start from an LN-projector state dict (nogate / dropmean
@@ -421,7 +435,7 @@ def main():
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         projector.load_state_dict(ck["projector"]); decoder.load_state_dict(ck["decoder"])
         dit.load_state_dict(ck["dit"])
-        ema_dit.load_state_dict(ck["ema_dit"])
+        ema_dit.load_state_dict(ck.get("ema_dit", ck["dit"]))   # ema no longer saved -> re-init from dit
         opt_pd.load_state_dict(ck["opt_pd"]); opt_dit.load_state_dict(ck["opt_dit"])
         sched_pd.load_state_dict(ck["sched_pd"]); sched_dit.load_state_dict(ck["sched_dit"])
         start_epoch, global_step = ck["epoch"], ck["global_step"]
@@ -482,6 +496,19 @@ def main():
             p = os.path.join(args.out_dir, f"ckpt_ep{ep:03d}.pt")
             torch.save(ckpt_cpu, p)
             print(f"  [val ep{ep}] saved {p}", flush=True)
+            # Retention: keep every-10-epoch milestones + the 3 most recent ep ckpts;
+            # delete the rest. (ckpt_latest.pt is separate and always kept for resume.)
+            # Avoids the disk-quota pile-up that truncates torch.save and crash-loops.
+            def _ep_of(fp):
+                try: return int(os.path.basename(fp)[len("ckpt_ep"):-len(".pt")])
+                except ValueError: return -1
+            _eps = sorted((_ep_of(f), f) for f in glob.glob(os.path.join(args.out_dir, "ckpt_ep*.pt")) if _ep_of(f) >= 0)
+            _keep = {f for e, f in _eps if e % 10 == 0} | {f for _, f in _eps[-3:]}
+            for e, f in _eps:
+                if f not in _keep:
+                    try: os.remove(f)
+                    except OSError: pass
+            print(f"  [val ep{ep}] kept: {sorted(e for e,f in _eps if f in _keep)}", flush=True)
         else:
             print(f"  [val ep{ep}] saved ckpt_latest.pt", flush=True)
 
@@ -505,8 +532,8 @@ def main():
                 # DECODER sees the DROPPED latent (robustness) while the DiT + SIGReg
                 # see the FULL-layer latent (stable, jitter-free generation target).
                 if args.dit_full_dec_drop:
-                    z_dec_tok = projector_ddp(layer_tokens, drop=True)    # -> decoder
-                    z_gen_tok = projector_ddp(layer_tokens, drop=False)   # -> DiT + SIGReg
+                    # single projector forward (one bn pass) -> dropped (decoder) + full (DiT/SIGReg)
+                    z_dec_tok, z_gen_tok = projector_ddp(layer_tokens, split=True)
                 else:
                     z_dec_tok = projector_ddp(layer_tokens)               # [B,256,1024]
                     z_gen_tok = z_dec_tok
@@ -632,7 +659,6 @@ def main():
                 "epoch": epoch + 1, "global_step": global_step,
                 "projector": projector.state_dict(), "decoder": decoder.state_dict(),
                 "dit": dit.state_dict(),
-                "ema_dit": ema_dit.state_dict(),
                 "opt_pd": opt_pd.state_dict(), "opt_dit": opt_dit.state_dict(),
                 "sched_pd": sched_pd.state_dict(), "sched_dit": sched_dit.state_dict(),
                 "layers": args.layers, "args": vars(args),
