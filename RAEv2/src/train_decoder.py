@@ -83,6 +83,7 @@ def main():
     # preemption resilience: also save ckpt_latest every N steps (not just per epoch), so
     # a preempted job resumes from a recent step instead of restarting the epoch from zero.
     ckpt_every_steps = int(os.environ.get("CKPT_EVERY_STEPS", "0") or "0")
+    no_ema = bool(int(os.environ.get("NO_EMA", "0") or "0"))   # skip saving ema_* copies (raw==ema at convergence); resume re-inits ema from raw
 
     from datetime import timedelta
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))   # NFS ckpt saves can be slow
@@ -235,7 +236,7 @@ def main():
     if os.path.exists(latest):
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         combine.load_state_dict(ck["combine"]); decoder.load_state_dict(ck["decoder"])
-        ema_combine.load_state_dict(ck["ema_combine"]); ema_dec.load_state_dict(ck["ema_dec"])
+        ema_combine.load_state_dict(ck.get("ema_combine") or ck["combine"]); ema_dec.load_state_dict(ck.get("ema_dec") or ck["decoder"])  # NO_EMA: re-init ema from raw
         disc.load_state_dict(ck["disc"]); optimizer.load_state_dict(ck["optimizer"])
         disc_optimizer.load_state_dict(ck["disc_optimizer"])
         start_epoch, global_step = ck["epoch"], ck["global_step"]
@@ -252,7 +253,7 @@ def main():
         # full layers (p_drop=0) to close the train/inference gap.
         ck = torch.load(T.init_from, map_location="cpu", weights_only=False)
         combine.load_state_dict(ck["combine"]); decoder.load_state_dict(ck["decoder"])
-        ema_combine.load_state_dict(ck["ema_combine"]); ema_dec.load_state_dict(ck["ema_dec"])
+        ema_combine.load_state_dict(ck.get("ema_combine") or ck["combine"]); ema_dec.load_state_dict(ck.get("ema_dec") or ck["decoder"])  # NO_EMA: re-init ema from raw
         if "disc" in ck:
             disc.load_state_dict(ck["disc"])
         if is_main:
@@ -272,7 +273,11 @@ def main():
     def decode_imgs(dec, z):
         out = dec(z, drop_cls_token=False).logits
         m = dec.module if isinstance(dec, DDP) else dec
-        return (m.unpatchify(out) * enc_std + enc_mean).clamp(0, 1)
+        # decoder predicts DIRECTLY in [0,1] pixel space (official RAE convention:
+        # RAE.decode returns unpatchify(out) raw). No ImageNet de-norm -> the trained
+        # decoder is a drop-in for stage1.RAE (offline_eval_stage1) exactly like the
+        # official k7/k23 decoders. (Old convention was normalized-output * std + mean.)
+        return m.unpatchify(out).clamp(0, 1)
 
     # -- async val/ckpt: rank 0 snapshots (frozen EMA copy + CPU-cloned ckpt),
     # then a daemon thread runs val + torch.save while the next epoch trains.
@@ -393,9 +398,8 @@ def main():
             loss_gan = torch.zeros(1, device=device)
             if use_gan:
                 disc_ddp.eval()
-                half = max(1, x_rec.shape[0] // 2)   # half-batch GAN
                 with autocast_ctx:
-                    fake_aug = disc_aug.aug(x_rec[:half] * 2 - 1)
+                    fake_aug = disc_aug.aug(x_rec * 2 - 1)   # full-batch GAN (matches official RAEv2)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                 loss_gan = vanilla_g_loss(logits_fake)
                 last_layer = next(reversed(list(decoder_ddp.module.parameters())))
@@ -416,8 +420,8 @@ def main():
             if use_gan:
                 disc_ddp.train()
                 with autocast_ctx:
-                    real_aug = disc_aug.aug(imgs[:half] * 2 - 1)
-                    fake_aug = disc_aug.aug(x_rec[:half].detach() * 2 - 1)
+                    real_aug = disc_aug.aug(imgs * 2 - 1)            # full-batch GAN (matches official RAEv2)
+                    fake_aug = disc_aug.aug(x_rec.detach() * 2 - 1)
                     logits_real, _ = disc_ddp(real_aug, None)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                     loss_d = hinge_d_loss(logits_real, logits_fake)
@@ -455,7 +459,8 @@ def main():
                 _snap = _to_cpu({
                     "epoch": epoch, "global_step": global_step, "layers": layers,
                     "combine": combine.state_dict(), "decoder": decoder.state_dict(),
-                    "ema_combine": ema_combine.state_dict(), "ema_dec": ema_dec.state_dict(),
+                    "ema_combine": None if no_ema else ema_combine.state_dict(),
+                    "ema_dec":     None if no_ema else ema_dec.state_dict(),
                     "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
                     "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
                 def _save_latest(s):

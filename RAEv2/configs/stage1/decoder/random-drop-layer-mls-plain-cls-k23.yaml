@@ -51,7 +51,7 @@ training:
   batch_size: 32
   grad_accum_steps: 4
   lr: 0.0002
-  warmup_epochs: 2
+  warmup_epochs: 1
   ema_decay: 0.9995
   precision: bf16
   ckpt_every: 5

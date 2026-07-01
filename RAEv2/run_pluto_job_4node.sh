@@ -33,8 +33,9 @@ export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$ROOT/.cache/torch}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export STAGE2_NO_EMA_CKPT=1
-export CKPT_KEEP_RECENT=6
-export CKPT_KEEP_EVERY=10
+export CKPT_KEEP_RECENT="${CKPT_KEEP_RECENT:-2}"   # keep most-recent N ep-*.pt
+export CKPT_KEEP_EVERY="${CKPT_KEEP_EVERY:-10}"    # + every-K-epoch milestones
+export CKPT_EVERY_STEPS="${CKPT_EVERY_STEPS:-500}" # also overwrite ep-<epoch>.pt every N steps -> survive spare-capacity preemption (resume mid-epoch, not from step 0)
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
 export WANDB_PROJECT="${WANDB_PROJECT:-omnirae}"
 export WANDB_FRESH_RUN=1   # fresh wandb run each launch (avoids resume step-collision / crashed status)
@@ -53,9 +54,32 @@ case "${1:-}" in
   exp1) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k23.yaml; BASE=omnirae-dit-h1-plain-cls-k23 ;;
   exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;          BASE=omnirae-dit-sigreg-cls-k23 ;;
   exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;         BASE=omnirae-dit-encoder-cls-k23 ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3>"; exit 1 ;;
+  exp4) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k7.yaml;  BASE=omnirae-dit-h1-plain-cls-k7 ;;  # k7 h1, evanarlian data, k23 decoder
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
+
+# Stage the run's imagenet-256 to node-local SSD for fast training reads (worth the
+# per-launch copy vs reading off NFS every step). Prefer S3, fall back to the sensei-fs
+# mount. Skips if already staged on this node.
+#   exp1 (k23-h1), exp3 (encoder), exp4 (k7-h1) all train on nanovisionx now
+#   (h1 DiTs sit on the 2e-4 random-drop nano decoder -> use its own data).
+#   FB (sensei-fs) is gone after the local nano delete, so this relies on S3 on the node.
+case "${1:-}" in
+  exp1|exp3|exp4) LSSD=/mnt/localssd/imagenet-256; S3SRC=s3://hongyangd-raev2-backup/raev2-data/imagenet-256/; FB="$ROOT/data/imagenet-256" ;;
+  *)              LSSD="" ;;
+esac
+if [ -n "$LSSD" ]; then
+  if [ ! -f "$LSSD/imagenet-latents-images/dataset_info.json" ]; then
+    echo "### $(date '+%F %T') staging $S3SRC -> $LSSD ..."
+    mkdir -p "$LSSD"
+    aws s3 sync "$S3SRC" "$LSSD/" \
+      || rsync -a "$FB/" "$LSSD/"
+    echo "### $(date '+%F %T') staged: $(du -sh "$LSSD" 2>/dev/null | cut -f1)"
+  else
+    echo "### imagenet already on local SSD ($LSSD)"
+  fi
+fi
 
 WANDB_FLAG=""; [ -n "${WANDB_KEY:-}" ] && WANDB_FLAG="--wandb"
 echo "### $(date '+%F %T')  ${EXPERIMENT_NAME}  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=${WANDB_FLAG:-off}"

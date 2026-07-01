@@ -22,7 +22,7 @@ stage_1:
         dim: 1024
         out_dim: 1024
 training:
-  global_batch_size: 224
+  global_batch_size: 512
   num_workers: 4
   image_size: 256
 eval:

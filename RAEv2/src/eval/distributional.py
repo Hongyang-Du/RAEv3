@@ -103,4 +103,6 @@ def compute_distributional_metrics(
     )
     if reference_npz:
         kwargs["fid_reference"] = reference_npz
+    elif os.environ.get("FID_REFERENCE"):
+        kwargs["fid_reference"] = os.environ["FID_REFERENCE"]   # e.g. guided_diffusion_stats (else default imagenet_256_fid_stats)
     return compute_metrics(**kwargs)

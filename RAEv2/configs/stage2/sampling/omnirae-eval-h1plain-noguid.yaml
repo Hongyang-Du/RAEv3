@@ -4,11 +4,11 @@ stage_1:
     encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
     resolution: 256
     decoder_config_path: configs/decoder/ViTXL
-    stage1_ckpt_path: output_full/decoder_random_drop_layer_mls_plain_k23/ckpt_latest.pt
+    stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/paper-repro/decoder_ckpt_latest.pt
     use_ema: true
     latent_dim: 1024
     drop: false
-    h1_stats_path: output_full/h1_decoder_plain_cls_k23_stats.pt
+    h1_stats_path: /sensei-fs-3/users/hongyangd/ckpt/paper-repro/h1_stats.pt
     combine_config:
       target: stage1.combine.MLSCombine
       params:
@@ -62,7 +62,7 @@ stage_2:
     - 16
     mlp_ratio: 4.0
     base_model_depth: 8
-  ckpt: /sensei-fs-3/users/hongyangd/ckpt/omnirae-dit-h1-plain-cls-k23-4node/checkpoints/ep-0000080.pt
+  ckpt: /sensei-fs-3/users/hongyangd/ckpt/paper-repro/h1-dit-ep80.pt
 conditioning:
   type: label
   cfg_dropout_prob: 0.1
@@ -86,10 +86,10 @@ guidance:
 dataset:
   target: imagenet
   type: hf
-  data_dir: ./data/imagenet-256
+  data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256
   split: train
   condition_type: label
-  shared_tmpdir: ~/tmp
+  shared_tmpdir: /tmp/gfid_shards
 training:
   epochs: 80
   global_batch_size: 1024
@@ -127,7 +127,7 @@ eval:
       split: val
       condition_type: label
       num_samples: 50000
-      reference_npz: /sensei-fs-3/users/hongyangd/RAEv3/RAEv2/data_eval/imagenet-256-evanarlian-val.npz
+      reference_npz: null
       metrics:
       - fid
       - inception_score

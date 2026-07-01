@@ -29,7 +29,7 @@ training:
   epochs: 5
   batch_size: 32
   lr: 8.0e-4
-  warmup_epochs: 2
+  warmup_epochs: 1
   ema_decay: 0.9995
   precision: bf16
   ckpt_every: 1

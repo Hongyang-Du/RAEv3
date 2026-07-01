@@ -84,6 +84,10 @@ def train_one_epoch(
     do_eval = config.eval is not None and eval_datasets is not None
     if do_eval: eval_dir = config.eval.eval_dir
     experiment_name = os.environ.get("EXPERIMENT_NAME")
+    # Preemption resilience: also checkpoint every N steps (not just per epoch). On spare-
+    # capacity an autorecovery reclaim lands well within one epoch; with per-epoch saving
+    # only, every restart re-enters the epoch from step 0 and the job never progresses.
+    ckpt_every_steps = int(os.environ.get("CKPT_EVERY_STEPS", "0") or "0")
 
     # Get null conditions for CFG dropout
     if config.conditioning.type == "nwm":
@@ -262,6 +266,14 @@ def train_one_epoch(
                 scheduler.step()
             update_ema(ema_model, ddp_model.module, decay=config.training.ema_decay)
             global_step += 1
+
+            # preemption-resilient step checkpoint: atomically overwrite the current epoch's
+            # ep-*.pt with the live state so a mid-epoch reclaim resumes here (find_resume
+            # picks the highest-epoch ckpt; resume re-enters this epoch with weights/step kept).
+            if ckpt_every_steps > 0 and global_step % ckpt_every_steps == 0 and rank == 0:
+                _sp = f"{checkpoint_dir}/ep-{epoch:07d}.pt"
+                save_stage2_checkpoint(_sp, global_step, epoch, ddp_model, ema_model, optimizer, scheduler)
+                logger.info(f"[step-ckpt] saved ep-{epoch:07d}.pt @ step {global_step}")
 
         epoch_metrics['loss'] += loss_diff.detach()
         num_batches += 1

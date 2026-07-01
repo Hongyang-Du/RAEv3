@@ -28,6 +28,9 @@ export DINOV3_CKPT_DIR="$ROOT/pretrained_models/encoders/dinov3"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$ROOT/.cache/torch}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+# Preemption resilience on spare-capacity: save ckpt_latest every N steps so an
+# autorecovery reclaim (often <1 epoch apart) resumes instead of restarting the epoch.
+export CKPT_EVERY_STEPS="${CKPT_EVERY_STEPS:-500}"
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
 export WANDB_PROJECT="${WANDB_PROJECT:-raev3-full}"
 # train_e2e_sigreg_dit.py does wandb.init() (config wandb: true), which needs

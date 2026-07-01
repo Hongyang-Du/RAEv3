@@ -78,12 +78,16 @@ def main():
         p.requires_grad_(False)
     mean, std = MEAN.to(device), STD.to(device)
 
+    # USE_EMA=0 -> load raw (non-EMA) combine/decoder weights instead of the EMA copies.
+    _ema = os.environ.get("USE_EMA", "1") != "0"
+    ck_key = lambda base: (("ema_" + base) if _ema else base)
+    print(f"[weights] {'EMA' if _ema else 'non-EMA'}: combine[{ck_key('combine')}] dec[{ck_key('dec')}]", flush=True)
     params = OmegaConf.to_container(cfg.combine.params, resolve=True)
     combine = get_obj_from_str(cfg.combine.target)(**params).to(device).eval()
-    combine.load_state_dict(ck["ema_combine"])
+    combine.load_state_dict(ck[ck_key("combine")])
     dec = _load_decoder("configs/decoder/ViTXL", hidden_size=1024, patch_size=16,
                         num_patches=256, pretrained_path=None).to(device).eval()
-    dec.load_state_dict(ck["ema_dec"])
+    dec.load_state_dict(ck[ck_key("dec")])
     del ck
 
     arr = np.load(val_npz, mmap_mode="r")
@@ -104,7 +108,9 @@ def main():
                     return_class_token=False, norm=True))
                 z = combine(toks, idx=idx)
                 out = dec(z, drop_cls_token=False).logits
-                rec = dec.unpatchify(out) * std + mean
+                # NO_DENORM=1 for decoders trained to output [0,1] DIRECTLY (new RAE-style
+                # convention); default applies ImageNet de-norm for the old normalized-output decoders.
+                rec = dec.unpatchify(out) if os.environ.get("NO_DENORM") else dec.unpatchify(out) * std + mean
             rec = rec.clamp(0, 1).float()
             psnrs.append(per_image_psnr(rec, imgs))
             ssims.append(ssim_fn(rec, imgs, data_range=1.0).item() * rec.shape[0])
@@ -120,13 +126,30 @@ def main():
     ref_arr = np.concatenate(ref_u8, 0)
     rfid = calculate_rfid(recon_arr, ref_arr, bs=128, device=device)
 
+    # FD_EVAL=1: also compute the OFFICIAL rFID via fd_evaluator on the SAME recon_arr
+    # (no re-generation). reference_npz=None routes to fd_evaluator; fid_reference falls
+    # back to imagenet_256_fid_stats unless FID_REFERENCE overrides (e.g. guided_diffusion_stats).
+    fd_rfid = None
+    if os.environ.get("FD_EVAL"):
+        from eval.distributional import compute_distributional_metrics
+        fd_out = compute_distributional_metrics(
+            recon_arr, ["fid"], reference_npz=None, data_dir=None,
+            device=torch.device(device), batch_size=128)
+        fd_rfid = float(fd_out["fid"])
+
     print(f"\n[{tag}] N={n_done}  eval_layers={used}")
-    print(f"  PSNR = {psnr.mean():.3f} dB   SSIM = {ssim:.4f}   rFID = {rfid:.3f}")
+    line = f"  PSNR = {psnr.mean():.3f} dB   SSIM = {ssim:.4f}   rFID(tf) = {rfid:.3f}"
+    if fd_rfid is not None:
+        line += f"   rFID(fd:{os.environ.get('FID_REFERENCE','imagenet_256')}) = {fd_rfid:.3f}"
+    print(line)
 
     out = args.out or ckpt_path.replace(".pt", f"_reconrfid{('_'+tag) if tag else ''}.json")
     with open(out, "w") as f:
         json.dump({"ckpt": ckpt_path, "tag": tag, "eval_layers": used, "num_images": n_done,
-                   "psnr": psnr.mean().item(), "ssim": ssim, "rfid": float(rfid)}, f, indent=2)
+                   "psnr": psnr.mean().item(), "ssim": ssim,
+                   "rfid_tf": float(rfid), "rfid_fd": fd_rfid,
+                   "fd_reference": os.environ.get("FID_REFERENCE", "imagenet_256") if fd_rfid is not None else None},
+                  f, indent=2)
     print(f"json -> {out}")
 
 

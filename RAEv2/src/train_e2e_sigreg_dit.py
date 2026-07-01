@@ -260,6 +260,10 @@ def main():
     parser.add_argument("--wandb-entity",  default="hongyangd")
     parser.add_argument("--num-workers",   type=int, default=4)
     parser.add_argument("--seed",          type=int, default=42)
+    parser.add_argument("--eval-seed",     type=int, default=0,
+                        help="FIXED seed for the eval/sample noise (val_eps), decoupled from "
+                             "--seed so denoise-PSNR and sample grids are identical across runs "
+                             "regardless of the training seed -> cross-run comparable.")
     parser.add_argument("--precision",     type=str, default="bf16", choices=["fp32", "bf16"])
     # YAML config provides defaults; explicit CLI flags still override them.
     cfg_ns, _ = parser.parse_known_args()
@@ -422,11 +426,11 @@ def main():
         val_img_orig = torch.stack([_t(PILImage.open(p).convert("RGB")) for p in val_paths]).to(device)
         with torch.no_grad():
             val_layers_fixed = [t.detach() for t in encode_layers(val_img_orig)]
-        g = torch.Generator(device=device).manual_seed(args.seed)
+        g = torch.Generator(device=device).manual_seed(args.eval_seed)   # FIXED eval seed, not args.seed
         val_eps = torch.randn(val_img_orig.shape[0], args.latent_dim, 16, 16,
                               device=device, generator=g)
         val_labels = torch.full((val_img_orig.shape[0],), args.num_classes, device=device)  # null class
-        print(f"Val images pre-encoded: {len(val_paths)} from {val_dir}", flush=True)
+        print(f"Val images pre-encoded: {len(val_paths)} from {val_dir}  (eval_seed={args.eval_seed})", flush=True)
 
     # -- Auto-resume ---------------------------------------------------------------
     start_epoch, global_step = 0, 0
@@ -491,10 +495,15 @@ def main():
                 wb.log({"val/psnr": val_ps,
                         **{f"val/denoise_psnr_t{int(tv*100)}": v for tv, v in parts},
                         "val/denoise_psnr_ceiling": val_ps, "val/step": gstep})
-        torch.save(ckpt_cpu, os.path.join(args.out_dir, "ckpt_latest.pt"))
+        os.makedirs(args.out_dir, exist_ok=True)          # out-dir may be reaped mid-run
+        # atomic, distinct .tmp.epoch name: the step-saver (.tmp.step) may also rename onto
+        # ckpt_latest.pt concurrently (prev epoch's async val thread vs this epoch's step
+        # saves) -> two atomic os.replace, last wins, never a half-written ckpt.
+        _lt = os.path.join(args.out_dir, "ckpt_latest.pt")
+        _le = _lt + ".tmp.epoch"; torch.save(ckpt_cpu, _le); os.replace(_le, _lt)
         if ep % args.ckpt_every == 0:
             p = os.path.join(args.out_dir, f"ckpt_ep{ep:03d}.pt")
-            torch.save(ckpt_cpu, p)
+            _pt = p + ".tmp"; torch.save(ckpt_cpu, _pt); os.replace(_pt, p)
             print(f"  [val ep{ep}] saved {p}", flush=True)
             # Retention: keep every-10-epoch milestones + the 3 most recent ep ckpts;
             # delete the rest. (ckpt_latest.pt is separate and always kept for resume.)
@@ -513,6 +522,24 @@ def main():
             print(f"  [val ep{ep}] saved ckpt_latest.pt", flush=True)
 
     val_thread = None
+    step_save_thread = None
+    # Preemption resilience: also save ckpt_latest every N steps (not just per epoch).
+    # On a spare-capacity cluster an autorecovery reclaim routinely lands mid-epoch; with
+    # per-epoch saving only, every restart re-enters the epoch from scratch and the job
+    # never accumulates progress. 0 = per-epoch only (set CKPT_EVERY_STEPS in the launcher).
+    ckpt_every_steps = int(os.environ.get("CKPT_EVERY_STEPS", "0") or "0")
+    if is_main:
+        print(f"CKPT_EVERY_STEPS = {ckpt_every_steps}  (0 = per-epoch only)", flush=True)
+
+    def _save_step_latest(cpu_ck, gs):
+        # atomic + dir-resilient ckpt_latest write. Distinct .tmp.step name so it can never
+        # race another writer; makedirs in case the out-dir was reaped mid-run (NFS quota /
+        # cleanup). Lets a mid-epoch preemption resume instead of restarting the epoch.
+        os.makedirs(args.out_dir, exist_ok=True)
+        _t = os.path.join(args.out_dir, "ckpt_latest.pt.tmp.step")
+        torch.save(cpu_ck, _t)
+        os.replace(_t, os.path.join(args.out_dir, "ckpt_latest.pt"))
+        print(f"  [step-ckpt] saved ckpt_latest.pt @ step {gs}", flush=True)
 
     # -- Training ------------------------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
@@ -599,6 +626,21 @@ def main():
             update_ema(ema_dit, dit, args.ema_decay)
             global_step += 1
 
+            if is_main and ckpt_every_steps > 0 and global_step % ckpt_every_steps == 0:
+                if step_save_thread is not None:
+                    step_save_thread.join()          # don't overlap two multi-GB saves
+                step_ckpt = _to_cpu({                # clone now; modules mutate next step
+                    "epoch": epoch, "global_step": global_step,   # epoch (not +1): resume re-enters this epoch
+                    "projector": projector.state_dict(), "decoder": decoder.state_dict(),
+                    "dit": dit.state_dict(),
+                    "opt_pd": opt_pd.state_dict(), "opt_dit": opt_dit.state_dict(),
+                    "sched_pd": sched_pd.state_dict(), "sched_dit": sched_dit.state_dict(),
+                    "layers": args.layers, "args": vars(args),
+                })
+                step_save_thread = threading.Thread(
+                    target=_save_step_latest, args=(step_ckpt, global_step), daemon=True)
+                step_save_thread.start()
+
             if is_main and global_step % args.log_every == 0:
                 zd = gaussian_diag(z_gen_tok)            # DiT latent (the SIGReg-shaped one)
                 ps = psnr(x_rec, imgs)
@@ -674,6 +716,8 @@ def main():
 
     if is_main and val_thread is not None:
         val_thread.join()                         # finish the last epoch's val + ckpt
+    if is_main and step_save_thread is not None:
+        step_save_thread.join()                   # finish any in-flight step ckpt
     if args.wandb and is_main:
         import wandb; wandb.finish()
     dist.destroy_process_group()

@@ -26,10 +26,15 @@ from .rae_variants import RAECombine
 
 
 class RAEDecoderH1(RAECombine):
-    def __init__(self, h1_stats_path: str = None, **kwargs):
+    def __init__(self, h1_stats_path: str = None, output_01: bool = False, **kwargs):
         kwargs.setdefault("drop", False)              # deterministic full-mean latent -> deterministic h1
         super().__init__(**kwargs)
         self._ckpt = None
+        # output_01: the loaded decoder is a [0,1]-folded ckpt (de-norm baked into decoder_pred),
+        # so neutralize the decode-time ImageNet de-norm (line ~90) to avoid double application.
+        if output_01:
+            self.img_mean.zero_(); self.img_std.fill_(1.0)
+            print("RAEDecoderH1: output_01 -> de-norm neutralized (img_mean=0, img_std=1)")
         cdec = self.decoder.decoder_pred.in_features  # decoder_hidden_size (1152 for ViT-XL)
         has_stats = bool(h1_stats_path) and os.path.exists(h1_stats_path)
         st = torch.load(h1_stats_path, map_location="cpu") if has_stats else {}
