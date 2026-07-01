@@ -50,6 +50,19 @@ case "${1:-}" in
   *) echo "usage: NUM_NODES=2 bash run_pluto_e2e_4node.sh <nano-dit-full-dec-drop>"; exit 1 ;;
 esac
 
+# Stage nanovisionx imagenet-256 from S3 to node-local SSD (local /sensei-fs copy was
+# deleted; the config reads /mnt/localssd/imagenet-256). Skips if already staged.
+LSSD=/mnt/localssd/imagenet-256
+if [ ! -f "$LSSD/imagenet-latents-images/dataset_info.json" ]; then
+  echo "### $(date '+%F %T') staging nano imagenet -> $LSSD ..."
+  mkdir -p "$LSSD"
+  aws s3 sync s3://hongyangd-raev2-backup/raev2-data/imagenet-256/ "$LSSD/" \
+    || { echo "### FATAL: S3 sync failed (need AWS creds/role on node)"; exit 1; }
+  echo "### $(date '+%F %T') staged: $(du -sh "$LSSD" 2>/dev/null | cut -f1)"
+else
+  echo "### nano imagenet already on local SSD ($LSSD)"
+fi
+
 echo "### $(date '+%F %T')  ${BASE}  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG}"
 
 exec "$TR" \

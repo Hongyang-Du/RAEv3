@@ -3,7 +3,7 @@
 # reconstruction loss sees the DROPPED latent (random subset, layer-drop 0.3).
 # Decouples a clean generation target from a drop-robust decoder -> the DiT no
 # longer chases per-step target jitter, the decoder still learns subset robustness.
-data: /sensei-fs-3/users/hongyangd/data/imagenet-256
+data: /mnt/localssd/imagenet-256
 out-dir: /sensei-fs-3/users/hongyangd/ckpt/e2e-sigreg-dit-full-dec-drop-nano
 epochs: 80
 batch-size: 24

@@ -55,6 +55,7 @@ case "${1:-}" in
   exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;          BASE=omnirae-dit-sigreg-cls-k23 ;;
   exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;         BASE=omnirae-dit-encoder-cls-k23 ;;
   exp4) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k7.yaml;  BASE=omnirae-dit-h1-plain-cls-k7 ;;  # k7 h1, evanarlian data, k23 decoder
+  exp5) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-raev2k23.yaml;      BASE=omnirae-dit-h1-raev2k23 ;;       # ABLATION: h1 on RAEv2 K=23 decoder (repro-nano-k23, cls off)
   *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
@@ -66,7 +67,7 @@ export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the s
 #   (h1 DiTs sit on the 2e-4 random-drop nano decoder -> use its own data).
 #   FB (sensei-fs) is gone after the local nano delete, so this relies on S3 on the node.
 case "${1:-}" in
-  exp1|exp3|exp4) LSSD=/mnt/localssd/imagenet-256; S3SRC=s3://hongyangd-raev2-backup/raev2-data/imagenet-256/; FB="$ROOT/data/imagenet-256" ;;
+  exp1|exp3|exp4|exp5) LSSD=/mnt/localssd/imagenet-256; S3SRC=s3://hongyangd-raev2-backup/raev2-data/imagenet-256/; FB="$ROOT/data/imagenet-256" ;;
   *)              LSSD="" ;;
 esac
 if [ -n "$LSSD" ]; then

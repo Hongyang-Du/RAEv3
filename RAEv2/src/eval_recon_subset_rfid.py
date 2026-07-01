@@ -79,15 +79,17 @@ def main():
     mean, std = MEAN.to(device), STD.to(device)
 
     # USE_EMA=0 -> load raw (non-EMA) combine/decoder weights instead of the EMA copies.
+    # (ckpt key naming is asymmetric: EMA=ema_combine/ema_dec, non-EMA=combine/decoder)
     _ema = os.environ.get("USE_EMA", "1") != "0"
-    ck_key = lambda base: (("ema_" + base) if _ema else base)
-    print(f"[weights] {'EMA' if _ema else 'non-EMA'}: combine[{ck_key('combine')}] dec[{ck_key('dec')}]", flush=True)
+    comb_key = "ema_combine" if _ema else "combine"
+    dec_key = "ema_dec" if _ema else "decoder"
+    print(f"[weights] {'EMA' if _ema else 'non-EMA'}: combine[{comb_key}] dec[{dec_key}]", flush=True)
     params = OmegaConf.to_container(cfg.combine.params, resolve=True)
     combine = get_obj_from_str(cfg.combine.target)(**params).to(device).eval()
-    combine.load_state_dict(ck[ck_key("combine")])
+    combine.load_state_dict(ck[comb_key])
     dec = _load_decoder("configs/decoder/ViTXL", hidden_size=1024, patch_size=16,
                         num_patches=256, pretrained_path=None).to(device).eval()
-    dec.load_state_dict(ck[ck_key("dec")])
+    dec.load_state_dict(ck[dec_key])
     del ck
 
     arr = np.load(val_npz, mmap_mode="r")

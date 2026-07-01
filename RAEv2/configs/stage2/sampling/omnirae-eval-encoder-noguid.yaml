@@ -73,7 +73,7 @@ transport:
   prediction: x
   time_dist_type: logit-normal_0_1
 sampler:
-  num_steps: 100
+  num_steps: 50
 guidance:
   cfg:
     scale: 1.0
@@ -86,7 +86,7 @@ guidance:
 dataset:
   target: imagenet
   type: hf
-  data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256
+  data_dir: /mnt/localssd/imagenet-256
   split: train
   condition_type: label
   shared_tmpdir: /tmp/gfid_shards
