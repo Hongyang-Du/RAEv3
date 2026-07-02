@@ -35,7 +35,7 @@ data:
     - target: imagenet
       name: imagenet
       weight: 1.0
-      data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256-full
+      data_dir: /mnt/localssd/raev2-data/imagenet-256
       split: train
       condition_type: label
     - target: blip3o

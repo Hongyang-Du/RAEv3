@@ -45,7 +45,7 @@ transport:
   prediction: x
   time_dist_type: logit-normal_0_1
 sampler:
-  num_steps: 100
+  num_steps: 50
 guidance:
   cfg:
     scale: 1.0

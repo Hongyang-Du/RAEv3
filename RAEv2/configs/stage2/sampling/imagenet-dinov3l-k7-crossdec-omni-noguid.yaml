@@ -69,7 +69,7 @@ guidance:
     t_min: 0.0
     t_max: 1.0
   ig:
-    scale: 1.78
+    scale: 1.0
     t_min: 0.10
     t_max: 1.0
 dataset:

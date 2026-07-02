@@ -1,3 +1,8 @@
+# NATIVE eval: official k7 DiT latents decoded by the OFFICIAL k7 decoder.
+# Same pipeline as the reference imagenet-dinov3l-k7.yaml, but the eval block is
+# switched to fid + inception_score against the official 50k val npz (torch-fidelity
+# fast path, no fd_evaluator needed) so it is directly comparable to the
+# cross-decoder eval (imagenet-dinov3l-k7-crossdec-omni.yaml).
 stage_1:
   target: stage1.RAE
   params:
@@ -11,19 +16,11 @@ stage_2:
   target: stage2.models.DDT.DiTwDDTHeadIG
   params:
     input_size: 16
-    patch_size:
-    - 1
-    - 1
+    patch_size: [1, 1]
     in_channels: 1024
-    hidden_size:
-    - 1440
-    - 2048
-    depth:
-    - 28
-    - 2
-    num_heads:
-    - 20
-    - 16
+    hidden_size: [1440, 2048]
+    depth: [28, 2]
+    num_heads: [20, 16]
     mlp_ratio: 4.0
     base_model_depth: 8
   ckpt: pretrained_models/stage2/imagenet/dinov3l-k7/checkpoint.pt
@@ -44,63 +41,38 @@ guidance:
     t_min: 0.0
     t_max: 1.0
   ig:
-    scale: 1.78
+    scale: 1.0
     t_min: 0.10
     t_max: 1.0
 dataset:
   target: imagenet
   type: hf
-  data_dir: ./data/imagenet-256
+  data_dir: /mnt/localssd/imagenet-256
   split: train
   condition_type: label
-  shared_tmpdir: ~/tmp
+  shared_tmpdir: /tmp/gfid_shards
 training:
-  epochs: 80
-  global_batch_size: 2048
+  global_batch_size: 1024
   grad_accum_steps: 1
-  ema_decay: 0.9995
   num_workers: 4
-  log_interval: 100
-  checkpoint_interval: 1
-  sample_every: 5000
-  clip_grad: 1.0
   global_seed: 42
-  optimizer:
-    type: gmuon
-    lr: 0.0002
-    momentum: 0.95
-    nesterov: true
-    ns_coefficients_preset: POLAR_EXPRESS_COEFFICIENTS
-    ns_use_kernels: false
-    weight_decay: 0.0
-  scheduler:
-    type: linear
-    warmup_epochs: 25
-    decay_end_epoch: 50
-    base_lr: 0.0002
-    final_lr: 2.0e-05
-    warmup_from_zero: false
   image_size: 256
 eval:
-  eval_interval: 5000
-  eval_model: false
   eval_dir: results/stage2/eval
+  eval_model: false
   datasets:
     imagenet:
       type: hf
-      data_dir: ./data/imagenet-256
+      data_dir: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256
       split: val
       condition_type: label
       num_samples: 50000
+      reference_npz: null
       metrics:
       - fid
-      - fdr6
-      - mind6
+      - inception_score
 misc:
-  latent_size:
-  - 1024
-  - 16
-  - 16
+  latent_size: [1024, 16, 16]
   num_classes: 1000
   time_dist_shift_dim: 262144
   time_dist_shift_base: 4096

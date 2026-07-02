@@ -34,7 +34,7 @@ transport:
   prediction: x
   time_dist_type: logit-normal_0_1
 sampler:
-  num_steps: 100
+  num_steps: 50
 guidance:
   cfg:
     scale: 1.0
@@ -47,7 +47,7 @@ guidance:
 dataset:
   target: imagenet
   type: hf
-  data_dir: /sensei-fs-3/users/hongyangd/data/imagenet-256
+  data_dir: /mnt/localssd/imagenet-256
   split: train
   condition_type: label
   shared_tmpdir: /tmp/gfid_shards
@@ -67,7 +67,7 @@ eval:
       split: val
       condition_type: label
       num_samples: 50000
-      reference_npz: /sensei-fs-3/users/hongyangd/official_raev2/data/imagenet-256/imagenet-256-val.npz
+      reference_npz: null
       metrics:
       - fid
       - inception_score
