@@ -19,7 +19,7 @@ stage_1:
     stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano/ckpt_ep016.pt   # train_decoder fmt (ImageNet-normed output) -> RAECombine.decode de-norm is correct (repro RAE decoder output [0,1] got double-normed -> gray viz)
     use_ema: false
     latent_dim: 1024
-    normalization_stat_path: /sensei-fs-3/users/hongyangd/ckpt/repro-nano-k23-16ep-2node/latent_stats_k23.pt
+    normalization_stat_path: /sensei-fs-3/users/hongyangd/RAEv3/RAEv2/latent_stats/latent_stats_k23_perpos.pt
     drop: false        # DiT trains on the CLEAN mean+cls latent (no per-step layer-drop) -> matches official
     combine_config:
       target: stage1.combine.MLSCombine
@@ -75,7 +75,7 @@ dataset:
   condition_type: label
   shared_tmpdir: ~/tmp
 training:
-  epochs: 80
+  epochs: 83
   global_batch_size: 1024
   grad_accum_steps: 2          # 64/GPU on 8x80GB (128/GPU OOMs); keeps global batch 1024
   ema_decay: 0.9995

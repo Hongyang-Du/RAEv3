@@ -1,8 +1,8 @@
 # EXP-1: Stage-2 DiT that diffuses h1 = hidden state after the FIRST decoder block of the
-# PLAIN (xcong) random-drop MLS k=23 decoder, with CLS ON (cls_surrogate: false       # RAE discards CLS (x = mean of patch tokens)
+# PLAIN (xcong) random-drop MLS k=23 decoder, with CLS ON (cls_surrogate: true       # repro-nano-k23 z0 needs L_last surrogate (full-dec recon 22.17 vs 20.18)
 # Decode runs decoder blocks 1..N-1 from h1 + dataset-mean CLS. No REPA.
 #
-# cls-on = MLSCombine cls_surrogate: false       # RAE discards CLS (x = mean of patch tokens)
+# cls-on = MLSCombine cls_surrogate: true       # repro-nano-k23 z0 needs L_last surrogate (full-dec recon 22.17 vs 20.18)
 # The xcong plain decoder is confirmed cls-on decodable (PSNR 30 @ cls-on).
 #
 # Before training: compute cls-on h1 stats once ->
@@ -17,9 +17,10 @@ stage_1:
     stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/repro-nano-k23-16ep-2node/raecombine_dec_ep16_noema.pt
     use_ema: false
     output_01: true
+    native_encode: true
     latent_dim: 1024
     drop: false
-    h1_stats_path: /sensei-fs-3/users/hongyangd/ckpt/paper-repro/h1_stats_raev2k23_noema.pt
+    h1_stats_path: /sensei-fs-3/users/hongyangd/RAEv3/RAEv2/latent_stats/h1_stats_raev2k23_native_perpos.pt
     combine_config:
       target: stage1.combine.MLSCombine
       params:
@@ -27,7 +28,7 @@ stage_1:
         weighting: mean
         p_drop: 0.0
         p_full: 0.0
-        cls_surrogate: false       # RAE discards CLS (x = mean of patch tokens)
+        cls_surrogate: True       # RAE discards CLS (x = mean of patch tokens)
         projector: none
         dim: 1024
         out_dim: 1024
@@ -74,7 +75,7 @@ dataset:
   condition_type: label
   shared_tmpdir: ~/tmp
 training:
-  epochs: 80
+  epochs: 83
   global_batch_size: 1024
   grad_accum_steps: 2          # 64/GPU on 8x80GB (128/GPU OOMs); keeps global batch 1024
   ema_decay: 0.9995

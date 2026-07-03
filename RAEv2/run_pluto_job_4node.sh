@@ -32,7 +32,9 @@ export DINOV3_CKPT_DIR="$ROOT/pretrained_models/encoders/dinov3"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$ROOT/.cache/torch}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-export STAGE2_NO_EMA_CKPT=1
+# SAVE EMA in stage-2 checkpoints (EMA weights give ~0.2 lower gFID and are what the
+# paper/official eval uses via model_utils' ema-preferred load). Adds ~3.5GB/ckpt.
+# (was: export STAGE2_NO_EMA_CKPT=1  -> stripped EMA to save disk; disabled to match paper.)
 export CKPT_KEEP_RECENT="${CKPT_KEEP_RECENT:-2}"   # keep most-recent N ep-*.pt
 export CKPT_KEEP_EVERY="${CKPT_KEEP_EVERY:-10}"    # + every-K-epoch milestones
 export CKPT_EVERY_STEPS="${CKPT_EVERY_STEPS:-500}" # also overwrite ep-<epoch>.pt every N steps -> survive spare-capacity preemption (resume mid-epoch, not from step 0)
@@ -51,12 +53,13 @@ MASTER="${MASTER_ADDR:-${JOB_NAME}-0}"          # rank-0 pod; fallback to <job>-
 MPORT="${MASTER_PORT:-29500}"
 
 case "${1:-}" in
-  exp1) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k23.yaml; BASE=omnirae-dit-h1-plain-cls-k23 ;;
-  exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;          BASE=omnirae-dit-sigreg-cls-k23 ;;
-  exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;         BASE=omnirae-dit-encoder-cls-k23 ;;
-  exp4) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k7.yaml;  BASE=omnirae-dit-h1-plain-cls-k7 ;;  # k7 h1, evanarlian data, k23 decoder
-  exp5) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-raev2k23.yaml;      BASE=omnirae-dit-h1-raev2k23 ;;       # ABLATION: h1 on RAEv2 K=23 decoder (repro-nano-k23, cls off)
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4>"; exit 1 ;;
+  exp1) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k23.yaml; BASE=omnirae-dit-h1-plain-cls-k23-ema ;;
+  exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;          BASE=omnirae-dit-sigreg-cls-k23-ema ;;
+  exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;         BASE=omnirae-dit-encoder-cls-k23-ema ;;
+  exp4) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k7.yaml;  BASE=omnirae-dit-h1-plain-cls-k7-ema ;;  # k7 h1, evanarlian data, k23 decoder
+  exp5) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-raev2k23.yaml;      BASE=omnirae-dit-h1-raev2k23-ema ;;       # ABLATION: h1 on RAEv2 K=23 decoder (repro-nano-k23, cls off)
+  exp6) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k7.yaml;          BASE=omnirae-dit-encoder-cls-k7-ema ;;    # k7 encoder counterpart of exp3 (7-layer subset of the k23 decoder)
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|exp6>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
 
@@ -67,7 +70,7 @@ export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the s
 #   (h1 DiTs sit on the 2e-4 random-drop nano decoder -> use its own data).
 #   FB (sensei-fs) is gone after the local nano delete, so this relies on S3 on the node.
 case "${1:-}" in
-  exp1|exp3|exp4|exp5) LSSD=/mnt/localssd/imagenet-256; S3SRC=s3://hongyangd-raev2-backup/raev2-data/imagenet-256/; FB="$ROOT/data/imagenet-256" ;;
+  exp1|exp3|exp4|exp5|exp6) LSSD=/mnt/localssd/imagenet-256; S3SRC=s3://hongyangd-raev2-backup/raev2-data/imagenet-256/; FB="$ROOT/data/imagenet-256" ;;
   *)              LSSD="" ;;
 esac
 if [ -n "$LSSD" ]; then

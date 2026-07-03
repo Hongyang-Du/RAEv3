@@ -26,10 +26,16 @@ from .rae_variants import RAECombine
 
 
 class RAEDecoderH1(RAECombine):
-    def __init__(self, h1_stats_path: str = None, output_01: bool = False, **kwargs):
+    def __init__(self, h1_stats_path: str = None, output_01: bool = False,
+                 native_encode: bool = False, **kwargs):
         kwargs.setdefault("drop", False)              # deterministic full-mean latent -> deterministic h1
         super().__init__(**kwargs)
         self._ckpt = None
+        # native_encode: for stage1.RAE decoders (e.g. repro-nano-k23) the z0 must come from
+        # the encoder WRAPPER (imgs*255 -> /255 -> timm-ImageNet-norm -> MLS mean+L_last),
+        # NOT the RAECombine _imgs_to_norm + get_intermediate_layers path (different norm ->
+        # z0 mismatch, recon 12 vs 22). Omni/train_decoder decoders keep the default path.
+        self.native_encode = native_encode
         # output_01: the loaded decoder is a [0,1]-folded ckpt (de-norm baked into decoder_pred),
         # so neutralize the decode-time ImageNet de-norm (line ~90) to avoid double application.
         if output_01:
@@ -51,6 +57,9 @@ class RAEDecoderH1(RAECombine):
     def _combine_tokens(self, images: torch.Tensor) -> torch.Tensor:
         """images -> raw equal-mean combine latent [B, N, 1024] (the input the stage-1
         decoder was trained on; no stats normalization, drop off)."""
+        if self.native_encode:
+            # encoder wrapper does /255 + timm-ImageNet-norm + MLS mean(layers)+L_last -> [B,N,C]
+            return self.encoder(images * 255.0)
         x = self._imgs_to_norm(images)
         layer_tokens = list(self.encoder.model.get_intermediate_layers(
             x, n=self.encoder.layer_indices, reshape=False,

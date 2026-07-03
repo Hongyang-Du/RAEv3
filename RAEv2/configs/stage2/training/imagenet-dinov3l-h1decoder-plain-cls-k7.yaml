@@ -14,12 +14,12 @@ stage_1:
     encoder_name: dinov3mls-vit-l16[layers=11.13.15.17.19.21.23]
     resolution: 256
     decoder_config_path: configs/decoder/ViTXL
-    stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano/ckpt_ep016_01folded.pt
+    stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano/ckpt_ep016.pt
     use_ema: false
-    output_01: true
+    output_01: false
     latent_dim: 1024
     drop: false
-    h1_stats_path: /sensei-fs-3/users/hongyangd/ckpt/paper-repro/h1_stats_2e4nano_noema_k7.pt
+    h1_stats_path: /sensei-fs-3/users/hongyangd/RAEv3/RAEv2/latent_stats/h1_stats_2e4nano_noema_k7_perpos.pt
     combine_config:
       target: stage1.combine.MLSCombine
       params:
