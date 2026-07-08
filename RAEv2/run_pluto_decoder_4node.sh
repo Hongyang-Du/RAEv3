@@ -52,7 +52,26 @@ MPORT="${MASTER_PORT:-29500}"
 case "${1:-}" in
   ft-plain)      CFG=configs/stage1/decoder/ft-xcong-plain-k23-nodrop-4node.yaml ;;
   drop0-scratch) CFG=configs/stage1/decoder/ourpipe-drop0-k23-16ep-4node.yaml ;;
-  nano-drop)     CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano.yaml ;;
+  nano-drop|nano-drop-p05|nano-drop-p07|nano-drop-sched)
+    case "${1}" in
+      nano-drop)       CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano.yaml ;;
+      nano-drop-p05)   CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p05.yaml ;;
+      nano-drop-p07)   CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p07.yaml ;;
+      nano-drop-sched) CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-sched.yaml ;;
+    esac
+    # nanovisionx imagenet-256 (the /sensei-fs shared copy was deleted; config now points
+    # at node-local SSD). Stage from our S3 backup on every node; skip if already staged.
+    LSSD=/mnt/localssd/imagenet-256
+    if [ ! -f "$LSSD/imagenet-latents-images/dataset_info.json" ]; then
+      echo "### $(date '+%F %T') staging nano imagenet -> $LSSD ..."
+      mkdir -p "$LSSD"
+      aws s3 sync s3://hongyangd-raev2-backup/raev2-data/imagenet-256/ "$LSSD/" \
+        || { echo "### FATAL: S3 sync failed (need AWS creds/role on node)"; exit 1; }
+      echo "### $(date '+%F %T') staged: $(du -sh "$LSSD" 2>/dev/null | cut -f1)"
+    else
+      echo "### nano imagenet already on local SSD ($LSSD)"
+    fi
+    ;;
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
@@ -119,7 +138,7 @@ PYEOF
 )"
     echo "### 4src-s3: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
     ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
+  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|nano-drop|nano-drop-p05|nano-drop-p07|nano-drop-sched|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
 esac
 
 echo "### $(date '+%F %T')  decoder-ft  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=$([ -n "${WANDB_API_KEY:-}" ] && echo on || echo off)"

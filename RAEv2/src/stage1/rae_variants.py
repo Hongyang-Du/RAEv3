@@ -203,8 +203,14 @@ class RAECombine(_RAEVariantBase):
     DiT trains on the dropped-latent DISTRIBUTION, exactly the augmentation the user
     asked for, without touching the (frozen) projector weights/stats."""
 
-    def __init__(self, combine_config, drop: bool = True, **kwargs):
+    def __init__(self, combine_config, drop: bool = True, output_01: bool = False, **kwargs):
         super().__init__(**kwargs)
+        # output_01: the loaded decoder outputs [0,1] pixels directly (e.g. the OFFICIAL
+        # RAEv2 decoders, whose RAE.decode returns unpatchify(out) with no ImageNet de-norm).
+        # Neutralize the decode-time *img_std+img_mean so it isn't applied on top.
+        if output_01:
+            self.img_mean.zero_(); self.img_std.fill_(1.0)
+            print("RAECombine: output_01 -> de-norm neutralized (img_mean=0, img_std=1)")
         from omegaconf import OmegaConf
         from utils.model_utils import get_obj_from_str
         cc = OmegaConf.to_container(combine_config, resolve=True) \

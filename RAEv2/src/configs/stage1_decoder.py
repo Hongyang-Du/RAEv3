@@ -63,6 +63,18 @@ class DataConfig:
 
 
 @dataclass
+class PDropScheduleConfig:
+    """Anneal the random-drop rate (MLSCombine.p_drop) over training: start -> end.
+    Progress = global_step / total_steps (micro-batch granularity), optionally after a
+    warmup_frac fraction of training held at `start`. Supports both a<b (e.g. 0.1->0.9)
+    and a>b (e.g. 0.9->0.1). When p_drop_schedule is None the static combine.p_drop is used."""
+    start: float = 0.3
+    end: float = 0.3
+    type: str = "linear"        # linear | cosine
+    warmup_frac: float = 0.0    # hold p_drop at `start` for the first warmup_frac of training
+
+
+@dataclass
 class TrainingConfig:
     epochs: int = 10
     batch_size: int = 32          # per GPU (micro-batch when grad_accum_steps > 1)
@@ -78,6 +90,7 @@ class TrainingConfig:
     out_dir: str = "output_full/decoder_run"
     init_from: Optional[str] = None   # warm-start weights from an external ckpt
                                       # (combine+decoder+ema+disc); fresh optimizer/epoch
+    p_drop_schedule: Optional[PDropScheduleConfig] = None   # anneal MLSCombine.p_drop start->end
 
 
 @dataclass
