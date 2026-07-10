@@ -6,8 +6,9 @@ turns them into the latent z [B, N, out_dim] the ViT decoder consumes. All the
 forked train_decoder_mls*.py scripts differ ONLY in this combine — here it is
 parameterized by four knobs:
 
-  weighting      mean | random_drop | softgate  how the K layers are mixed
+  weighting      mean | random_drop | dirichlet_drop | softgate  how the K layers mix
   p_drop         float                          per-sample random LAYER-drop prob
+                                                (dirichlet_drop: the MEAN drop rate)
   p_full         float                          per-sample prob of keeping ALL layers
                                                 (no drop) -> mixes full + dropped passes
   cls_surrogate  bool                           add L_last token-mean (raev2 code)
@@ -17,12 +18,24 @@ parameterized by four knobs:
 (1 - p_drop) (>=1 kept) and z0 is the equal-weight mean over the kept subset.
 Drops whole LAYERS (not units) -> structurally collapse-proof; eval = full mean.
 
-Variant map (the three kept experiments + the legacy ones):
-  raev2 K=23              weighting=mean,        projector=none, cls_surrogate=false
-  Random Drop Layer MLS   weighting=random_drop, projector=none, cls_surrogate=false
-  Random Drop Layer + MLP weighting=random_drop, projector=bn,   cls_surrogate=false
-  nogate (legacy)         weighting=mean,        projector=ln
-  softgate (legacy)       weighting=softgate,    projector=ln|none
+`dirichlet_drop` = per-LAYER drop probabilities modeled with a Dirichlet. Every
+step a per-sample simplex vector pi ~ Dirichlet(alpha) (alpha = softplus(log_alpha),
+one CONCENTRATION per layer, learnable by default) allocates a fixed "drop budget":
+the per-layer drop RATE is p_k = clamp(pi_k * K * p_drop, 0, p_max), so the mean
+rate over layers stays p_drop (schedulable) while the Dirichlet redistributes it
+UNEVENLY across layers and randomly each step. Layers with larger alpha_k are, on
+average, dropped more; learnable alpha lets the model learn which layers to lean on.
+The keep is still a HARD whole-layer Bernoulli (collapse-proof); a reparameterized
+rsample + straight-through mask routes gradient back to alpha. Eval = full mean
+(alpha unused at eval), so the probe / cross-decode pipeline is unchanged.
+
+Variant map (the kept experiments + the legacy ones):
+  raev2 K=23              weighting=mean,           projector=none, cls_surrogate=false
+  Random Drop Layer MLS   weighting=random_drop,    projector=none, cls_surrogate=false
+  Random Drop Layer + MLP weighting=random_drop,    projector=bn,   cls_surrogate=false
+  Dirichlet Drop Layer    weighting=dirichlet_drop, projector=none, cls_surrogate=false
+  nogate (legacy)         weighting=mean,           projector=ln
+  softgate (legacy)       weighting=softgate,       projector=ln|none
 
 forward(layer_tokens, idx=None):
   layer_tokens : list of K tensors, each [B, N, dim]
@@ -35,6 +48,8 @@ DDP note: with weighting in {mean, random_drop} and projector=none the module ha
 ZERO parameters. DDP errors on a param-free module, so the trainer must call it
 directly (not wrap it in DDP) when has_params is False.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -54,9 +69,13 @@ class MLSCombine(nn.Module):
                  mult: int = 4,
                  tau: float = 1.0,
                  topk: int = 0,
-                 noise_tau: float = 0.0):
+                 noise_tau: float = 0.0,
+                 alpha_init: float = 1.0,
+                 alpha_learnable: bool = True,
+                 p_max: float = 0.95,
+                 alpha_eps: float = 1e-3):
         super().__init__()
-        assert weighting in ("mean", "random_drop", "softgate", "learned_gate"), weighting
+        assert weighting in ("mean", "random_drop", "dirichlet_drop", "softgate", "learned_gate"), weighting
         assert projector in ("none", "ln", "bn"), projector
         assert 0.0 <= p_full <= 1.0, p_full
         self.layers = list(layers)
@@ -80,6 +99,20 @@ class MLSCombine(nn.Module):
         self.topk = topk               # learned_gate: keep exactly top-k layers (0 = full softmax)
         if weighting == "learned_gate":
             self.gate_logits = nn.Parameter(torch.zeros(self.K))  # init uniform 1/K
+
+        # dirichlet_drop: per-layer Dirichlet concentration alpha = softplus(log_alpha)+eps.
+        # log_alpha stores softplus^{-1}(alpha_init) so all layers start at alpha_init
+        # (symmetric prior == same expected drop rate); training then breaks the symmetry.
+        self.p_max = float(p_max)          # cap per-layer drop rate (keep every layer trainable)
+        self.alpha_eps = float(alpha_eps)  # floor so alpha > 0 (Dirichlet needs positive conc.)
+        if weighting == "dirichlet_drop":
+            a0 = max(float(alpha_init) - self.alpha_eps, 1e-4)
+            log_a0 = math.log(math.expm1(a0))          # softplus^{-1}(a0) = log(exp(a0)-1)
+            init = torch.full((self.K,), log_a0)
+            if alpha_learnable:
+                self.log_alpha = nn.Parameter(init)    # learned per-layer reliance (has_params -> DDP)
+            else:
+                self.register_buffer("log_alpha", init)  # fixed per-layer alpha from config
 
         if projector == "none":
             self.skip = None
@@ -134,6 +167,30 @@ class MLSCombine(nn.Module):
             if gate_w is not None:                          # already sliced+renormalized
                 return (gate_w.view(-1, 1, 1, 1) * sub).sum(0)
             return sub.mean(0)
+
+        # dirichlet_drop: per-layer drop RATES drawn from a Dirichlet each step.
+        # Always taken while training (even if p_drop->0 by schedule) so log_alpha stays
+        # in the autograd graph -> DDP never sees it as an unused parameter.
+        if self.training and self.weighting == "dirichlet_drop":
+            alpha = (F.softplus(self.log_alpha) + self.alpha_eps).float()   # [K] > 0
+            base_p = max(float(self.p_drop), 1e-6)          # mean drop rate (>0 keeps alpha in graph)
+            # per-sample simplex allocation of the drop budget; rsample -> grad flows to alpha
+            pi = torch.distributions.Dirichlet(alpha.expand(B, K)).rsample()  # [B, K], rows sum to 1
+            # simplex -> per-layer drop rate; mean_k p == base_p (mean pi == 1/K), clamp to keep valid
+            p = (pi * K * base_p).clamp(0.0, self.p_max)    # [B, K]
+            keep_prob = 1.0 - p
+            keep_hard = (torch.rand_like(keep_prob) < keep_prob).float()      # HARD whole-layer keep
+            dead = keep_hard.sum(dim=1) == 0                # always keep >= 1 layer per sample
+            if dead.any():
+                j = torch.randint(K, (int(dead.sum()),), device=stk.device)
+                keep_hard[dead, j] = 1.0
+            if self.p_full > 0:                             # some samples keep ALL layers
+                full = torch.rand(B, device=stk.device) < self.p_full
+                keep_hard[full, :] = 1.0
+            # straight-through: forward = hard 0/1 mask, backward = grad through keep_prob -> alpha
+            keep = (keep_prob + (keep_hard - keep_prob).detach()).transpose(0, 1)  # [K, B]
+            w = keep / keep.sum(0, keepdim=True).clamp_min(1e-6)   # equal weight over kept subset
+            return (w.view(K, B, 1, 1).to(stk.dtype) * stk).sum(0)
 
         if self.training and self.weighting in ("random_drop", "softgate") and self.p_drop > 0:
             keep = torch.rand(K, B, device=stk.device) > self.p_drop

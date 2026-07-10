@@ -472,10 +472,24 @@ def main():
                 lr = optimizer.param_groups[0]["lr"]
                 zd = gaussian_diag(z); ps = psnr(x_rec, imgs)
                 pdrop_str = f"  p_drop={combine.p_drop:.3f}" if pdrop_dynamic else ""
+                # dirichlet_drop: log the learned per-layer concentration alpha and the
+                # implied expected per-layer drop rate E[p_k] = (alpha_k/sum) * K * p_drop
+                # (mean over layers == p_drop). Only fires when the combine has log_alpha.
+                dir_str, dir_log = "", {}
+                if hasattr(combine, "log_alpha"):
+                    with torch.no_grad():
+                        a = F.softplus(combine.log_alpha) + combine.alpha_eps        # [K] > 0
+                        ep = (a / a.sum().clamp_min(1e-6)) * combine.K * float(combine.p_drop)
+                    dir_str = f"  a[{a.min():.2f},{a.max():.2f}] pk[{ep.min():.2f},{ep.max():.2f}]"
+                    dir_log = {"train/alpha_min": a.min().item(), "train/alpha_max": a.max().item(),
+                               "train/alpha_mean": a.mean().item(), "train/alpha_std": a.std().item()}
+                    for li, lyr in enumerate(combine.layers):
+                        dir_log[f"train/alpha/L{lyr}"] = a[li].item()
+                        dir_log[f"train/pdrop/L{lyr}"] = ep[li].item()
                 print(f"  ep{epoch+1} s{global_step}  loss={loss.item():.4e}  l1={loss_l1.item():.4e}"
                       f"  lpips={loss_lpips.item():.4e}  psnr={ps:.2f}  sig={loss_sig.item():.4e}"
                       f"  gan={loss_gan.item():.4e}  z(mu={zd['mean']:.2f} sd={zd['std']:.2f})"
-                      f"  vard(mu={zd['var_mean']:.2f})  lr={lr:.2e}{pdrop_str}", flush=True)
+                      f"  vard(mu={zd['var_mean']:.2f})  lr={lr:.2e}{pdrop_str}{dir_str}", flush=True)
                 if cfg.wandb.enabled:
                     import wandb
                     log_d = {"train/loss": loss.item(), "train/l1": loss_l1.item(),
@@ -485,6 +499,9 @@ def main():
                              "train/z_var_mean": zd["var_mean"], "train/lr": lr}
                     if pdrop_dynamic:
                         log_d["train/p_drop"] = combine.p_drop
+                    if dir_log:
+                        log_d.update(dir_log)
+                        log_d["train/alpha_hist"] = wandb.Histogram(a.float().cpu().numpy())
                     wandb.log(log_d, step=global_step)
 
             # -- step-based ckpt_latest (preemption resilience) ------------------
