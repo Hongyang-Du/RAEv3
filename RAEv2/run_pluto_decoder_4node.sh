@@ -14,10 +14,14 @@
 #   bash /sensei-fs-3/users/hongyangd/RAEv3/RAEv2/run_pluto_decoder_4node.sh ft-plain
 set -uo pipefail
 
+# REPO = the repo THIS script lives in, so the old-code worktree (RAEv3_oldnorm) runs ITS
+# OWN code + configs instead of hardcoding the main RAEv3/RAEv2. ROOT stays the shared
+# sensei user dir (rae_env, dinov3, caches, out_dirs).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for base in /sensei-fs-3 /mnt/remotes/sensei-fs-3; do
-  if [ -d "$base/users/hongyangd/RAEv3/RAEv2" ]; then REPO="$base/users/hongyangd/RAEv3/RAEv2"; ROOT="$base/users/hongyangd"; break; fi
+  if [ -d "$base/users/hongyangd" ]; then ROOT="$base/users/hongyangd"; break; fi
 done
-: "${REPO:?could not find RAEv3/RAEv2 on the sensei mount}"
+: "${REPO:?could not resolve script dir}"; : "${ROOT:?could not find sensei user dir}"
 cd "$REPO"
 
 mkdir -p "$ROOT/logs"
@@ -53,6 +57,10 @@ case "${1:-}" in
   ft-plain)      CFG=configs/stage1/decoder/ft-xcong-plain-k23-nodrop-4node.yaml ;;
   drop0-scratch) CFG=configs/stage1/decoder/ourpipe-drop0-k23-16ep-4node.yaml ;;
   nano-drop)     CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano.yaml ;;
+  nano-drop-p005) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p005-oldnorm.yaml ;; # old-regime retrain p_drop=0.05
+  nano-drop-p01) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p01-oldnorm.yaml ;;  # old-regime retrain p_drop=0.1
+  nano-drop-p05) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p05-oldnorm.yaml ;;  # old-regime retrain p_drop=0.5
+  nano-drop-p07) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p07-oldnorm.yaml ;;  # old-regime retrain p_drop=0.7
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
@@ -119,8 +127,38 @@ PYEOF
 )"
     echo "### 4src-s3: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
     ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
+  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|nano-drop|nano-drop-p005|nano-drop-p01|nano-drop-p05|nano-drop-p07|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
 esac
+
+# Stage nanovisionx imagenet-256 from S3 -> node-local SSD (the /sensei-fs shared copy was
+# deleted; the nano configs' data_dir points at $LSSD). Runs on EVERY node; skip if already
+# staged. Needs AWS creds / instance-role with s3:GetObject on the bucket.
+if [[ "$CFG" == *nano* ]]; then
+  LSSD=/mnt/localssd/imagenet-256
+  if [ ! -f "$LSSD/imagenet-latents-images/dataset_info.json" ]; then
+    echo "### $(date '+%F %T') staging nano imagenet -> $LSSD ..."
+    mkdir -p "$LSSD"
+    aws s3 sync s3://hongyangd-raev2-backup/raev2-data/imagenet-256/ "$LSSD/" \
+      || { echo "### FATAL: S3 sync failed (need AWS creds/role on node)"; exit 1; }
+    echo "### $(date '+%F %T') staged: $(du -sh "$LSSD" 2>/dev/null | cut -f1)"
+  else
+    echo "### nano imagenet already on local SSD ($LSSD)"
+  fi
+fi
+
+# ROBUSTNESS: worker nodes wait for the master's rendezvous port to be OPEN before starting
+# torchrun. Because each fresh pod re-stages ~236G to (ephemeral) local SSD, staging finishes
+# at slightly different times per node; without this, a worker that finishes first starts
+# torchrun, fails to reach the not-yet-up master store, its POD exits, and Pluto respawns a
+# fresh pod that must re-stage 236G again -> the two nodes never rendezvous ("keeps reconnecting").
+# Waiting here keeps the worker pod alive until the master is reachable. (bash /dev/tcp; no nc dep.)
+if [ "${NUM_NODES}" -gt 1 ] && [ "${NODE_RANK}" -ne 0 ]; then
+  echo "### $(date '+%F %T') rank ${NODE_RANK}: waiting for master ${MASTER}:${MPORT} ..."
+  for _i in $(seq 1 360); do   # up to ~60 min (covers cold 236G stage on master)
+    if (exec 3<>"/dev/tcp/${MASTER}/${MPORT}") 2>/dev/null; then exec 3>&- 3<&-; echo "### master up"; break; fi
+    sleep 10
+  done
+fi
 
 echo "### $(date '+%F %T')  decoder-ft  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=$([ -n "${WANDB_API_KEY:-}" ] && echo on || echo off)"
 
