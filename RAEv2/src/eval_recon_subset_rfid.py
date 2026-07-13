@@ -41,6 +41,8 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--val-npz", default=None, help="override eval.val_npz (e.g. a held-out eval set)")
     ap.add_argument("--seed", type=int, default=None, help="override eval.seed (subset sampling)")
+    ap.add_argument("--save-recon-npz", default=None,
+                    help="if set, save reconstructions (uint8 NHWC) + subset idxs to this .npz")
     args = ap.parse_args()
     device = "cuda"
 
@@ -126,6 +128,15 @@ def main():
     ssim = sum(ssims) / n_done
     recon_arr = np.concatenate(recon_u8, 0)
     ref_arr = np.concatenate(ref_u8, 0)
+
+    # Optionally persist the reconstructions (uint8 NHWC) for reuse. `idxs` records the
+    # subset order so recon[i] corresponds to reference val image `idxs[i]`.
+    if args.save_recon_npz:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_recon_npz)), exist_ok=True)
+        np.savez(args.save_recon_npz, recon=recon_arr, idxs=np.asarray(idxs, dtype=np.int64))
+        print(f"[save] recon npz -> {args.save_recon_npz} "
+              f"({os.path.getsize(args.save_recon_npz)//1024//1024} MB)", flush=True)
+
     rfid = calculate_rfid(recon_arr, ref_arr, bs=128, device=device)
 
     # FD_EVAL=1: also compute the OFFICIAL rFID via fd_evaluator on the SAME recon_arr

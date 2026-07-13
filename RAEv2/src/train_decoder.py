@@ -374,11 +374,14 @@ def main():
         # -- checkpoint (CPU-cloned, safe to save while training mutates the live model)
         # atomic write: tmp + rename so a preemption/quota-exceeded mid-save never leaves
         # a truncated ckpt_latest that resume would crash-loop on.
-        _tmp = latest + ".tmp.epoch"   # distinct tmp from the step-saver (.tmp.step), else
-        torch.save(ckpt_cpu, _tmp); os.replace(_tmp, latest)   # both race on one tmp -> os.replace FileNotFoundError -> ckpt_epNNN never saved
+        _tmp = latest + ".tmp.epoch"   # distinct tmp from the step-saver (.tmp.step)
+        with save_lock:                # serialize with the step-saver (concurrent GB writes corrupt)
+            torch.save(ckpt_cpu, _tmp); os.replace(_tmp, latest)
         if ep % T.ckpt_every == 0:
             _epf = os.path.join(T.out_dir, f"ckpt_ep{ep:03d}.pt")
-            _t2 = _epf + ".tmp"; torch.save(ckpt_cpu, _t2); os.replace(_t2, _epf)
+            _t2 = _epf + ".tmp"
+            with save_lock:
+                torch.save(ckpt_cpu, _t2); os.replace(_t2, _epf)
             # retention: with virtualized epochs there can be hundreds of ckpt_ep files;
             # keep only the most recent CKPT_KEEP_RECENT (env, default keep-all) so the
             # per-user disk quota doesn't fill up.
@@ -392,6 +395,11 @@ def main():
 
     val_thread = None
     step_save_thread = None
+    # One lock shared by the step-saver and the epoch/val-saver daemon threads: two
+    # concurrent multi-GB torch.saves to the shared FS corrupt each other's zip stream
+    # ("unexpected pos" / "basic_ios::clear: iostream error"), which is why ckpt_epNNN
+    # stopped saving after ep001. Serializing the writes fixes it; saves stay async.
+    save_lock = threading.Lock()
 
     # -- training loop ---------------------------------------------------------
     # grad_accum: micro-batch of T.batch_size, optimizer steps every `accum`
@@ -479,7 +487,8 @@ def main():
                 if hasattr(combine, "log_alpha"):
                     with torch.no_grad():
                         a = F.softplus(combine.log_alpha) + combine.alpha_eps        # [K] > 0
-                        ep = (a / a.sum().clamp_min(1e-6)) * combine.K * float(combine.p_drop)
+                        _pmin = getattr(combine, "p_min", 0.0); _pmax = getattr(combine, "p_max", 1.0)
+                        ep = ((a / a.sum().clamp_min(1e-6)) * combine.K * float(combine.p_drop)).clamp(_pmin, _pmax)
                     dir_str = f"  a[{a.min():.2f},{a.max():.2f}] pk[{ep.min():.2f},{ep.max():.2f}]"
                     dir_log = {"train/alpha_min": a.min().item(), "train/alpha_max": a.max().item(),
                                "train/alpha_mean": a.mean().item(), "train/alpha_std": a.std().item()}
@@ -518,7 +527,9 @@ def main():
                     "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
                     "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
                 def _save_latest(s):
-                    _t = latest + ".tmp.step"; torch.save(s, _t); os.replace(_t, latest)
+                    _t = latest + ".tmp.step"
+                    with save_lock:    # serialize with the epoch/val-saver (concurrent GB writes corrupt)
+                        torch.save(s, _t); os.replace(_t, latest)
                 step_save_thread = threading.Thread(target=_save_latest, args=(_snap,), daemon=True)
                 step_save_thread.start()
                 print(f"  [step-ckpt] saved ckpt_latest @ step {global_step}", flush=True)

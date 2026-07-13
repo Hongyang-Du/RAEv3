@@ -52,14 +52,16 @@ MPORT="${MASTER_PORT:-29500}"
 case "${1:-}" in
   ft-plain)      CFG=configs/stage1/decoder/ft-xcong-plain-k23-nodrop-4node.yaml ;;
   drop0-scratch) CFG=configs/stage1/decoder/ourpipe-drop0-k23-16ep-4node.yaml ;;
-  nano-drop|nano-drop-p01|nano-drop-p05|nano-drop-p07|nano-drop-sched|nano-dirdrop)
+  nano-drop|nano-drop-p005|nano-drop-p01|nano-drop-p05|nano-drop-p07|nano-drop-sched|nano-dirdrop|nano-dirdrop-adv)
     case "${1}" in
-      nano-drop)       CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano.yaml ;;
-      nano-drop-p01)   CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p01.yaml ;;
-      nano-drop-p05)   CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p05.yaml ;;
-      nano-drop-p07)   CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p07.yaml ;;
-      nano-drop-sched) CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-sched.yaml ;;
-      nano-dirdrop)    CFG=configs/stage1/decoder/dirichlet-drop-layer-mls-plain-k23-nano.yaml ;;
+      nano-drop)         CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano.yaml ;;
+      nano-drop-p005)    CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p005.yaml ;;
+      nano-drop-p01)     CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p01.yaml ;;
+      nano-drop-p05)     CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p05.yaml ;;
+      nano-drop-p07)     CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-p07.yaml ;;
+      nano-drop-sched)   CFG=configs/stage1/decoder/random-drop-layer-mls-plain-k23-nano-sched.yaml ;;
+      nano-dirdrop)      CFG=configs/stage1/decoder/dirichlet-drop-layer-mls-plain-k23-nano.yaml ;;
+      nano-dirdrop-adv)  CFG=configs/stage1/decoder/dirichlet-drop-layer-mls-plain-k23-nano-adv.yaml ;;
     esac
     # nanovisionx imagenet-256 (the /sensei-fs shared copy was deleted; config now points
     # at node-local SSD). Stage from our S3 backup on every node; skip if already staged.
@@ -140,7 +142,7 @@ PYEOF
 )"
     echo "### 4src-s3: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
     ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|nano-drop|nano-drop-p01|nano-drop-p05|nano-drop-p07|nano-drop-sched|nano-dirdrop|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
+  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|nano-drop|nano-drop-p005|nano-drop-p01|nano-drop-p05|nano-drop-p07|nano-drop-sched|nano-dirdrop|nano-dirdrop-adv|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
 esac
 
 echo "### $(date '+%F %T')  decoder-ft  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=$([ -n "${WANDB_API_KEY:-}" ] && echo on || echo off)"

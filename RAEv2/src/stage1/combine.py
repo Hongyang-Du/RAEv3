@@ -56,6 +56,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _GradReverse(torch.autograd.Function):
+    """Identity on the forward pass; NEGATES (and scales by lambd) the gradient on the
+    backward pass. Wrapping log_alpha with this makes a single loss.backward() ASCEND the
+    reconstruction loss w.r.t. alpha (adversarial drop) while still DESCENDING it w.r.t.
+    the decoder -> no second optimizer / no trainer change needed."""
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g.neg() * ctx.lambd, None
+
+
+def grad_reverse(x, lambd=1.0):
+    return _GradReverse.apply(x, lambd)
+
+
 class MLSCombine(nn.Module):
     def __init__(self,
                  layers,
@@ -73,6 +92,8 @@ class MLSCombine(nn.Module):
                  alpha_init: float = 1.0,
                  alpha_learnable: bool = True,
                  p_max: float = 0.95,
+                 p_min: float = 0.0,
+                 adv_lambda: float = 0.0,
                  alpha_eps: float = 1e-3):
         super().__init__()
         assert weighting in ("mean", "random_drop", "dirichlet_drop", "softgate", "learned_gate"), weighting
@@ -104,6 +125,8 @@ class MLSCombine(nn.Module):
         # log_alpha stores softplus^{-1}(alpha_init) so all layers start at alpha_init
         # (symmetric prior == same expected drop rate); training then breaks the symmetry.
         self.p_max = float(p_max)          # cap per-layer drop rate (keep every layer trainable)
+        self.p_min = float(p_min)          # floor per-layer drop rate (no layer ever ~never dropped)
+        self.adv_lambda = float(adv_lambda)  # >0: adversarial alpha (gradient-reversal ascent); 0: normal descent
         self.alpha_eps = float(alpha_eps)  # floor so alpha > 0 (Dirichlet needs positive conc.)
         if weighting == "dirichlet_drop":
             a0 = max(float(alpha_init) - self.alpha_eps, 1e-4)
@@ -172,12 +195,18 @@ class MLSCombine(nn.Module):
         # Always taken while training (even if p_drop->0 by schedule) so log_alpha stays
         # in the autograd graph -> DDP never sees it as an unused parameter.
         if self.training and self.weighting == "dirichlet_drop":
-            alpha = (F.softplus(self.log_alpha) + self.alpha_eps).float()   # [K] > 0
+            # adv_lambda>0: reverse the gradient into log_alpha so it ASCENDS the recon loss
+            # (alpha learns to drop the layers the decoder leans on most -> forces robustness),
+            # instead of descending it (which collapses to keep-shallow / drop-deep). 0 = descent.
+            la = grad_reverse(self.log_alpha, self.adv_lambda) if self.adv_lambda > 0 else self.log_alpha
+            alpha = (F.softplus(la) + self.alpha_eps).float()   # [K] > 0
             base_p = max(float(self.p_drop), 1e-6)          # mean drop rate (>0 keeps alpha in graph)
             # per-sample simplex allocation of the drop budget; rsample -> grad flows to alpha
             pi = torch.distributions.Dirichlet(alpha.expand(B, K)).rsample()  # [B, K], rows sum to 1
-            # simplex -> per-layer drop rate; mean_k p == base_p (mean pi == 1/K), clamp to keep valid
-            p = (pi * K * base_p).clamp(0.0, self.p_max)    # [B, K]
+            # simplex -> per-layer drop rate; mean_k p ~= base_p (mean pi == 1/K). Bound to
+            # [p_min, p_max]: prevents the extremes (some layer ~never dropped, some ~always) so
+            # every layer stays both seen and dropped -> the adversary can't fully abandon a layer.
+            p = (pi * K * base_p).clamp(self.p_min, self.p_max)    # [B, K]
             keep_prob = 1.0 - p
             keep_hard = (torch.rand_like(keep_prob) < keep_prob).float()      # HARD whole-layer keep
             dead = keep_hard.sum(dim=1) == 0                # always keep >= 1 layer per sample
