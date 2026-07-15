@@ -24,7 +24,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import OmegaConf
 from torchvision import transforms
 
-from configs.stage1_decoder import DecoderConfig
+from configs.stage1_decoder import DecoderConfig, PDropScheduleConfig
 from encoders.vision_encoder import create_encoder
 from stage1.rae import _load_decoder
 from stage1.disc import DinoDiscriminator, hinge_d_loss, vanilla_g_loss, calculate_adaptive_weight
@@ -80,6 +80,14 @@ def main():
     if os.environ.get("DISC_START_OVERRIDE"): L.gan.disc_start = int(os.environ["DISC_START_OVERRIDE"])
     if os.environ.get("OUT_DIR_OVERRIDE"): T.out_dir = os.environ["OUT_DIR_OVERRIDE"]
     if os.environ.get("NUM_WORKERS_OVERRIDE"): D.num_workers = int(os.environ["NUM_WORKERS_OVERRIDE"])
+    # p_drop-schedule overrides: flip direction / endpoints / shape without editing the YAML
+    # (e.g. PDROP_START=0.9 PDROP_END=0.1). If the config has no schedule, any of these enables one.
+    if any(os.environ.get(k) for k in ("PDROP_START", "PDROP_END", "PDROP_TYPE", "PDROP_WARMUP_FRAC")):
+        if T.p_drop_schedule is None: T.p_drop_schedule = PDropScheduleConfig()
+        if os.environ.get("PDROP_START"): T.p_drop_schedule.start = float(os.environ["PDROP_START"])
+        if os.environ.get("PDROP_END"): T.p_drop_schedule.end = float(os.environ["PDROP_END"])
+        if os.environ.get("PDROP_TYPE"): T.p_drop_schedule.type = os.environ["PDROP_TYPE"]
+        if os.environ.get("PDROP_WARMUP_FRAC"): T.p_drop_schedule.warmup_frac = float(os.environ["PDROP_WARMUP_FRAC"])
     # preemption resilience: also save ckpt_latest every N steps (not just per epoch), so
     # a preempted job resumes from a recent step instead of restarting the epoch from zero.
     ckpt_every_steps = int(os.environ.get("CKPT_EVERY_STEPS", "0") or "0")
@@ -184,6 +192,27 @@ def main():
         pr = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * pr))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
+
+    # -- optional random-drop-rate schedule: anneal MLSCombine.p_drop start->end ----
+    # progress = global_step/total_steps (micro-batch granularity) so it resumes from a
+    # restored global_step. Active only when p_drop_schedule set and combine has p_drop.
+    pdrop_sched = T.p_drop_schedule
+    pdrop_dynamic = pdrop_sched is not None and hasattr(combine, "p_drop")
+
+    def p_drop_at(step):
+        p = step / max(1, total_steps - 1)
+        wf = pdrop_sched.warmup_frac
+        frac = 0.0 if p < wf else (p - wf) / max(1e-8, 1.0 - wf)
+        frac = min(1.0, max(0.0, frac))
+        if pdrop_sched.type == "cosine":
+            frac = 0.5 * (1.0 - math.cos(math.pi * frac))
+        return pdrop_sched.start + (pdrop_sched.end - pdrop_sched.start) * frac
+
+    if is_main and pdrop_dynamic:
+        print(f"p_drop schedule: {pdrop_sched.start} -> {pdrop_sched.end} "
+              f"({pdrop_sched.type}, warmup_frac={pdrop_sched.warmup_frac})", flush=True)
+    elif is_main and pdrop_sched is not None:
+        print("WARNING: p_drop_schedule set but combine has no p_drop attr -> ignored", flush=True)
 
     # -- LPIPS + discriminator -------------------------------------------------
     lpips_all = LPIPS_().to(device).eval()
@@ -378,6 +407,8 @@ def main():
                 layer_tokens = encode_layers(imgs)
             use_gan = (global_step >= disc_start_step) and (L.gan.disc_weight > 0)
             is_accum_step = ((micro_idx + 1) % accum == 0)
+            if pdrop_dynamic:                       # anneal random-drop rate start->end
+                combine.p_drop = p_drop_at(global_step)
 
             with autocast_ctx:
                 z = combine_ddp(layer_tokens)

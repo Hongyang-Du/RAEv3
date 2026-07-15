@@ -61,6 +61,10 @@ case "${1:-}" in
   nano-drop-p01) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p01-oldnorm.yaml ;;  # old-regime retrain p_drop=0.1
   nano-drop-p05) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p05-oldnorm.yaml ;;  # old-regime retrain p_drop=0.5
   nano-drop-p07) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p07-oldnorm.yaml ;;  # old-regime retrain p_drop=0.7
+  nano-drop-p03) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-oldnorm.yaml ;;  # old-regime p_drop=0.3 REPRO of the 0.294 anchor
+  nano-drop-p002) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p002-oldnorm.yaml ;;  # old-regime p_drop=0.02
+  nano-drop-p09) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p09-oldnorm.yaml ;;  # old-regime p_drop=0.9
+  nano-drop-sched-0.9to0.1) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-sched-0.9to0.1-oldnorm.yaml ;;  # old-regime p_drop schedule 0.9->0.1
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
