@@ -65,6 +65,7 @@ case "${1:-}" in
   nano-drop-p002) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p002-oldnorm.yaml ;;  # old-regime p_drop=0.02
   nano-drop-p09) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p09-oldnorm.yaml ;;  # old-regime p_drop=0.9
   nano-drop-sched-0.9to0.1) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-sched-0.9to0.1-oldnorm.yaml ;;  # old-regime p_drop schedule 0.9->0.1
+  nano-ft-k23) CFG=configs/stage1/decoder/ft-k23-nodrop-oldnorm.yaml ;;  # finetune omni->k23 (freeze/LoRA via env FREEZE_PREFIXES / LORA_R)
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
@@ -137,7 +138,7 @@ esac
 # Stage nanovisionx imagenet-256 from S3 -> node-local SSD (the /sensei-fs shared copy was
 # deleted; the nano configs' data_dir points at $LSSD). Runs on EVERY node; skip if already
 # staged. Needs AWS creds / instance-role with s3:GetObject on the bucket.
-if [[ "$CFG" == *nano* ]]; then
+if [[ "$CFG" == *nano* || "$CFG" == *oldnorm* ]]; then
   LSSD=/mnt/localssd/imagenet-256
   if [ ! -f "$LSSD/imagenet-latents-images/dataset_info.json" ]; then
     echo "### $(date '+%F %T') staging nano imagenet -> $LSSD ..."

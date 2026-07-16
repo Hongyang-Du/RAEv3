@@ -25,8 +25,8 @@ combine:
     - 21
     - 22
     - 23
-    weighting: random_drop
-    p_drop: 0.9            # fallback / schedule start; annealed by training.p_drop_schedule
+    weighting: mean          # k23, NO drop (plain sum of all 23 layers)
+    p_drop: 0.0
     cls_surrogate: true
     projector: none
     dim: 1024
@@ -39,29 +39,25 @@ loss:
   sigreg: null
   gan:
     disc_weight: 0.75
-    disc_start: 8
+    disc_start: 0            # GAN from the first epoch (warm decoder+disc via init_from)
 data:
-  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
+  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from S3 at job start
   image_size: 256
   val_npz: data_eval/imagenet-256-val.npz
   val_n: 100
 training:
   epochs: 16
   batch_size: 32
-  lr: 2.0e-4
-  warmup_epochs: 2
+  lr: 1.0e-4               # finetune LR (lower than the 2e-4 from-scratch runs)
+  warmup_epochs: 0
   ema_decay: 0.9995
   precision: bf16
   ckpt_every: 1
   log_every: 50
   seed: 42
-  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-sched-0.9to0.1-oldnorm
-  # anneal random-drop rate 0.9 -> 0.1 over the 16 epochs (linear). Flip via PDROP_START/END env.
-  p_drop_schedule:
-    start: 0.9
-    end: 0.0
-    type: linear
-    warmup_frac: 0.0
+  # warm-start decoder+combine+ema+disc from the trained OmniRAE p0.3 checkpoint.
+  init_from: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-p0.3/ckpt_ep016.pt
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-ft-k23   # overridden per version via OUT_DIR_OVERRIDE
 probe:
   loo_solo: final
   val_image: assets/samples/sample_1.png
@@ -69,4 +65,4 @@ wandb:
   enabled: true
   project: raev3-full
   entity: uscgvl
-  name: omni-randomdrop-plain-k23-nano-sched-0.9to0.1-oldnorm
+  name: omni-ft-k23

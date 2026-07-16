@@ -34,6 +34,77 @@ from stage1.disc.utils import RandomWindowCrop
 from overfit_sigreg import sigreg_loss, gaussian_diag, psnr, val_recon_psnr_npz
 
 
+# ---- decoder finetune modes (freeze / LoRA), env-driven; no-op unless env set -----
+class _LoRALinear(nn.Module):
+    """Wrap a frozen nn.Linear with a trainable low-rank update:
+    y = base(x) + scale * B(A(x)). B is zero-init so at step 0 the module == base."""
+    def __init__(self, base, r, alpha):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.lora_A = nn.Linear(base.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, base.out_features, bias=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.scaling = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + self.lora_B(self.lora_A(x)) * self.scaling
+
+
+def _inject_lora(module, targets, r, alpha):
+    n = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear) and name in targets:
+            setattr(module, name, _LoRALinear(child, r, alpha)); n += 1
+        else:
+            n += _inject_lora(child, targets, r, alpha)
+    return n
+
+
+def apply_finetune_mode(decoder, is_main):
+    """Env-driven decoder finetune mode (returns True iff LoRA was injected):
+      LORA_R=16 [LORA_ALPHA] [LORA_TARGETS=query,key,value,dense] -> freeze base, train only LoRA
+      FREEZE_PREFIXES=decoder_embed  -> freeze decoder params whose name starts with any prefix
+    No-ops when neither env is set (normal full training)."""
+    lora_r = int(os.environ.get("LORA_R", "0") or "0")
+    freeze_prefixes = [s for s in os.environ.get("FREEZE_PREFIXES", "").split(",") if s]
+    if lora_r > 0:
+        alpha = float(os.environ.get("LORA_ALPHA", str(2 * lora_r)))
+        targets = set(t for t in os.environ.get("LORA_TARGETS", "query,key,value,dense").split(",") if t)
+        n = _inject_lora(decoder, targets, lora_r, alpha)
+        for name, p in decoder.named_parameters():
+            p.requires_grad_(".lora_A." in name or ".lora_B." in name)
+        if is_main:
+            tr = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+            print(f"[finetune] LoRA r={lora_r} alpha={alpha} into {n} Linear(s) "
+                  f"targets={sorted(targets)}; trainable decoder={tr/1e6:.3f}M", flush=True)
+        return True
+    if freeze_prefixes:
+        nf = 0
+        for name, p in decoder.named_parameters():
+            if any(name.startswith(pre) for pre in freeze_prefixes):
+                p.requires_grad_(False); nf += 1
+        if is_main:
+            print(f"[finetune] froze {nf} decoder param-tensors with prefixes {freeze_prefixes}", flush=True)
+    return False
+
+
+def _remap_lora_state(sd, model):
+    """Old (pre-LoRA) state_dict -> wrapped names: a LoRA-wrapped Linear puts its base
+    params under an extra '.base.' segment, so remap so base weights still load."""
+    keys = set(model.state_dict().keys())
+    out = {}
+    for k, v in sd.items():
+        if k in keys:
+            out[k] = v; continue
+        head, _, tail = k.rpartition(".")
+        cand = f"{head}.base.{tail}"
+        out[cand if cand in keys else k] = v
+    return out
+
+
 def update_ema(ema, model, decay=0.9995):
     with torch.no_grad():
         for ep, p in zip(ema.parameters(), model.parameters()):
@@ -170,6 +241,10 @@ def main():
                             num_patches=cfg.decoder.num_patches,
                             pretrained_path=None).to(device)
 
+    # finetune mode (freeze / LoRA) via env; no-op for normal training. MUST run before
+    # DDP-wrapping the decoder so frozen params are excluded from DDP grad sync.
+    lora_injected = apply_finetune_mode(decoder, is_main)
+
     combine_has_params = combine.has_params if hasattr(combine, "has_params") \
         else any(True for _ in combine.parameters())
     combine_ddp = DDP(combine, device_ids=[local_rank]) if combine_has_params else combine
@@ -177,7 +252,7 @@ def main():
     ema_combine = deepcopy(combine); ema_combine.requires_grad_(False); ema_combine.eval()
     ema_dec = deepcopy(decoder); ema_dec.requires_grad_(False); ema_dec.eval()
 
-    trainable = list(combine.parameters()) + list(decoder.parameters())
+    trainable = [p for p in list(combine.parameters()) + list(decoder.parameters()) if p.requires_grad]
     if is_main:
         print(f"Trainable: {sum(p.numel() for p in trainable)/1e6:.1f}M  "
               f"(combine {sum(p.numel() for p in combine.parameters())/1e6:.2f}M + decoder)")
@@ -280,12 +355,19 @@ def main():
         # new optimizer/scheduler/LR). Used to fine-tune a drop-trained model with
         # full layers (p_drop=0) to close the train/inference gap.
         ck = torch.load(T.init_from, map_location="cpu", weights_only=False)
-        combine.load_state_dict(ck["combine"]); decoder.load_state_dict(ck["decoder"])
-        ema_combine.load_state_dict(ck["ema_combine"]); ema_dec.load_state_dict(ck["ema_dec"])
+        combine.load_state_dict(ck["combine"])
+        # LoRA renames base params (extra '.base.'); remap + non-strict so base loads and
+        # the fresh LoRA params (absent in ck) stay at init. Plain/freeze -> strict load.
+        _dec_sd = _remap_lora_state(ck["decoder"], decoder) if lora_injected else ck["decoder"]
+        _ema_sd = _remap_lora_state(ck["ema_dec"], ema_dec) if lora_injected else ck["ema_dec"]
+        mk, uk = decoder.load_state_dict(_dec_sd, strict=not lora_injected)
+        ema_dec.load_state_dict(_ema_sd, strict=not lora_injected)
+        ema_combine.load_state_dict(ck["ema_combine"])
         if "disc" in ck:
             disc.load_state_dict(ck["disc"])
         if is_main:
-            print(f"Warm-started weights from {T.init_from} (fresh optimizer, epoch=0)")
+            print(f"Warm-started weights from {T.init_from} (fresh optimizer, epoch=0)"
+                  + (f"; LoRA base loaded, missing={len(mk)} unexpected={len(uk)}" if lora_injected else ""))
         del ck
 
     # SIGReg regularizes the projector's latent -> it only has effect with a
