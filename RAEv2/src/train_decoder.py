@@ -253,6 +253,11 @@ def main():
     # finetune mode (freeze / LoRA) via env; no-op for normal training. MUST run before
     # DDP-wrapping the decoder so frozen params are excluded from DDP grad sync.
     lora_injected = apply_finetune_mode(decoder, is_main)
+    if lora_injected:
+        # _inject_lora() creates fresh nn.Linear adapters AFTER decoder.to(device) above,
+        # so they default to CPU; re-sync the whole tree or DDP() below throws a
+        # cpu/cuda device-mismatch ValueError.
+        decoder = decoder.to(device)
 
     combine_has_params = combine.has_params if hasattr(combine, "has_params") \
         else any(True for _ in combine.parameters())
@@ -520,7 +525,10 @@ def main():
                     fake_aug = disc_aug.aug(x_rec[:half] * 2 - 1)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                 loss_gan = vanilla_g_loss(logits_fake)
-                last_layer = next(reversed(list(decoder_ddp.module.parameters())))
+                # plain last param is frozen under LoRA/freeze finetune modes (grad-less ->
+                # autograd.grad() inside calculate_adaptive_weight throws); use the last
+                # TRAINABLE param instead (== plain last param when nothing is frozen).
+                last_layer = next(reversed([p for p in decoder_ddp.module.parameters() if p.requires_grad]))
                 adp_w = calculate_adaptive_weight(loss_rec, loss_gan, last_layer).clamp(0, 1e4).detach()
             else:
                 adp_w = torch.tensor(0.0, device=device)
