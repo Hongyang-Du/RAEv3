@@ -53,13 +53,19 @@ class _LoRALinear(nn.Module):
         return self.base(x) + self.lora_B(self.lora_A(x)) * self.scaling
 
 
-def _inject_lora(module, targets, r, alpha):
+def _inject_lora(module, targets, r, alpha, skip=(), _prefix=""):
+    """Recursively wrap target nn.Linear leaves with LoRA. Subtrees whose dotted path
+    matches `skip` (e.g. 'decoder_layers.0') are left untouched -> their output is
+    bit-identical (used to preserve h1 = block-0 output that the DiT diffuses in)."""
     n = 0
     for name, child in list(module.named_children()):
+        path = f"{_prefix}.{name}" if _prefix else name
+        if any(path == s or path.startswith(s + ".") for s in skip):
+            continue
         if isinstance(child, nn.Linear) and name in targets:
             setattr(module, name, _LoRALinear(child, r, alpha)); n += 1
         else:
-            n += _inject_lora(child, targets, r, alpha)
+            n += _inject_lora(child, targets, r, alpha, skip, path)
     return n
 
 
@@ -73,13 +79,16 @@ def apply_finetune_mode(decoder, is_main):
     if lora_r > 0:
         alpha = float(os.environ.get("LORA_ALPHA", str(2 * lora_r)))
         targets = set(t for t in os.environ.get("LORA_TARGETS", "query,key,value,dense").split(",") if t)
-        n = _inject_lora(decoder, targets, lora_r, alpha)
+        # skip block 0 (+ embed/cls/pos are frozen below) so h1 = block-0 output is UNCHANGED
+        # -> the DiT that diffuses h1 stays valid. LORA_SKIP="" to LoRA every block instead.
+        skip = [s for s in os.environ.get("LORA_SKIP", "decoder_layers.0").split(",") if s]
+        n = _inject_lora(decoder, targets, lora_r, alpha, skip=skip)
         for name, p in decoder.named_parameters():
             p.requires_grad_(".lora_A." in name or ".lora_B." in name)
         if is_main:
             tr = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
-            print(f"[finetune] LoRA r={lora_r} alpha={alpha} into {n} Linear(s) "
-                  f"targets={sorted(targets)}; trainable decoder={tr/1e6:.3f}M", flush=True)
+            print(f"[finetune] LoRA r={lora_r} alpha={alpha} into {n} Linear(s) targets={sorted(targets)} "
+                  f"skip={skip} (h1 preserved); trainable decoder={tr/1e6:.3f}M", flush=True)
         return True
     if freeze_prefixes:
         nf = 0
