@@ -1,16 +1,17 @@
 """RAEDecoderH1 — move the stage-2 diffusion boundary INTO the decoder.
 
 Instead of diffusing the encoder combine latent z (the standard RAE target), the DiT
-diffuses **h1**: the hidden state after the decoder's FIRST transformer block. The
-remaining decoder blocks (1..N-1) reconstruct the image from h1.
+diffuses **h1**: the hidden state after decoder transformer block `block_idx` (0 by
+default, i.e. the FIRST block). The remaining decoder blocks (block_idx+1..N-1)
+reconstruct the image from h1.
 
   image --(frozen encoder + equal-mean combine)--> z  [B, N, 1024]   (raw, drop off)
-        --decoder_embed + CLS + pos --> block[0] -->  h1 [B, N+1, Cdec]
+        --decoder_embed + CLS + pos --> block[0..block_idx] -->  h1 [B, N+1, Cdec]
   DiT target  = normalized h1 PATCH tokens (CLS dropped) [B, Cdec, H, W]
-  decode(h1)  = [mean-CLS, h1 patches] -> block[1..N-1] -> norm -> pred -> unpatchify
+  decode(h1)  = [mean-CLS, h1 patches] -> block[block_idx+1..N-1] -> norm -> pred -> unpatchify
 
 The spatial DiT (PatchEmbed/unpatchify require T = H*W, a square) cannot carry the extra
-CLS token, so the image-dependent block-0 CLS is replaced at decode time by the
+CLS token, so the image-dependent block_idx-CLS is replaced at decode time by the
 dataset-mean CLS (precomputed by compute_h1_stats.py). No REPA: h1 is already a
 decoder-internal, recon-aligned representation.
 
@@ -26,9 +27,10 @@ from .rae_variants import RAECombine
 
 
 class RAEDecoderH1(RAECombine):
-    def __init__(self, h1_stats_path: str = None, **kwargs):
+    def __init__(self, h1_stats_path: str = None, block_idx: int = 0, **kwargs):
         kwargs.setdefault("drop", False)              # deterministic full-mean latent -> deterministic h1
         super().__init__(**kwargs)
+        self.block_idx = block_idx                    # split point: h1 = output of decoder_layers[block_idx]
         self._ckpt = None
         cdec = self.decoder.decoder_pred.in_features  # decoder_hidden_size (1152 for ViT-XL)
         has_stats = bool(h1_stats_path) and os.path.exists(h1_stats_path)
@@ -54,7 +56,7 @@ class RAEDecoderH1(RAECombine):
 
     @torch.no_grad()
     def _block0(self, images: torch.Tensor) -> torch.Tensor:
-        """images -> h1 [B, N+1, Cdec] (decoder up to and including transformer block 0)."""
+        """images -> h1 [B, N+1, Cdec] (decoder up to and including transformer block_idx)."""
         z = self._combine_tokens(images)              # [B, N, 1024]
         d = self.decoder
         x = d.decoder_embed(z)                         # [B, N, Cdec]
@@ -62,7 +64,9 @@ class RAEDecoderH1(RAECombine):
         cls = d.trainable_cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat([cls, x], dim=1)                 # [B, N+1, Cdec]
         x = x + d.decoder_pos_embed
-        return d.decoder_layers[0](x, head_mask=None)[0]
+        for layer in d.decoder_layers[:self.block_idx + 1]:
+            x = layer(x, head_mask=None)[0]
+        return x
 
     @torch.no_grad()
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -75,7 +79,7 @@ class RAEDecoderH1(RAECombine):
         return (z - self.h1_mean) / torch.sqrt(self.h1_var + self.eps)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """normalized h1 [B, Cdec, H, W] -> image [0,1] via decoder blocks 1..N-1.
+        """normalized h1 [B, Cdec, H, W] -> image [0,1] via decoder blocks block_idx+1..N-1.
         (pos-embed is already baked into h1; the CLS is the dataset-mean substitute.)"""
         z = z * torch.sqrt(self.h1_var + self.eps) + self.h1_mean
         b, c, h, w = z.shape
@@ -83,7 +87,7 @@ class RAEDecoderH1(RAECombine):
         cls = self.mean_cls.to(device=z.device, dtype=z.dtype).expand(b, -1, -1)
         hs = torch.cat([cls, patches], dim=1)          # [B, N+1, Cdec]
         d = self.decoder
-        for layer in d.decoder_layers[1:]:
+        for layer in d.decoder_layers[self.block_idx + 1:]:
             hs = layer(hs, head_mask=None)[0]
         hs = d.decoder_norm(hs)
         logits = d.decoder_pred(hs)[:, 1:, :]          # drop CLS -> [B, N, p*p*3]

@@ -44,7 +44,7 @@ loss:
   sigreg: null
   gan:
     disc_weight: 2
-    disc_start: 0
+    disc_start: 8
 data:
   data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
   image_size: 256

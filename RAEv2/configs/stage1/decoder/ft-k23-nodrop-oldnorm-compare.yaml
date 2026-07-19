@@ -1,0 +1,68 @@
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    weighting: mean          # k23, NO drop (plain sum of all 23 layers)
+    p_drop: 0.0
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 0            # GAN from the first epoch (warm decoder+disc via init_from)
+data:
+  data_dir: /mnt/localssd/compare/imagenet-256   # local A/B subset (4096 imgs, 1 class)
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 6
+  batch_size: 32
+  lr: 1.0e-4               # finetune LR (lower than the 2e-4 from-scratch runs)
+  warmup_epochs: 0
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 10
+  seed: 42
+  # warm-start decoder+combine+ema+disc from the trained OmniRAE p0.3 checkpoint.
+  init_from: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-p0.3/ckpt_ep016.pt
+  out_dir: /mnt/localssd/compare/ckpt-PLACEHOLDER
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: false
+  project: raev3-full
+  entity: uscgvl
+  name: omni-ft-k23-compare
