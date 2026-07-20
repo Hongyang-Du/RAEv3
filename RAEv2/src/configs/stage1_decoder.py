@@ -63,6 +63,18 @@ class DataConfig:
 
 
 @dataclass
+class MaskCondConfig:
+    """Mask conditioning (Variant A): the trainer samples stratified per-sample
+    layer masks, builds z from the masked mean AND feeds the same mask to the
+    decoder via MaskEmbedder + zero-init AdaLN (stage1/mask_cond.py). None ->
+    everything unchanged (unconditional random-drop training)."""
+    d_c: int = 256                # condition dim (small: shared AdaLN head keeps params <1%)
+    cond_drop: float = 0.1        # CFG-style: replace c with learned null embedding
+    full_frac: float = 1 / 3      # stratified sampler: all-ones (full feed) group
+    uniform_frac: float = 1 / 3   # |S| ~ Uniform{1..K} group; remainder = iid Bernoulli(p_drop)
+
+
+@dataclass
 class PDropScheduleConfig:
     """Anneal MLSCombine.p_drop from `start` to `end` over training. Supports both
     a<b (0.1->0.9) and a>b (0.9->0.1). When p_drop_schedule is None the static
@@ -115,3 +127,4 @@ class DecoderConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     probe: ProbeConfig = field(default_factory=ProbeConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    mask_cond: Optional[MaskCondConfig] = None   # Variant A mask conditioning; None = off

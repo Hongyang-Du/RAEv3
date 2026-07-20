@@ -6,12 +6,13 @@ from transformers import AutoConfig
 from encoders.vision_encoder import create_encoder
 from .decoders import GeneralDecoder
 
-def _load_decoder(config_path, hidden_size, patch_size, num_patches, pretrained_path=None):
+def _load_decoder(config_path, hidden_size, patch_size, num_patches, pretrained_path=None,
+                  mask_cond=None):
     config = AutoConfig.from_pretrained(config_path)
     config.hidden_size = hidden_size
     config.patch_size = patch_size
     config.image_size = int(patch_size * sqrt(num_patches))
-    decoder = GeneralDecoder(config, num_patches=num_patches)
+    decoder = GeneralDecoder(config, num_patches=num_patches, mask_cond=mask_cond)
     if pretrained_path is not None:
         print(f"Loading pretrained decoder from {pretrained_path}")
         state_dict = torch.load(pretrained_path, map_location='cpu', weights_only=False)

@@ -57,6 +57,9 @@ def main():
     ap.add_argument("--num-images", type=int, default=None)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--null-cond", action="store_true",
+                    help="mask-cond ckpts: decode with the learned null embedding instead of "
+                         "the matched mask (A/B baseline; net conditioning contribution)")
     args = ap.parse_args()
     device = torch.device("cuda")
 
@@ -98,8 +101,17 @@ def main():
     params = OmegaConf.to_container(cfg.combine.params, resolve=True)
     combine = get_obj_from_str(cfg.combine.target)(**params).to(device).eval()
     combine.load_state_dict(ck["ema_combine"])
+    # auto-detect mask conditioning from the ckpt (mask_embedder.layer_emb [K, d_c])
+    # so the decoder is rebuilt to match and every subset eval passes the matched
+    # k-hot mask -- the c/z-consistency rule.
+    mc_emb = ck["ema_dec"].get("mask_embedder.layer_emb")
+    mask_cond = {"K": mc_emb.shape[0], "d_c": mc_emb.shape[1]} if mc_emb is not None else None
+    if mask_cond:
+        print(f"  mask_cond detected (K={mask_cond['K']}, d_c={mask_cond['d_c']})"
+              + ("  [NULL-cond A/B]" if args.null_cond else "  [matched-mask cond]"), flush=True)
     dec = _load_decoder("configs/decoder/ViTXL", hidden_size=1024, patch_size=16,
-                        num_patches=256, pretrained_path=None).to(device).eval()
+                        num_patches=256, pretrained_path=None,
+                        mask_cond=mask_cond).to(device).eval()
     dec.load_state_dict(ck["ema_dec"])
     del ck
 
@@ -119,7 +131,11 @@ def main():
                     (imgs - mean) / std, n=layers, reshape=False,
                     return_class_token=False, norm=True))
                 z = combine(toks, idx=idx)
-                out = dec(z, drop_cls_token=False).logits
+                lm = None
+                if mask_cond and not args.null_cond:      # matched k-hot conditioning
+                    lm = torch.zeros(imgs.shape[0], len(layers), dtype=torch.bool, device=device)
+                    lm[:, idx if idx is not None else slice(None)] = True
+                out = dec(z, drop_cls_token=False, layer_mask=lm).logits
                 rec = dec.unpatchify(out) * std + mean
             rec = rec.clamp(0, 1).float()                  # metrics in fp32 (bf16 SSIM is wrong)
             psnrs.append(per_image_psnr(rec, imgs))
@@ -137,6 +153,7 @@ def main():
     out = args.out or ckpt_path.replace(".pt", f"_recon{('_'+tag) if tag else ''}.json")
     with open(out, "w") as f:
         json.dump({"ckpt": ckpt_path, "tag": tag, "eval_layers": used, "num_images": n_done,
+                   "mask_cond": bool(mask_cond), "null_cond": bool(args.null_cond),
                    "psnr_mean": psnr.mean().item(), "psnr_std": psnr.std().item(),
                    "ssim": ssim}, f, indent=2)
     print(f"json -> {out}")

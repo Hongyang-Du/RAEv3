@@ -40,6 +40,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .mask_cond import sample_stratified_masks
+
 
 class MLSCombine(nn.Module):
     def __init__(self,
@@ -98,9 +100,17 @@ class MLSCombine(nn.Module):
     def has_params(self) -> bool:
         return any(True for _ in self.parameters())
 
-    def _mix(self, stk, idx):
+    def _mix(self, stk, idx, mask=None):
         """stk [K, B, N, dim] -> z0 [B, N, dim] (weighted combine over layers)."""
         K, B = stk.shape[0], stk.shape[1]
+
+        # external per-sample mask [B, K] (mask-conditioning trainer samples it once
+        # so latent and decoder conditioning provably share the same mask). Same
+        # renormalized masked mean as the internal random_drop path.
+        if mask is not None:
+            w = mask.to(stk.dtype).t()                       # [K, B]
+            w = w / w.sum(0, keepdim=True).clamp_min(1e-6)
+            return (w.view(K, B, 1, 1) * stk).sum(0)
 
         # learned_gate: deterministic softmax-weighted mean, grad flows to gate_logits.
         if self.weighting == "learned_gate":
@@ -160,9 +170,9 @@ class MLSCombine(nn.Module):
         sigma = self.noise_tau * torch.rand((z.size(0),) + (1,) * (z.dim() - 1), device=z.device)
         return z + sigma * torch.randn_like(z)
 
-    def forward(self, layer_tokens, idx=None) -> torch.Tensor:
+    def forward(self, layer_tokens, idx=None, mask=None) -> torch.Tensor:
         stk = torch.stack(layer_tokens, dim=0)              # [K, B, N, dim]
-        z0 = self._mix(stk, idx)                            # [B, N, dim]
+        z0 = self._mix(stk, idx, mask=mask)                 # [B, N, dim]
         if self.cls_surrogate:
             z0 = z0 + stk[-1].mean(dim=1, keepdim=True)     # raev2 L_last token-mean (fixed)
 
@@ -175,3 +185,127 @@ class MLSCombine(nn.Module):
         h = self.fc1(z0)
         h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
         return self._noise(self.skip(z0) + self.fc2(F.gelu(h)), idx)
+
+
+# ---------------------------------------------------------------------------
+# Variant B: per-position depth attention (learned token-level fusion)
+# ---------------------------------------------------------------------------
+
+class DepthAttnBlock(nn.Module):
+    """One depth-attention refinement block: the fused query token cross-attends
+    over the K per-layer tokens at its own spatial position. The attention
+    out-projection AND the FFN output are zero-init -> the block is an exact
+    no-op at init (residual around the query)."""
+
+    def __init__(self, dim: int, n_heads: int, mlp_mult: int):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, mlp_mult * dim), nn.GELU(),
+                                 nn.Linear(mlp_mult * dim, dim))
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+
+    def forward(self, q, kv, pad):                   # q [S,1,d]  kv [S,K,d]  pad [S,K]
+        kvn = self.norm_kv(kv)
+        a, _ = self.attn(self.norm_q(q), kvn, kvn,
+                         key_padding_mask=pad, need_weights=False)
+        q = q + a
+        return q + self.ffn(self.norm_ffn(q))
+
+
+class DepthAttnFusion(nn.Module):
+    """fused = masked_mean + AttnBlocks(query=masked_mean, kv=per-layer tokens).
+
+    Pure reshape: (K, B, N, d) -> (B*N, K, d) sequences on the DEPTH axis; dropped
+    layers are key_padding_mask'ed out per sample. A learnable depth embedding
+    tells attention WHICH layer each kv token came from (it only reaches the
+    output through the zero-init projections, so init identity is preserved)."""
+
+    def __init__(self, dim: int, K: int, n_layers: int, n_heads: int, mlp_mult: int):
+        super().__init__()
+        self.depth_pos = nn.Parameter(torch.randn(K, dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [DepthAttnBlock(dim, n_heads, mlp_mult) for _ in range(n_layers)])
+
+    def forward(self, z0, stk, mask):                # z0 [B,N,d] stk [K,B,N,d] mask [B,K]
+        K, B, N, d = stk.shape
+        kv = stk.permute(1, 2, 0, 3).reshape(B * N, K, d) + self.depth_pos
+        q = z0.reshape(B * N, 1, d)
+        pad = (~mask.bool()).repeat_interleave(N, dim=0)          # [B*N, K], True = drop
+        for blk in self.blocks:
+            q = blk(q, kv, pad)
+        return q.reshape(B, N, d)
+
+
+class DepthAttnCombine(nn.Module):
+    """Variant B combine: no lossy mean bottleneck -- the decoder-facing latent is
+    the masked mean PLUS a learned per-position depth-attention correction over
+    the kept layers' tokens. Mirrors the MLSCombine interface (forward(tokens,
+    idx=, mask=), has_params, p_drop) so train_decoder.py / eval scripts work
+    unchanged.
+
+    Warm-start: init_from an UNconditional random-drop ckpt (param-free MLSCombine
+    -> empty combine state_dict); the fresh `fusion.*` params are zero-init no-ops,
+    so step 0 == the anchor's equal-weight masked mean (+ cls surrogate).
+
+    Collapse note (Fig 2): a bare learned gate collapses to shallow layers, but
+    only because they are always present; under random drop the missing layers
+    cannot be leaned on -- dropout is what keeps this learned fusion honest. Still,
+    start the GAN a bit late (disc_start >= 1): Fig 2 shows GAN accelerates
+    collapse before the fusion settles.
+
+    Training masks are sampled INTERNALLY with the same stratified sampler as
+    Variant A (full / uniform-|S| / Bernoulli) unless an external `mask` is
+    passed (the mask_cond trainer path, enabling an A+B combo)."""
+
+    def __init__(self,
+                 layers,
+                 p_drop: float = 0.3,
+                 full_frac: float = 1 / 3,
+                 uniform_frac: float = 1 / 3,
+                 cls_surrogate: bool = False,
+                 dim: int = 1024,
+                 out_dim: int = 1024,
+                 n_layers: int = 2,
+                 n_heads: int = 8,
+                 mlp_mult: int = 2):
+        super().__init__()
+        assert dim == out_dim, "DepthAttnCombine is residual around the mean: dim must equal out_dim"
+        self.layers = list(layers)
+        self.K = len(self.layers)
+        self.p_drop = p_drop                       # trainer's p_drop schedule hooks this
+        self.full_frac = full_frac
+        self.uniform_frac = uniform_frac
+        self.cls_surrogate = cls_surrogate
+        self.fusion = DepthAttnFusion(dim, self.K, n_layers, n_heads, mlp_mult)
+
+    @property
+    def has_params(self) -> bool:
+        return True
+
+    def forward(self, layer_tokens, idx=None, mask=None) -> torch.Tensor:
+        stk = torch.stack(layer_tokens, dim=0)     # [K, B, N, dim]
+        K, B = stk.shape[0], stk.shape[1]
+        if mask is None:
+            if idx is not None:                    # probe/eval subset -> k-hot
+                mask = torch.zeros(B, K, dtype=torch.bool, device=stk.device)
+                mask[:, list(idx)] = True
+            elif self.training and self.p_drop > 0:
+                mask = sample_stratified_masks(B, K, self.p_drop,
+                                               full_frac=self.full_frac,
+                                               uniform_frac=self.uniform_frac,
+                                               device=stk.device)
+            else:                                  # eval, full feed
+                mask = torch.ones(B, K, dtype=torch.bool, device=stk.device)
+        w = mask.to(stk.dtype).t()                 # [K, B]
+        w = w / w.sum(0, keepdim=True).clamp_min(1e-6)
+        z0 = (w.view(K, B, 1, 1) * stk).sum(0)     # masked equal-weight mean
+        z = self.fusion(z0, stk, mask)
+        if self.cls_surrogate:
+            z = z + stk[-1].mean(dim=1, keepdim=True)   # raev2 L_last token-mean (fixed)
+        return z

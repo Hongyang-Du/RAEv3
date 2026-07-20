@@ -230,7 +230,26 @@ class ViTMAELayer(nn.Module):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        ada: Optional[Tuple[torch.Tensor, ...]] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        if ada is not None:
+            # AdaLN mask conditioning (see stage1/mask_cond.py). (1+gate)/(1+scale)
+            # parameterization: with the zero-init head every s/b/g is 0 and this
+            # path is function-identical to the unconditional one below -> a
+            # warm-started checkpoint is unchanged at step 0.
+            s1, b1, g1, s2, b2, g2 = (t.unsqueeze(1) for t in ada)   # [B,1,d]
+            h = self.layernorm_before(hidden_states) * (1 + s1) + b1
+            self_attention_outputs = self.attention(h, head_mask, output_attentions=output_attentions)
+            outputs = self_attention_outputs[1:]
+            hidden_states = hidden_states + (1 + g1) * self_attention_outputs[0]
+
+            h = self.layernorm_after(hidden_states) * (1 + s2) + b2
+            # ViTMAEOutput adds the residual internally; replicate dense+dropout so
+            # the gate scales only the branch delta.
+            delta = self.output.dropout(self.output.dense(self.intermediate(h)))
+            layer_output = hidden_states + (1 + g2) * delta
+            return (layer_output,) + outputs
+
         self_attention_outputs = self.attention(
             self.layernorm_before(hidden_states),  # in ViTMAE, layernorm is applied before self-attention
             head_mask,
@@ -255,7 +274,7 @@ class ViTMAELayer(nn.Module):
 
 
 class GeneralDecoder(nn.Module):
-    def __init__(self, config, num_patches):
+    def __init__(self, config, num_patches, mask_cond=None):
         super().__init__()
         self.decoder_embed = nn.Linear(config.hidden_size, config.decoder_hidden_size, bias=True)
         self.decoder_pos_embed = nn.Parameter(
@@ -281,6 +300,25 @@ class GeneralDecoder(nn.Module):
         self.initialize_weights(num_patches)
         self.decoder_config = decoder_config
         self.set_trainable_cls_token()
+
+        # -- optional mask conditioning (Variant A, stage1/mask_cond.py) ----------
+        # mask_cond = {"K": <num encoder layers>, "d_c": <cond dim>}. A shared
+        # zero-init AdaLN head (d_c -> 6*d) + per-block diagonal gain/bias keeps
+        # the overhead ~2.4M (<1% of ViT-XL) so matched-parameter comparisons hold.
+        self.mask_cond = mask_cond is not None
+        if self.mask_cond:
+            from ..mask_cond import MaskEmbedder
+            d = config.decoder_hidden_size
+            n_blocks = config.decoder_num_hidden_layers
+            self.mask_embedder = MaskEmbedder(mask_cond["K"], mask_cond["d_c"])
+            self.null_cond = nn.Parameter(torch.zeros(mask_cond["d_c"]))
+            self.ada_shared = nn.Sequential(
+                nn.SiLU(), nn.Linear(mask_cond["d_c"], mask_cond["d_c"]),
+                nn.SiLU(), nn.Linear(mask_cond["d_c"], 6 * d))
+            nn.init.zeros_(self.ada_shared[-1].weight)      # zero-init: step-0 identity
+            nn.init.zeros_(self.ada_shared[-1].bias)
+            self.ada_gain = nn.Parameter(torch.ones(n_blocks, 6 * d))
+            self.ada_bias = nn.Parameter(torch.zeros(n_blocks, 6 * d))
     def set_trainable_cls_token(self, tensor: Optional[torch.Tensor] = None):
         # register a trainable CLS token
         tensor = torch.zeros(1, 1, self.decoder_config.hidden_size) if tensor is None else tensor
@@ -398,7 +436,30 @@ class GeneralDecoder(nn.Module):
         return_dict=True,
         interpolate_pos_encoding: bool = False,
         drop_cls_token: bool = False,
+        layer_mask: Optional[torch.Tensor] = None,
+        cond_drop: Optional[torch.Tensor] = None,
     ):
+        # -- mask conditioning: k-hot layer_mask [B, K] -> per-block AdaLN params --
+        # layer_mask MUST be the same mask that built the latent z (c/z consistency).
+        # layer_mask=None with mask_cond built -> all rows use the learned null
+        # embedding (the CFG-style unconditional branch / A-B baseline). cond_drop
+        # [B] bool replaces those rows' c with null (training-time CFG dropout);
+        # torch.where keeps both branches in the graph -> DDP-safe.
+        ada_mods = None
+        if self.mask_cond:
+            B = hidden_states.shape[0]
+            if layer_mask is None:
+                c = self.null_cond.unsqueeze(0).expand(B, -1)
+            else:
+                c = self.mask_embedder(layer_mask)
+                if cond_drop is not None:
+                    c = torch.where(cond_drop[:, None], self.null_cond.unsqueeze(0), c)
+            mods = self.ada_shared(c)                                  # [B, 6d]
+            ada_mods = [(mods * g + b).chunk(6, dim=-1)                # per block: 6 x [B, d]
+                        for g, b in zip(self.ada_gain, self.ada_bias)]
+        elif layer_mask is not None:
+            raise ValueError("layer_mask given but decoder was built without mask_cond")
+
         # embed tokens
         x = self.decoder_embed(hidden_states)
         if drop_cls_token:
@@ -422,15 +483,18 @@ class GeneralDecoder(nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
+            ada = ada_mods[i] if ada_mods is not None else None
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     layer_module.__call__,
                     hidden_states,
                     None,
                     output_attentions,
+                    ada,
                 )
             else:
-                layer_outputs = layer_module(hidden_states, head_mask=None, output_attentions=output_attentions)
+                layer_outputs = layer_module(hidden_states, head_mask=None,
+                                             output_attentions=output_attentions, ada=ada)
 
             hidden_states = layer_outputs[0]
 

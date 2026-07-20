@@ -27,6 +27,7 @@ from torchvision import transforms
 from configs.stage1_decoder import DecoderConfig, PDropScheduleConfig
 from encoders.vision_encoder import create_encoder
 from stage1.rae import _load_decoder
+from stage1.mask_cond import sample_stratified_masks
 from stage1.disc import DinoDiscriminator, hinge_d_loss, vanilla_g_loss, calculate_adaptive_weight
 from stage1.disc.diffaug import DiffAug
 from stage1.disc.lpips import LPIPS as LPIPS_
@@ -245,10 +246,18 @@ def main():
     # -- combine (instantiated from config) + decoder (from scratch) -----------
     from utils.model_utils import get_obj_from_str
     combine = get_obj_from_str(C.target)(**C.params).to(device)
+    MC = cfg.mask_cond                       # None = unconditional (unchanged path)
     decoder = _load_decoder(cfg.decoder.config_path, hidden_size=latent_dim,
                             patch_size=cfg.decoder.patch_size,
                             num_patches=cfg.decoder.num_patches,
-                            pretrained_path=None).to(device)
+                            pretrained_path=None,
+                            mask_cond={"K": len(layers), "d_c": MC.d_c} if MC else None).to(device)
+    if MC and is_main:
+        n_mc = sum(p.numel() for n, p in decoder.named_parameters()
+                   if n.startswith(("mask_embedder.", "null_cond", "ada_")))
+        print(f"[mask_cond] d_c={MC.d_c} cond_drop={MC.cond_drop} "
+              f"sampler=(full {MC.full_frac:.2f} / uniform {MC.uniform_frac:.2f} / "
+              f"bernoulli {1 - MC.full_frac - MC.uniform_frac:.2f})  +{n_mc/1e6:.2f}M params", flush=True)
 
     # finetune mode (freeze / LoRA) via env; no-op for normal training. MUST run before
     # DDP-wrapping the decoder so frozen params are excluded from DDP grad sync.
@@ -369,14 +378,41 @@ def main():
         # new optimizer/scheduler/LR). Used to fine-tune a drop-trained model with
         # full layers (p_drop=0) to close the train/inference gap.
         ck = torch.load(T.init_from, map_location="cpu", weights_only=False)
-        combine.load_state_dict(ck["combine"])
+
+        # Depth-attn (Variant B) warm-start from a param-free-combine ckpt: the
+        # fusion.* params are absent in ck and stay at their zero-init no-op ->
+        # step 0 == the anchor's masked mean. Anything else missing is a bug.
+        def _load_warm_combine(mod, sd, tag):
+            if set(sd.keys()) == set(mod.state_dict().keys()):
+                mod.load_state_dict(sd)
+                return 0
+            _mk, _uk = mod.load_state_dict(sd, strict=False)
+            _bad = [k for k in _mk if not k.startswith("fusion.")]
+            assert not _bad and not _uk, \
+                f"init_from {tag} mismatch beyond fusion modules: missing={_bad} unexpected={list(_uk)}"
+            return len(_mk)
+
+        n_fresh_comb = _load_warm_combine(combine, ck["combine"], "combine")
         # LoRA renames base params (extra '.base.'); remap + non-strict so base loads and
         # the fresh LoRA params (absent in ck) stay at init. Plain/freeze -> strict load.
+        # mask_cond warm-start from an UNconditional ckpt: also non-strict; the zero-init
+        # AdaLN makes the step-0 model function-identical to the loaded ckpt. Fail loudly
+        # if anything besides the cond modules is missing.
+        _mc_prefixes = ("mask_embedder.", "null_cond", "ada_shared.", "ada_gain", "ada_bias")
         _dec_sd = _remap_lora_state(ck["decoder"], decoder) if lora_injected else ck["decoder"]
         _ema_sd = _remap_lora_state(ck["ema_dec"], ema_dec) if lora_injected else ck["ema_dec"]
-        mk, uk = decoder.load_state_dict(_dec_sd, strict=not lora_injected)
-        ema_dec.load_state_dict(_ema_sd, strict=not lora_injected)
-        ema_combine.load_state_dict(ck["ema_combine"])
+        _strict = not (lora_injected or MC)
+        mk, uk = decoder.load_state_dict(_dec_sd, strict=_strict)
+        ema_dec.load_state_dict(_ema_sd, strict=_strict)
+        if MC and not lora_injected:
+            bad = [k for k in mk if not k.startswith(_mc_prefixes)]
+            assert not bad and not uk, \
+                f"init_from mismatch beyond mask_cond modules: missing={bad} unexpected={list(uk)}"
+            if is_main:
+                print(f"[mask_cond] warm-start: {len(mk)} cond params fresh (zero-init identity)", flush=True)
+        _load_warm_combine(ema_combine, ck["ema_combine"], "ema_combine")
+        if n_fresh_comb and is_main:
+            print(f"[depth_attn] warm-start: {n_fresh_comb} fusion params fresh (zero-init no-op)", flush=True)
         if "disc" in ck:
             disc.load_state_dict(ck["disc"])
         if is_main:
@@ -394,8 +430,8 @@ def main():
     use_sig = L.sigreg is not None and combine_has_params
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=(T.precision == "bf16"))
 
-    def decode_imgs(dec, z):
-        out = dec(z, drop_cls_token=False).logits
+    def decode_imgs(dec, z, layer_mask=None, cond_drop=None):
+        out = dec(z, drop_cls_token=False, layer_mask=layer_mask, cond_drop=cond_drop).logits
         m = dec.module if isinstance(dec, DDP) else dec
         return (m.unpatchify(out) * enc_std + enc_mean).clamp(0, 1)
 
@@ -411,6 +447,18 @@ def main():
             return [_to_cpu(v) for v in obj]
         return obj
 
+    def _mask_for(idx, B):
+        """Conditioning mask matching a probe subset (None = full feed). c/z must
+        share the mask, so every val decode with a subset idx passes the k-hot."""
+        if not MC:
+            return None
+        m = torch.zeros(B, len(layers), dtype=torch.bool, device=device)
+        if idx is None:
+            m[:] = True
+        else:
+            m[:, list(idx)] = True
+        return m
+
     def _async_val_save(sn_combine, sn_dec, ckpt_cpu, ep, gstep, do_probe):
         wb = None
         if cfg.wandb.enabled:
@@ -418,7 +466,8 @@ def main():
         # -- demo val
         if val_layers_fixed is not None:
             with torch.no_grad():
-                vrec = decode_imgs(sn_dec, sn_combine(val_layers_fixed))
+                vrec = decode_imgs(sn_dec, sn_combine(val_layers_fixed),
+                                   layer_mask=_mask_for(None, val_img_orig.shape[0]))
             vps_demo = psnr(vrec, val_img_orig)
             print(f"  [val ep{ep}] PSNR (EMA, {vrec.shape[0]} demo imgs): {vps_demo:.2f} dB", flush=True)
             if wb is not None:
@@ -426,17 +475,27 @@ def main():
         # -- val-N subset (functional SSIM: no Metric.compute() PG sync)
         if val_eval_imgs is not None:
             from torchmetrics.functional.image import structural_similarity_index_measure as _ssim_fn
-            psnrs, ssims = [], []
+            psnrs, ssims, psnrs_null = [], [], []
             with torch.no_grad():
                 for i in range(0, val_eval_imgs.shape[0], 32):
                     vb = val_eval_imgs[i:i + 32].to(device).float() / 255
-                    rec = decode_imgs(sn_dec, sn_combine(encode_layers(vb))).clamp(0, 1).float()
+                    zv = sn_combine(encode_layers(vb))
+                    rec = decode_imgs(sn_dec, zv, layer_mask=_mask_for(None, vb.shape[0])).clamp(0, 1).float()
                     mse = ((rec - vb) ** 2).flatten(1).mean(1)
                     psnrs.append(-10.0 * torch.log10(mse + 1e-10))
                     ssims.append(_ssim_fn(rec, vb, data_range=1.0).item() * rec.shape[0])
+                    if MC:   # null-embedding A/B: the net conditioning contribution
+                        rec0 = decode_imgs(sn_dec, zv).clamp(0, 1).float()
+                        mse0 = ((rec0 - vb) ** 2).flatten(1).mean(1)
+                        psnrs_null.append(-10.0 * torch.log10(mse0 + 1e-10))
             vpsnr = torch.cat(psnrs).mean().item()
             vssim = sum(ssims) / val_eval_imgs.shape[0]
             print(f"  [val ep{ep}] PSNR (EMA, {D.val_n} val imgs): {vpsnr:.3f} dB  SSIM={vssim:.4f}", flush=True)
+            if MC:
+                vpsnr0 = torch.cat(psnrs_null).mean().item()
+                print(f"  [val ep{ep}] PSNR null-cond: {vpsnr0:.3f} dB  (cond gain {vpsnr - vpsnr0:+.3f})", flush=True)
+                if wb is not None:
+                    wb.log({"val/psnr_null": vpsnr0, "val/step": gstep})
             tsv = os.path.join(T.out_dir, "val_psnr_steps.tsv")
             if not os.path.exists(tsv):
                 with open(tsv, "w") as f:
@@ -448,9 +507,12 @@ def main():
         # -- LOO/solo probes (final epoch only by default)
         if do_probe and val_layers_fixed is not None:
             with torch.no_grad():
+                _vB = val_img_orig.shape[0]
                 def _sub_psnr(idx):
-                    return psnr(decode_imgs(sn_dec, sn_combine(val_layers_fixed, idx=idx)), val_img_orig)
-                full = psnr(decode_imgs(sn_dec, sn_combine(val_layers_fixed)), val_img_orig)
+                    return psnr(decode_imgs(sn_dec, sn_combine(val_layers_fixed, idx=idx),
+                                            layer_mask=_mask_for(idx, _vB)), val_img_orig)
+                full = psnr(decode_imgs(sn_dec, sn_combine(val_layers_fixed),
+                                        layer_mask=_mask_for(None, _vB)), val_img_orig)
                 K = len(val_layers_fixed)
                 loo = [_sub_psnr([j for j in range(K) if j != i]) for i in range(K)]
                 solo = [_sub_psnr([i]) for i in range(K)]
@@ -506,9 +568,20 @@ def main():
             if pdrop_dynamic:                       # anneal random-drop rate start->end
                 combine.p_drop = p_drop_at(global_step)
 
+            if MC:
+                # mask conditioning: sample the stratified mask ONCE, use it for both
+                # the latent (masked mean) and the decoder conditioning; 10% of rows
+                # swap c for the learned null embedding (CFG-style cond dropout).
+                m_layers = sample_stratified_masks(
+                    imgs.shape[0], len(layers), combine.p_drop,
+                    full_frac=MC.full_frac, uniform_frac=MC.uniform_frac, device=device)
+                drop_cond = torch.rand(imgs.shape[0], device=device) < MC.cond_drop
+            else:
+                m_layers = drop_cond = None
+
             with autocast_ctx:
-                z = combine_ddp(layer_tokens)
-                x_rec = decode_imgs(decoder_ddp, z)
+                z = combine_ddp(layer_tokens, mask=m_layers) if MC else combine_ddp(layer_tokens)
+                x_rec = decode_imgs(decoder_ddp, z, layer_mask=m_layers, cond_drop=drop_cond)
                 loss_l1 = F.l1_loss(x_rec, imgs)
                 loss_lpips = lpips_all(x_rec * 2 - 1, imgs * 2 - 1).mean()
             loss_rec = loss_l1 + L.lpips_w * loss_lpips

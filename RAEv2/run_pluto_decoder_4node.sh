@@ -69,6 +69,8 @@ case "${1:-}" in
   nano-drop-k7-p03) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p03-oldnorm.yaml ;;  # native k7 (7-layer) random-drop p_drop=0.3
   nano-drop-k7-p01) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p01-oldnorm.yaml ;;  # native k7 (7-layer) random-drop p_drop=0.1
   nano-drop-p03-ganheavy) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-ganheavy-oldnorm.yaml ;;  # k23 p_drop=0.3 w/ disc_weight 4.0 + disc_start=0
+  nano-drop-p03-maskcond) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-maskcond-oldnorm.yaml ;;  # Variant A mask conditioning (AdaLN), from scratch, anchor 16ep recipe
+  nano-drop-p03-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-depthattn-oldnorm.yaml ;;  # Variant B depth-attn fusion, from scratch, anchor 16ep recipe
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
