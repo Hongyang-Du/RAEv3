@@ -81,7 +81,7 @@ def main():
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
     ])
-    needs_transform = config.dataset.type not in ("hf", "wds")
+    needs_transform = config.dataset.type not in ("hf", "wds", "latent_cache")
     # train dataloader
     dataloader = prepare_unified_dataloader(
         config=dataclasses.asdict(config.dataset),

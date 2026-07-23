@@ -85,6 +85,19 @@ def train_one_epoch(
     if do_eval: eval_dir = config.eval.eval_dir
     experiment_name = os.environ.get("EXPERIMENT_NAME")
 
+    # dataset.target == "latent_cache": dataloader already yields (latent, label) from
+    # scripts/stage1/precompute_latents.py -- skip the per-step stage_1.encode() forward
+    # entirely. Only valid for a deterministic frozen latent (no gate grad, no raw-pixel
+    # REPA target, no raw-pixel denoise-probe capture).
+    use_cached_latents = getattr(config.dataset, "target", None) == "latent_cache"
+    if use_cached_latents:
+        assert not (gate_optimizer is not None and getattr(rae, "has_learnable_gate", False)), \
+            "latent_cache dataset + learned_gate is incompatible: the gate needs a grad-enabled " \
+            "encode_train() over raw images, which cached latents cannot provide."
+        assert not config.repa.use_repa, \
+            "latent_cache dataset + REPA is incompatible: REPA needs the raw image for its own " \
+            "target encoder, which isn't stored in the cache."
+
     # Get null conditions for CFG dropout
     if config.conditioning.type == "nwm":
         model_kwargs_null = nwm_cond.null_context(config, micro_batch_size, device)
@@ -137,7 +150,9 @@ def train_one_epoch(
         # encode_train); otherwise the latent is the frozen, detached diffusion target.
         use_gate = gate_optimizer is not None and getattr(rae, "has_learnable_gate", False)
         z_tokens = None
-        if use_gate:
+        if use_cached_latents:
+            z = images  # dataloader already yielded the normalized post-combine latent
+        elif use_gate:
             z, z_tokens = rae.encode_train(images)
         else:
             with torch.no_grad():
@@ -158,8 +173,10 @@ def train_one_epoch(
             else:
                 first_capture = viz_fixed['context'] is None
                 viz_fixed = get_fixed_viz_batch_conditions(viz_fixed, y, config.conditioning.type, text_encoder, device)
-                # fixed images (aligned with the captured labels) for the denoise probe
-                if first_capture and config.conditioning.type == "label":
+                # fixed images (aligned with the captured labels) for the denoise probe --
+                # unavailable in latent_cache mode (no raw pixels in the cache), so the
+                # probe_imgs-gated denoise-probe logging block later just stays skipped.
+                if first_capture and config.conditioning.type == "label" and not use_cached_latents:
                     viz_fixed['probe_imgs'] = images[:viz_fixed['zs'].shape[0]].clone()
 
         # Encode conditions

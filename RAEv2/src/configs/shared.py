@@ -61,7 +61,7 @@ class SchedulerConfig:
 class DatasetConfig:
     """Dataset configuration (shared across all training)."""
     target: str = "imagenet"
-    type: str = "hf"  # ["hf", "wds"]
+    type: str = "hf"  # ["hf", "wds", "latent_cache"]
     data_dir: str = "./data"
     split: Any = "train"
     condition_type: Optional[str] = None  # "label", "text", or "nwm"

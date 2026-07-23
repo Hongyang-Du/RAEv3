@@ -3,8 +3,10 @@
 from .blip3o_wds_dataset import BLIP3O_METADATA, BLIP3OWebDataset
 from .imagenet_classes import IMAGENET_CLASSES
 from .imagenet_hf_dataset import ImageNetHFDataset
+from .latent_cache_dataset import LatentCacheDataset
 from .unified_dataloader import (
     DataloaderResult,
+    LatentCacheDataloaderResult,
     MixedDataloader,
     prepare_unified_dataloader,
 )
@@ -15,6 +17,8 @@ __all__ = [
     "IMAGENET_CLASSES",
     "prepare_unified_dataloader",
     "DataloaderResult",
+    "LatentCacheDataloaderResult",
+    "LatentCacheDataset",
     "MixedDataloader",
     "BLIP3OWebDataset",
     "BLIP3O_METADATA",

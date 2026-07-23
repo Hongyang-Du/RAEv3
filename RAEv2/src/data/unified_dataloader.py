@@ -68,6 +68,18 @@ class DataloaderResult:
         return iter(self.loader)
 
 
+@dataclass
+class LatentCacheDataloaderResult(DataloaderResult):
+    """DataloaderResult variant for LatentCacheDataset: set_epoch reseeds the
+    dataset's shard/sample shuffling directly (neither the sampler nor wds
+    pipeline paths in the base class apply to a plain IterableDataset)."""
+    _latent_dataset: Optional[object] = field(default=None, repr=False)
+
+    def set_epoch(self, epoch: int):
+        if self._latent_dataset is not None:
+            self._latent_dataset.set_epoch(epoch)
+
+
 class _ArrowEvalDataset(Dataset):
     """Map-style dataset that loads an HF Arrow dir directly.
 
@@ -223,6 +235,8 @@ def prepare_unified_dataloader(
         result = _prepare_nwm_loader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
         )
+    elif target == "latent_cache":
+        result = _prepare_latent_cache_loader(config, batch_size, num_workers, world_size)
     else:
         raise ValueError(f"Unknown dataset target: {target!r}")
     result.virtual_epoch_steps = virtual_epoch_steps
@@ -497,6 +511,47 @@ def _prepare_nwm_loader(
         sampler=sampler,
         dataset_size=len(dataset),
         is_iterable=False,
+    )
+
+
+def _prepare_latent_cache_loader(
+    config: dict,
+    batch_size: int,
+    num_workers: int,
+    world_size: int,
+) -> "LatentCacheDataloaderResult":
+    """Prepare a loader over latents precomputed by scripts/stage1/precompute_latents.py.
+
+    Yields (latent, label) directly -- no image, no transform, no stage_1.encode()
+    call needed in the training loop (see stage2/engine.py's use_cached_latents branch).
+    """
+    from .latent_cache_dataset import LatentCacheDataset
+
+    latents_dir = config.get("data_dir") or config.get("latents_dir")
+    if not latents_dir:
+        raise ValueError("latent_cache target requires `data_dir` pointing at the precomputed latents dir")
+    split = config.get("split", "train")
+    seed = config.get("seed", 42)
+
+    dataset = LatentCacheDataset(latents_dir=latents_dir, split=split, seed=seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,  # must respawn each epoch so workers see the new set_epoch seed
+        multiprocessing_context="forkserver" if num_workers > 0 else None,
+    )
+
+    return LatentCacheDataloaderResult(
+        loader=loader,
+        sampler=None,
+        dataset_size=dataset.num_samples,
+        is_iterable=True,
+        _batch_size=batch_size,
+        _num_workers=num_workers,
+        _world_size=world_size,
+        _latent_dataset=dataset,
     )
 
 

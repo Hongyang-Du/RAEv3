@@ -141,7 +141,9 @@ def main():
         np.savez(args.save_recon_npz, recon=recon_arr, idxs=np.asarray(idxs, dtype=np.int64))
         print(f"[save] recon npz -> {args.save_recon_npz}", flush=True)
 
-    rfid = calculate_rfid(recon_arr, ref_arr, bs=128, device=device)
+    # NB: calculate_rfid tests `cuda=(device=="cuda")` -> must pass the STRING "cuda",
+    # NOT torch.device("cuda") (which != "cuda" -> silently runs inception on CPU, ~15x slower).
+    rfid = calculate_rfid(recon_arr, ref_arr, bs=128, device="cuda")
     fd_rfid = None
     if os.environ.get("FD_EVAL"):
         from eval.distributional import compute_distributional_metrics

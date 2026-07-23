@@ -50,12 +50,34 @@ MASTER="${MASTER_ADDR:-${JOB_NAME}-0}"          # rank-0 pod; fallback to <job>-
 MPORT="${MASTER_PORT:-29500}"
 
 case "${1:-}" in
-  exp1) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k23.yaml; BASE=omnirae-dit-h1-plain-cls-k23 ;;
-  exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;          BASE=omnirae-dit-sigreg-cls-k23 ;;
-  exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;         BASE=omnirae-dit-encoder-cls-k23 ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3>"; exit 1 ;;
+  exp1) CFG=configs/stage2/training/imagenet-dinov3l-h1decoder-plain-cls-k23.yaml;    BASE=omnirae-dit-h1-plain-cls-k23 ;;
+  exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;             BASE=omnirae-dit-sigreg-cls-k23 ;;
+  exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;            BASE=omnirae-dit-encoder-cls-k23 ;;
+  exp4) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23.yaml;             BASE=omnirae-dit-depthattn-cls-k23 ;;  # DepthAttnCombine (Variant B), drop:false = full-k23 latent, on-the-fly encode
+  exp5) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23-cachedlatent.yaml; BASE=omnirae-dit-depthattn-cls-k23-cachedlatent ;;  # same as exp4 but reads precomputed latents (scripts/stage1/precompute_latents.py) -- needs /mnt/localssd/latents-depthattn-k23-nano-p03 staged on every node first
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
+
+# cachedlatent configs read from local SSD (src/data/latent_cache_dataset.py partitions
+# shards by DDP rank, which spans ALL nodes) -> every node needs its OWN full copy, local
+# SSD is not shared across nodes. Runs on EVERY node (this script IS the per-node entry);
+# skip if already staged. ~656GB (bf16, 1.28M x 1024x16x16 samples) -> check node disk
+# budget before adding more variants here. Needs AWS creds/instance-role with s3:GetObject
+# on the bucket (same assumption run_pluto_decoder_4node.sh's imagenet staging makes).
+if [[ "$CFG" == *cachedlatent* ]]; then
+  LSSD=/mnt/localssd/latents-depthattn-k23-nano-p03
+  S3=s3://hongyangd-raev2-backup/raev2-data/latents-depthattn-k23-nano-p03
+  if [ ! -f "$LSSD/train/manifest.json" ]; then
+    echo "### $(date '+%F %T') staging depthattn latent cache -> $LSSD (~656GB, AWS-internal)..."
+    mkdir -p "$LSSD"
+    aws s3 sync "$S3" "$LSSD" --only-show-errors \
+      || { echo "### FATAL: S3 sync failed (need AWS creds/role on node)"; exit 1; }
+    echo "### $(date '+%F %T') staged: $(du -sh "$LSSD" 2>/dev/null | cut -f1)"
+  else
+    echo "### depthattn latent cache already on local SSD ($LSSD)"
+  fi
+fi
 
 WANDB_FLAG=""; [ -n "${WANDB_KEY:-}" ] && WANDB_FLAG="--wandb"
 echo "### $(date '+%F %T')  ${EXPERIMENT_NAME}  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=${WANDB_FLAG:-off}"
