@@ -60,6 +60,31 @@ def get_checkpoint_epoch(ckpt_path: str) -> int:
         return -1
 
 
+def get_checkpoint_sort_key(ckpt_path: str) -> tuple:
+    """(epoch, step) ordering key for picking the newest checkpoint to resume from.
+
+    Ranking by epoch alone can't order a mid-epoch rolling `ckpt_latest.pt` against the
+    same-epoch boundary file `ep-<e>.pt` -- they'd tie and max() would break the tie
+    arbitrarily, possibly resuming from the older one. So order by (epoch, step).
+
+    Parse from the basename when possible ('ep-<e>[-step-<s>].pt') to avoid loading the
+    file; the epoch-boundary files have no 'step-' -> step key -1, which is always < any
+    real mid-epoch step of the same epoch, so a same-epoch rolling ckpt (real step >=
+    that boundary's) correctly wins. Only a name without 'ep-' (e.g. ckpt_latest.pt)
+    falls back to reading the stored epoch/step.
+    """
+    base = os.path.basename(ckpt_path)
+    m_e = re.search(r'ep-(\d+)', base)
+    m_s = re.search(r'step-(\d+)', base)
+    if m_e:
+        return (int(m_e.group(1)), int(m_s.group(1)) if m_s else -1)
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        return (ckpt.get("epoch", -1), ckpt.get("step", -1))
+    except Exception:
+        return (-1, -1)
+
+
 def find_resume_checkpoint(resume_dir: str, candidate_ckpt: Optional[str] = None) -> Optional[str]:
     """
     Find the checkpoint with the highest epoch from experiment dir and optional candidate.
@@ -86,8 +111,9 @@ def find_resume_checkpoint(resume_dir: str, candidate_ckpt: Optional[str] = None
     if not candidates:
         return None
 
-    # Return checkpoint with highest epoch
-    return max(candidates, key=get_checkpoint_epoch)
+    # Return the newest checkpoint by (epoch, step) -- see get_checkpoint_sort_key for
+    # why step matters (mid-epoch rolling ckpt_latest.pt vs same-epoch ep-<e>.pt).
+    return max(candidates, key=get_checkpoint_sort_key)
 
 def save_worktree(
     path: str,

@@ -236,7 +236,7 @@ def prepare_unified_dataloader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
         )
     elif target == "latent_cache":
-        result = _prepare_latent_cache_loader(config, batch_size, num_workers, world_size)
+        result = _prepare_latent_cache_loader(config, batch_size, num_workers, rank, world_size)
     else:
         raise ValueError(f"Unknown dataset target: {target!r}")
     result.virtual_epoch_steps = virtual_epoch_steps
@@ -518,6 +518,7 @@ def _prepare_latent_cache_loader(
     config: dict,
     batch_size: int,
     num_workers: int,
+    rank: int,
     world_size: int,
 ) -> "LatentCacheDataloaderResult":
     """Prepare a loader over latents precomputed by scripts/stage1/precompute_latents.py.
@@ -533,7 +534,10 @@ def _prepare_latent_cache_loader(
     split = config.get("split", "train")
     seed = config.get("seed", 42)
 
-    dataset = LatentCacheDataset(latents_dir=latents_dir, split=split, seed=seed)
+    # pass rank/world_size explicitly: LatentCacheDataset must NOT read torch.distributed
+    # inside its forkserver workers (world_size would wrongly read as 1). See its __init__.
+    dataset = LatentCacheDataset(latents_dir=latents_dir, split=split, seed=seed,
+                                 rank=rank, world_size=world_size)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,

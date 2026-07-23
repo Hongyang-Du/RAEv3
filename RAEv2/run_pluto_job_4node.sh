@@ -32,9 +32,24 @@ export DINOV3_CKPT_DIR="$ROOT/pretrained_models/encoders/dinov3"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$ROOT/.cache/torch}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+# DIAGNOSTIC (read-only): print the NCCL transport it picks at init so we can tell
+# whether inter-node collectives use IB/EFA RDMA or fall back to slow TCP sockets.
+# SUBSYS=INIT,NET keeps it to one-time setup lines (no per-step flooding). Remove
+# once the ~3.3s/step multi-node slowdown is understood.
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET,ENV}"
+# DIAGNOSTIC: rank0 prints per-step breakdown (data-wait / fwd / bwd+all-reduce / opt)
+# for gstep 5-35 (see src/stage2/engine.py), to locate the cached-latent slowdown.
+# Remove once understood.
+export STEP_TIMING="${STEP_TIMING:-1}"
 export STAGE2_NO_EMA_CKPT=1
 export CKPT_KEEP_RECENT=6
 export CKPT_KEEP_EVERY=10
+# roll a ckpt_latest.pt every N optimizer steps so a preemption (jobs here restart ~every
+# 1.5h) loses at most N steps, not the whole epoch. 500 * ~3.3s/step ~= 28min << restart
+# period. If the per-step slowdown gets fixed (~0.5s/step), raise this so the 3.5GB rank0
+# write stays a small fraction of wall time.
+export CKPT_EVERY_STEPS="${CKPT_EVERY_STEPS:-500}"
 export WANDB_ENTITY="${WANDB_ENTITY:-uscgvl}"
 export WANDB_PROJECT="${WANDB_PROJECT:-omnirae}"
 export WANDB_FRESH_RUN=1   # fresh wandb run each launch (avoids resume step-collision / crashed status)
@@ -77,6 +92,27 @@ if [[ "$CFG" == *cachedlatent* ]]; then
   else
     echo "### depthattn latent cache already on local SSD ($LSSD)"
   fi
+else
+  # non-cachedlatent configs (exp1-4) encode on-the-fly from the raw imagenet-256 arrow
+  # set. Their stage-2 configs use a RELATIVE data_dir (./data/imagenet-256), so stage the
+  # ~236GB arrow set from S3 to node-local SSD (not shared across nodes) and point
+  # ./data/imagenet-256 at it via symlink. Skip if already staged. Same AWS creds/role
+  # assumption as the cachedlatent branch. imagenet_hf_dataset.py reads the train split at
+  # <data_dir>/imagenet-latents-images, so that subdir's presence is the "staged" sentinel.
+  LSSD=/mnt/localssd/imagenet-256
+  S3=s3://hongyangd-raev2-backup/raev2-data/imagenet-256
+  if [ ! -d "$LSSD/imagenet-latents-images" ]; then
+    echo "### $(date '+%F %T') staging imagenet-256 -> $LSSD (~236GB, AWS-internal)..."
+    mkdir -p "$LSSD"
+    aws s3 sync "$S3" "$LSSD" --only-show-errors \
+      || { echo "### FATAL: S3 sync failed (need AWS creds/role on node)"; exit 1; }
+    echo "### $(date '+%F %T') staged: $(du -sh "$LSSD" 2>/dev/null | cut -f1)"
+  else
+    echo "### imagenet-256 already on local SSD ($LSSD)"
+  fi
+  # config's relative ./data/imagenet-256 -> node-local staged copy (each node its own)
+  mkdir -p "$REPO/data"
+  ln -sfn "$LSSD" "$REPO/data/imagenet-256"
 fi
 
 WANDB_FLAG=""; [ -n "${WANDB_KEY:-}" ] && WANDB_FLAG="--wandb"
@@ -89,6 +125,7 @@ exec "$TR" \
   --rdzv_backend=c10d \
   --rdzv_id="${JOB_NAME:-omnirae}-${BASE}" \
   --rdzv_endpoint="${MASTER}:${MPORT}" \
+  --rdzv_conf=join_timeout=1800 \
   src/train.py \
   --config "$CFG" \
   --results-dir "$ROOT/ckpt" \

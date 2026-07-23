@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections import defaultdict
 from typing import Dict, Optional
 
@@ -142,7 +143,14 @@ def train_one_epoch(
     gate_accum = getattr(config.training, "gate_accum_steps", 1) if gate_optimizer is not None else 1
     if gate_optimizer is not None and not hasattr(gate_optimizer, "_accum_i"):
         gate_optimizer._accum_i = 0
+    # STEP_TIMING=1: env-gated per-step breakdown (data-wait / fwd / bwd+all-reduce / opt),
+    # rank0, gstep 5-35, then quiet. Locates the multi-node cached-latent slowdown. The
+    # cuda.syncs slightly inflate absolute numbers (they remove step-to-step overlap) but
+    # the point is which section dominates. Calibrated for grad_accum=1. No cost when unset.
+    _st = bool(int(os.environ.get("STEP_TIMING", "0"))) and rank == 0
+    _t_end = time.perf_counter()
     for step, (images, y) in enumerate(dataloader):
+        _t_data = time.perf_counter() - _t_end   # time blocked waiting for this batch
         images = images.to(device)
 
         # Encode images to latents and compute REPA targets.
@@ -193,6 +201,8 @@ def train_one_epoch(
         #########################################################
         model_kwargs = dict(context=context, attn_mask=context_attn_mask)
 
+        if _st:
+            torch.cuda.synchronize(); _t0 = time.perf_counter()
         with autocast(**autocast_kwargs):
             loss_dict = transport.training_losses(
                 ddp_model, z, model_kwargs, model_kwargs_null,
@@ -249,12 +259,18 @@ def train_one_epoch(
 
         loss = loss / config.training.grad_accum_steps
 
+        if _st:
+            torch.cuda.synchronize(); _t_fwd = time.perf_counter() - _t0; _t0 = time.perf_counter()
+
         is_accum_step = (step + 1) % config.training.grad_accum_steps != 0
         if is_accum_step:
             with ddp_model.no_sync():
                 loss.backward()
         else:
             loss.backward()  # DDP auto-syncs gradients on final micro-step
+
+        if _st:
+            torch.cuda.synchronize(); _t_bwd = time.perf_counter() - _t0; _t0 = time.perf_counter()
 
         if not is_accum_step:
             if config.training.clip_grad:
@@ -279,6 +295,29 @@ def train_one_epoch(
                 scheduler.step()
             update_ema(ema_model, ddp_model.module, decay=config.training.ema_decay)
             global_step += 1
+
+            # CKPT_EVERY_STEPS>0: roll a single ckpt_latest.pt every N optimizer steps so a
+            # mid-epoch preemption loses at most N steps instead of the whole epoch. Reuses
+            # save_stage2_checkpoint's atomic tmp+os.replace (a kill mid-write keeps the old
+            # complete file); resume ranks it by (epoch, step) via get_checkpoint_sort_key.
+            # Default 0 (off) preserves prior behavior; set in the launch script. Each save
+            # blocks rank0 (other ranks wait at the next all-reduce), so size N vs that cost.
+            ckpt_every_steps = int(os.environ.get("CKPT_EVERY_STEPS", "0") or "0")
+            if ckpt_every_steps > 0 and rank == 0 and global_step % ckpt_every_steps == 0:
+                logger.info(f"Rolling checkpoint at step {global_step} (epoch {epoch})...")
+                save_stage2_checkpoint(f"{checkpoint_dir}/ckpt_latest.pt", global_step, epoch,
+                                       ddp_model, ema_model, optimizer, scheduler)
+
+            if _st:
+                torch.cuda.synchronize()
+                _t_opt = time.perf_counter() - _t0
+                _t_total = time.perf_counter() - _t_end
+                if 5 <= global_step <= 35:
+                    logger.info(
+                        f"[step-timing] gstep={global_step} total={_t_total:.3f}s | "
+                        f"data={_t_data:.3f} fwd={_t_fwd:.3f} bwd+ar={_t_bwd:.3f} opt={_t_opt:.3f}"
+                    )
+                _t_end = time.perf_counter()
 
         epoch_metrics['loss'] += loss_diff.detach()
         num_batches += 1
