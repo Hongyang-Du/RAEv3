@@ -8,13 +8,13 @@
 # Scripts field:
 #   export WANDB_KEY=...            # optional (vault secret)
 #   export NUM_NODES=4              # MUST match the replica count
-#   bash /sensei-fs-3/users/hongyangd/RAEv3/RAEv2/run_pluto_job_4node.sh exp3
+#   bash /sensei-fs-3/users/hongyangd/RAEv3_oldnorm/RAEv2/run_pluto_job_4node.sh exp3
 set -uo pipefail
 
 for base in /sensei-fs-3 /mnt/remotes/sensei-fs-3; do
-  if [ -d "$base/users/hongyangd/RAEv3/RAEv2" ]; then REPO="$base/users/hongyangd/RAEv3/RAEv2"; ROOT="$base/users/hongyangd"; break; fi
+  if [ -d "$base/users/hongyangd/RAEv3_oldnorm/RAEv2" ]; then REPO="$base/users/hongyangd/RAEv3_oldnorm/RAEv2"; ROOT="$base/users/hongyangd"; break; fi
 done
-: "${REPO:?could not find RAEv3/RAEv2 on the sensei mount}"
+: "${REPO:?could not find RAEv3_oldnorm/RAEv2 on the sensei mount}"
 cd "$REPO"
 
 # tee ALL output of this pod (incl. tracebacks) to the shared FS so failures on any
