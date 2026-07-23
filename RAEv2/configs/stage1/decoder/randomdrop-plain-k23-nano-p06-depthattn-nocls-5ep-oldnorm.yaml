@@ -1,0 +1,73 @@
+# 5-epoch smoke sweep (Variant B: depth-attn fusion, NO cls_surrogate): same as
+# randomdrop-plain-k23-nano-p03-depthattn-5ep-oldnorm.yaml but with cls_surrogate:
+# false, to ablate the additive L23-token-mean term out of DepthAttnCombine and see
+# whether the learned depth-attn fusion alone (no cls surrogate) matches recon quality.
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    p_drop: 0.6              # Bernoulli group of the internal stratified sampler
+    full_frac: 0.3333333
+    uniform_frac: 0.3333333
+    cls_surrogate: false
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2              # 2 depth-attn refinement blocks, ~17M params (combine-level;
+    n_heads: 8               #   B intentionally trades matched-params for a higher ceiling)
+    mlp_mult: 2
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 2              # 2 GAN-free epochs; still enough for the fusion to settle at 5ep budget
+data:
+  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 5
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-p0.6-depthattn-nocls-5ep-sweep
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: omni-randomdrop-plain-k23-nano-p0.6-depthattn-nocls-5ep-sweep

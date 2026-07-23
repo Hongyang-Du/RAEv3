@@ -545,6 +545,10 @@ def _prepare_latent_cache_loader(
         pin_memory=True,
         persistent_workers=False,  # must respawn each epoch so workers see the new set_epoch seed
         multiprocessing_context="forkserver" if num_workers > 0 else None,
+        drop_last=True,  # each worker's fair-share budget isn't a multiple of batch_size, so its
+                         # final batch is partial; the CFG-dropout null cond is fixed at micro_batch
+                         # -> a partial batch mismatches (RuntimeError: size 25 vs 32). Drop it. All
+                         # workers/ranks share the same budget, so all drop the same -> no DDP desync.
     )
 
     return LatentCacheDataloaderResult(
