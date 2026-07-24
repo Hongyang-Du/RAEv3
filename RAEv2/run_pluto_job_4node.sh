@@ -42,8 +42,7 @@ export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET,ENV}"
 # for gstep 5-35 (see src/stage2/engine.py), to locate the cached-latent slowdown.
 # Remove once understood.
 export STEP_TIMING="${STEP_TIMING:-1}"
-export STAGE2_NO_EMA_CKPT=1
-export CKPT_KEEP_RECENT=6
+export CKPT_KEEP_RECENT=2
 export CKPT_KEEP_EVERY=10
 # roll a ckpt_latest.pt every N optimizer steps so a preemption (jobs here restart ~every
 # 1.5h) loses at most N steps, not the whole epoch. 500 * ~3.3s/step ~= 28min << restart
@@ -69,7 +68,7 @@ case "${1:-}" in
   exp2) CFG=configs/stage2/training/imagenet-dinov3l-sigreg-cls-k23.yaml;             BASE=omnirae-dit-sigreg-cls-k23 ;;
   exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;            BASE=omnirae-dit-encoder-cls-k23 ;;
   exp4) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23.yaml;             BASE=omnirae-dit-depthattn-cls-k23 ;;  # DepthAttnCombine (Variant B), drop:false = full-k23 latent, on-the-fly encode
-  exp5) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23-cachedlatent.yaml; BASE=omnirae-dit-depthattn-cls-k23-cachedlatent ;;  # same as exp4 but reads precomputed latents (scripts/stage1/precompute_latents.py) -- needs /mnt/localssd/latents-depthattn-k23-nano-p03 staged on every node first
+  exp5) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23-cachedlatent.yaml; BASE=omnirae-dit-depthattn-cls-k23-p03-cachedlatent ;;  # same as exp4 but reads precomputed latents (scripts/stage1/precompute_latents.py) -- needs /mnt/localssd/latents-depthattn-k23-nano-p03 staged on every node first
   *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run

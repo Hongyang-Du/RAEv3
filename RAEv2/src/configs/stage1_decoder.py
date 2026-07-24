@@ -34,6 +34,14 @@ class SigregConfig:
 
 
 @dataclass
+class KLConfig:
+    """VAE-style KL(N(mu,sigma^2) || N(0,I)) weight. Only has effect when the combine
+    was built with variational=true (stage1.combine.VAEBottleneck); ignored otherwise
+    (train_decoder.py warns if set without a variational combine)."""
+    weight: float = 1.0e-6          # LDM-scale default (train_decoder_mls_kl.py precedent)
+
+
+@dataclass
 class GanConfig:
     disc_weight: float = 0.75
     disc_start: int = 1            # epoch GAN turns on
@@ -44,6 +52,7 @@ class GanConfig:
 class LossConfig:
     lpips_w: float = 1.0
     sigreg: Optional[SigregConfig] = None          # None -> SIGReg off
+    kl: Optional[KLConfig] = None                  # None -> KL off (needs combine.variational=true)
     gan: GanConfig = field(default_factory=GanConfig)
 
 

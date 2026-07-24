@@ -40,7 +40,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 # HF streaming (WebDataset tar shards from the Hub, cached to localssd) for the 4-source mix.
 export HF_HUB_ENABLE_HF_TRANSFER=1
 mkdir -p /mnt/localssd/raev2-wds-cache 2>/dev/null || true
-export CKPT_KEEP_RECENT="${CKPT_KEEP_RECENT:-4}"   # keep recent N ckpt_ep*.pt (virtualized epochs -> many)
+export CKPT_KEEP_RECENT="${CKPT_KEEP_RECENT:-2}"   # keep recent N ckpt_ep*.pt (virtualized epochs -> many)
 export CKPT_EVERY_STEPS="${CKPT_EVERY_STEPS:-500}" # also save ckpt_latest every N steps -> survives Porter preemption (resume, not restart-from-zero)
 # wandb: train_decoder.py reads cfg.wandb.enabled; it needs an API key in the env.
 [ -n "${WANDB_KEY:-}" ] && export WANDB_API_KEY="${WANDB_KEY}"

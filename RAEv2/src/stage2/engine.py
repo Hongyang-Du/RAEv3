@@ -125,7 +125,7 @@ def train_one_epoch(
             keep_every = int(os.environ.get("CKPT_KEEP_EVERY", "10"))
             eps = sorted(int(m.group(1)) for f in os.listdir(checkpoint_dir)
                          if (m := re.fullmatch(r"ep-(\d+)\.pt", f)))
-            keep = set(eps[-keep_recent:]) | {e for e in eps if keep_every > 0 and e % keep_every == 0}
+            keep = set(eps[-keep_recent:]) | {e for e in eps if keep_every > 0 and e > 0 and e % keep_every == 0}
             for e in eps:
                 if e not in keep:
                     try: os.remove(f"{checkpoint_dir}/ep-{e:07d}.pt")

@@ -1,0 +1,88 @@
+# 5-epoch smoke sweep (two-stage VAE bottleneck on top of Variant B depth-attn
+# fusion): same recipe as randomdrop-plain-k23-nano-p03-depthattn-vae4-oldnorm.yaml
+# but compressed to 5 epochs / 2 GAN-free + 3 GAN epochs, matched budget vs the
+# existing depthattn-5ep sibling. Separate out_dir/wandb name from the 16ep run so
+# this smoke test's ckpt_latest.pt never gets auto-resumed by (or collides with)
+# the real anchor-budget run.
+#
+# Purpose: first real (GPU + ImageNet data, not CPU dummy tensors) run of
+# stage1.combine.CompressedCombine(DepthAttnCombine) + VAEBottleneck(out_dim=128) --
+# checks train_decoder.py's forward/backward/EMA/checkpointing, the KL loss term,
+# and the val PSNR/SSIM + LOO/solo probe eval path all run cleanly end to end on
+# the new compressed latent (decoder.latent_dim=128). Not meant to reach the 16ep
+# anchor's PSNR -- see RAEv3_oldnorm/README.md for the full-budget comparison.
+combine:
+  target: stage1.combine.CompressedCombine
+  params:
+    inner:
+      target: stage1.combine.DepthAttnCombine
+      params:
+        layers:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+        - 17
+        - 18
+        - 19
+        - 20
+        - 21
+        - 22
+        - 23
+        p_drop: 0.3
+        cls_surrogate: true
+        dim: 1024
+        out_dim: 1024
+        n_layers: 2
+        n_heads: 8
+        mlp_mult: 2
+    dim: 1024
+    out_dim: 128
+    variational: true
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 128
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  kl:
+    weight: 1.0e-6
+  gan:
+    disc_weight: 0.75
+    disc_start: 2              # 2 GAN-free epochs; still enough for the fusion to settle at 5ep budget
+data:
+  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 5
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-p0.3-depthattn-vae128-5ep-sweep
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: omni-randomdrop-plain-k23-nano-p0.3-depthattn-vae128-5ep-sweep

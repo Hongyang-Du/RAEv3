@@ -123,6 +123,13 @@ def update_ema(ema, model, decay=0.9995):
             eb.copy_(b)
 
 
+def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """KL(N(mu, sigma^2) || N(0, I)), fp32, summed over the latent dim, mean over B*N
+    (matches train_decoder_mls_kl.py's legacy full-width KL variant)."""
+    mu_f, logvar_f = mu.float(), logvar.float()
+    return (-0.5 * (1.0 + logvar_f - mu_f.pow(2) - logvar_f.exp())).sum(-1).mean()
+
+
 def make_loader(data_dir, image_size, batch_size, num_workers, world_size, rank):
     t = transforms.Compose([
         transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
@@ -225,7 +232,10 @@ def main():
             print(f"Train: {len(train_loader.dataset)} images")
 
     # -- frozen DINOv3 encoder -------------------------------------------------
-    layers = list(C.params["layers"])
+    # MLSCombine/DepthAttnCombine keep `layers` at the top level; CompressedCombine
+    # nests the actual fusion combine (and its `layers`) under params.inner.params.
+    layers = list(C.params["layers"] if "layers" in C.params
+                  else C.params["inner"]["params"]["layers"])
     layers_str = ".".join(str(x) for x in layers)
     encoder = create_encoder(f"dinov3mls-vit-l16[layers={layers_str}]",
                              device=device, resolution=D.image_size)
@@ -421,13 +431,19 @@ def main():
         del ck
 
     # SIGReg regularizes the projector's latent -> it only has effect with a
-    # parametric projector, and the proven recipe (LeWM) is the BN-MLP. Forbid the
-    # silent no-op (projector=none) and the untested ln combo: sigreg => bn.
-    if L.sigreg is not None and C.params.get("projector") != "bn":
+    # parametric projector, and the proven recipe (LeWM) is the BN-MLP (or the new
+    # VAE bottleneck). Forbid the silent no-op (projector=none) and the untested ln
+    # combo: sigreg => bn | vae.
+    if L.sigreg is not None and C.params.get("projector") not in ("bn", "vae"):
         raise ValueError(
             f"loss.sigreg is set but combine.projector={C.params.get('projector')!r}; "
-            "SIGReg requires projector: bn (BN-MLP). Set projector: bn or disable sigreg.")
+            "SIGReg requires projector: bn or vae. Set one of those or disable sigreg.")
     use_sig = L.sigreg is not None and combine_has_params
+    # KL only has effect on the VAE bottleneck's (mu, logvar) head (variational=true);
+    # ignored (with a warning) if set on a deterministic combine.
+    use_kl = L.kl is not None and getattr(combine, "variational", False)
+    if L.kl is not None and not use_kl and is_main:
+        print("WARNING: loss.kl is set but combine.variational is not True -> KL ignored", flush=True)
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=(T.precision == "bf16"))
 
     def decode_imgs(dec, z, layer_mask=None, cond_drop=None):
@@ -589,6 +605,8 @@ def main():
                                     distributed=L.sigreg.distributed,
                                     scale_by_n=L.sigreg.scale_by_n)
                         if use_sig else torch.zeros((), device=device))
+            loss_kl = (kl_divergence(combine.last_mu, combine.last_logvar)
+                       if use_kl else torch.zeros((), device=device))
 
             loss_gan = torch.zeros(1, device=device)
             if use_gan:
@@ -607,7 +625,8 @@ def main():
                 adp_w = torch.tensor(0.0, device=device)
 
             sig_w = L.sigreg.weight if use_sig else 0.0
-            loss = loss_rec + sig_w * loss_sig + L.gan.disc_weight * adp_w * loss_gan
+            kl_w = L.kl.weight if use_kl else 0.0
+            loss = loss_rec + sig_w * loss_sig + kl_w * loss_kl + L.gan.disc_weight * adp_w * loss_gan
             (loss / accum).backward()
             if is_accum_step:
                 if T.clip_grad > 0:
@@ -639,13 +658,15 @@ def main():
                 zd = gaussian_diag(z); ps = psnr(x_rec, imgs)
                 print(f"  ep{epoch+1} s{global_step}  loss={loss.item():.4e}  l1={loss_l1.item():.4e}"
                       f"  lpips={loss_lpips.item():.4e}  psnr={ps:.2f}  sig={loss_sig.item():.4e}"
+                      f"  kl={loss_kl.item():.4e}"
                       f"  gan={loss_gan.item():.4e}  z(mu={zd['mean']:.2f} sd={zd['std']:.2f})"
                       f"  vard(mu={zd['var_mean']:.2f})  lr={lr:.2e}", flush=True)
                 if cfg.wandb.enabled:
                     import wandb
                     wandb.log({"train/loss": loss.item(), "train/l1": loss_l1.item(),
                                "train/lpips": loss_lpips.item(), "train/psnr": ps,
-                               "train/sigreg": loss_sig.item(), "train/gan_g": loss_gan.item(),
+                               "train/sigreg": loss_sig.item(), "train/kl": loss_kl.item(),
+                               "train/gan_g": loss_gan.item(),
                                "train/z_mean": zd["mean"], "train/z_std": zd["std"],
                                "train/z_var_mean": zd["var_mean"], "train/lr": lr}, step=global_step)
 

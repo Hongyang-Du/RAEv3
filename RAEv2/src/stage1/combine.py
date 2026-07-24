@@ -11,11 +11,21 @@ parameterized by four knobs:
   p_full         float                          per-sample prob of keeping ALL layers
                                                 (no drop) -> mixes full + dropped passes
   cls_surrogate  bool                           add L_last token-mean (raev2 code)
-  projector      none | ln | bn                 per-token residual MLP after mix
+  projector      none | ln | bn | vae           per-token residual MLP after mix
 
 `random_drop` = "Random Drop Layer MLS": each sample keeps each layer with prob
 (1 - p_drop) (>=1 kept) and z0 is the equal-weight mean over the kept subset.
 Drops whole LAYERS (not units) -> structurally collapse-proof; eval = full mean.
+
+`projector=vae` (VAEBottleneck, below) is the odd one out: unlike ln/bn (which mix
+the K layers but keep the channel count fixed), it progressively COMPRESSES z0 from
+`dim` down to a much smaller `out_dim` (e.g. 1024 -> 4), so the fusion network
+itself becomes a learned encoder producing an SD/LDM-style small latent. Pair it
+with `variational=true` + loss.kl (VAE reparameterize + KL, see
+train_decoder_mls_kl.py for the legacy full-width precedent) or leave
+`variational=false` and pair it with the existing loss.sigreg instead -- both just
+shape the (now small) bottleneck toward N(0, I); SIGReg is this project's proven
+cheaper-on-recon default at full width, KL is the classic VAE choice.
 
 Variant map (the three kept experiments + the legacy ones):
   raev2 K=23              weighting=mean,        projector=none, cls_surrogate=false
@@ -23,6 +33,7 @@ Variant map (the three kept experiments + the legacy ones):
   Random Drop Layer + MLP weighting=random_drop, projector=bn,   cls_surrogate=false
   nogate (legacy)         weighting=mean,        projector=ln
   softgate (legacy)       weighting=softgate,    projector=ln|none
+  VAE bottleneck (new)    weighting=random_drop, projector=vae,  out_dim << dim
 
 forward(layer_tokens, idx=None):
   layer_tokens : list of K tensors, each [B, N, dim]
@@ -36,11 +47,72 @@ ZERO parameters. DDP errors on a param-free module, so the trainer must call it
 directly (not wrap it in DDP) when has_params is False.
 """
 
+from typing import List, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .mask_cond import sample_stratified_masks
+from utils.model_utils import get_obj_from_str
+
+
+class VAEBottleneck(nn.Module):
+    """Progressive channel-compression head for MLSCombine's `projector="vae"` mode.
+
+    Squeezes the fused latent from `dim` down to `out_dim` (e.g. 1024 -> 4) through a
+    cascade of Linear->LayerNorm->GELU stages that halve the width each step (the
+    last stage lands exactly on out_dim, whatever the remaining ratio is). This makes
+    the fusion network itself a learned encoder -- unlike MLSCombine's other
+    projectors (none/ln/bn), which mix the K layers but never change the channel
+    count -- so the stage-2 diffusion model can eventually run on an SD/LDM-style
+    small latent instead of the full DINOv3 width.
+
+    variational=True adds a zero-init logvar head (sigma=1 at init, same convention
+    as the legacy train_decoder_mls_kl.py) so the caller can reparameterize and add
+    a KL term -- the classic VAE way of shaping the bottleneck toward N(0, I).
+    variational=False (default) returns a deterministic mu, meant to be paired with
+    the existing SIGReg loss instead (same shaping goal; this project's own
+    nogate/dropmean ablations found SIGReg ~free on recon vs a plain mean).
+    """
+
+    def __init__(self, dim: int, out_dim: int, variational: bool = False,
+                 widths: Optional[List[int]] = None):
+        super().__init__()
+        assert 0 < out_dim <= dim, (out_dim, dim)
+        if widths is None:
+            widths = [dim]
+            w = dim
+            while w > out_dim * 2:
+                w //= 2
+                widths.append(w)
+            widths.append(out_dim)
+        else:
+            widths = list(widths)
+            assert widths[0] == dim and widths[-1] == out_dim, \
+                f"widths must start at dim={dim} and end at out_dim={out_dim}, got {widths}"
+        self.widths = widths
+
+        stages = []
+        for i in range(len(widths) - 1):
+            stages.append(nn.Linear(widths[i], widths[i + 1]))
+            if i < len(widths) - 2:           # no norm/act after the final linear (raw mu)
+                stages.append(nn.LayerNorm(widths[i + 1]))
+                stages.append(nn.GELU())
+        self.encoder = nn.Sequential(*stages)
+
+        self.variational = variational
+        if variational:
+            self.to_logvar = nn.Linear(out_dim, out_dim)
+            nn.init.zeros_(self.to_logvar.weight)
+            nn.init.zeros_(self.to_logvar.bias)      # logvar=0 -> sigma=1 at init
+
+    def forward(self, z0: torch.Tensor):
+        mu = self.encoder(z0)
+        if not self.variational:
+            return mu, None
+        logvar = self.to_logvar(mu).clamp(-30.0, 20.0)   # numerical stability
+        return mu, logvar
 
 
 class MLSCombine(nn.Module):
@@ -56,10 +128,12 @@ class MLSCombine(nn.Module):
                  mult: int = 4,
                  tau: float = 1.0,
                  topk: int = 0,
-                 noise_tau: float = 0.0):
+                 noise_tau: float = 0.0,
+                 variational: bool = False,
+                 bottleneck_widths: Optional[List[int]] = None):
         super().__init__()
         assert weighting in ("mean", "random_drop", "softgate", "learned_gate"), weighting
-        assert projector in ("none", "ln", "bn"), projector
+        assert projector in ("none", "ln", "bn", "vae"), projector
         assert 0.0 <= p_full <= 1.0, p_full
         self.layers = list(layers)
         self.K = len(self.layers)
@@ -83,8 +157,14 @@ class MLSCombine(nn.Module):
         if weighting == "learned_gate":
             self.gate_logits = nn.Parameter(torch.zeros(self.K))  # init uniform 1/K
 
+        # variational: only meaningful for projector="vae" (see VAEBottleneck above)
+        self.variational = variational
+
         if projector == "none":
             self.skip = None
+        elif projector == "vae":
+            self.bottleneck = VAEBottleneck(dim, out_dim, variational=variational,
+                                            widths=bottleneck_widths)
         else:
             self.skip = nn.Linear(dim, out_dim) if dim != out_dim else nn.Identity()
             if projector == "ln":
@@ -178,6 +258,14 @@ class MLSCombine(nn.Module):
 
         if self.projector == "none":
             return self._noise(z0, idx)
+        if self.projector == "vae":
+            mu, logvar = self.bottleneck(z0)                # [B, N, out_dim] each
+            self.last_mu, self.last_logvar = mu, logvar     # stashed for the trainer's KL term
+            if self.variational and self.training and idx is None:
+                z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+            else:
+                z = mu
+            return self._noise(z, idx)
         if self.projector == "ln":
             return self._noise(self.skip(z0) + self.ffn(self.norm(z0)), idx)
         # bn
@@ -309,3 +397,85 @@ class DepthAttnCombine(nn.Module):
         if self.cls_surrogate:
             z = z + stk[-1].mean(dim=1, keepdim=True)   # raev2 L_last token-mean (fixed)
         return z
+
+
+# ---------------------------------------------------------------------------
+# Compression wrapper: bolt a VAEBottleneck onto ANY existing combine, unchanged
+# ---------------------------------------------------------------------------
+
+class CompressedCombine(nn.Module):
+    """Two-stage combine: an existing fusion variant (MLSCombine OR DepthAttnCombine),
+    run to completion exactly as-is, THEN a VAEBottleneck compresses its dim-wide
+    output down to out_dim. This is the "current SD/LDM-style VAE" shape: feature
+    extraction first, downsampling after -- not interleaved into the same blocks.
+
+    Why not compress INSIDE DepthAttnFusion instead: every DepthAttnBlock is a
+    residual correction (q = q + zero-init attn/ffn), which requires the correction
+    to be the same width as q at every step; that is also why DepthAttnCombine
+    asserts dim == out_dim. Shrinking the width block-by-block would replace those
+    adds with dimension-changing projections that cannot be zero-init'ed to an
+    identity (no linear map R^1024 -> R^512 is the identity), so the "step 0 ==
+    anchor, learn a correction from there" property (checked by
+    smoke_depthattn_identity.py) and cheap warm-starting from anchor ckpts
+    (training.init_from) would both be lost. Chaining the bottleneck AFTER a
+    completed, untouched inner combine keeps all of that intact -- the inner
+    combine's own forward is called exactly as it always was.
+
+    forward = VAEBottleneck(inner(layer_tokens, idx, mask)). p_drop / layers / K are
+    proxied to the inner combine so the trainer's p_drop-schedule hook and any code
+    reading combine.layers/.K keep working unchanged.
+
+    Config (nested target/params, same convention train_decoder.py already uses to
+    instantiate the top-level combine):
+        combine:
+          target: stage1.combine.CompressedCombine
+          params:
+            inner:
+              target: stage1.combine.DepthAttnCombine
+              params: {layers: [...], p_drop: 0.3, cls_surrogate: true,
+                       dim: 1024, out_dim: 1024, n_layers: 2, n_heads: 8, mlp_mult: 2}
+            dim: 1024
+            out_dim: 4
+            variational: true
+    """
+
+    def __init__(self, inner, dim: int, out_dim: int, variational: bool = False,
+                 bottleneck_widths: Optional[List[int]] = None):
+        super().__init__()
+        from omegaconf import OmegaConf
+        cc = OmegaConf.to_container(inner, resolve=True) if OmegaConf.is_config(inner) else dict(inner)
+        self.inner = get_obj_from_str(cc["target"])(**cc["params"])
+        self.bottleneck = VAEBottleneck(dim, out_dim, variational=variational,
+                                        widths=bottleneck_widths)
+        self.variational = variational
+
+    # proxy the inner combine's p_drop (trainer's p_drop-schedule hook mutates this
+    # directly: `combine.p_drop = p_drop_at(step)`) and layers/K (read by
+    # learned_gate logging / stage-2 layer-selection code).
+    @property
+    def p_drop(self):
+        return self.inner.p_drop
+
+    @p_drop.setter
+    def p_drop(self, value):
+        self.inner.p_drop = value
+
+    @property
+    def layers(self):
+        return self.inner.layers
+
+    @property
+    def K(self):
+        return self.inner.K
+
+    @property
+    def has_params(self) -> bool:
+        return True     # the bottleneck always has params, regardless of inner
+
+    def forward(self, layer_tokens, idx=None, mask=None) -> torch.Tensor:
+        z0 = self.inner(layer_tokens, idx=idx, mask=mask)
+        mu, logvar = self.bottleneck(z0)
+        self.last_mu, self.last_logvar = mu, logvar     # stashed for the trainer's KL term
+        if self.variational and self.training and idx is None:
+            return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        return mu

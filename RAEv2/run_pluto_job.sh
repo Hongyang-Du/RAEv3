@@ -26,7 +26,6 @@ export DINOV3_CKPT_DIR="$ROOT/pretrained_models/encoders/dinov3"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$ROOT/.cache/torch}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-export STAGE2_NO_EMA_CKPT=1   # don't store EMA in checkpoints (~1/3 smaller) — EMA unused downstream
 export CKPT_KEEP_RECENT=6     # keep the 6 most recent checkpoints (rolling resume/fallback)
 export CKPT_KEEP_EVERY=10     # plus keep every-10-epoch milestones (for gFID-vs-epoch eval)
 

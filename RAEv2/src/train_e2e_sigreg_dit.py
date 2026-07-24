@@ -435,7 +435,7 @@ def main():
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         projector.load_state_dict(ck["projector"]); decoder.load_state_dict(ck["decoder"])
         dit.load_state_dict(ck["dit"])
-        ema_dit.load_state_dict(ck.get("ema_dit", ck["dit"]))   # ema no longer saved -> re-init from dit
+        ema_dit.load_state_dict(ck.get("ema_dit", ck["dit"]))   # fall back to dit for older checkpoints saved without ema_dit
         opt_pd.load_state_dict(ck["opt_pd"]); opt_dit.load_state_dict(ck["opt_dit"])
         sched_pd.load_state_dict(ck["sched_pd"]); sched_dit.load_state_dict(ck["sched_dit"])
         start_epoch, global_step = ck["epoch"], ck["global_step"]
@@ -658,7 +658,7 @@ def main():
             ckpt_cpu = _to_cpu({
                 "epoch": epoch + 1, "global_step": global_step,
                 "projector": projector.state_dict(), "decoder": decoder.state_dict(),
-                "dit": dit.state_dict(),
+                "dit": dit.state_dict(), "ema_dit": sn_dit.state_dict(),
                 "opt_pd": opt_pd.state_dict(), "opt_dit": opt_dit.state_dict(),
                 "sched_pd": sched_pd.state_dict(), "sched_dit": sched_dit.state_dict(),
                 "layers": args.layers, "args": vars(args),

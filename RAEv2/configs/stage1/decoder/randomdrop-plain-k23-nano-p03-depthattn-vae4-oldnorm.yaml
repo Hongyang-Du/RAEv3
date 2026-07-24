@@ -1,0 +1,91 @@
+# Two-stage VAE-bottleneck ablation on top of Variant B (depth-attn fusion), vs
+# randomdrop-plain-k23-nano-p03-depthattn-oldnorm.yaml. Same anchor recipe (k23,
+# p_drop=0.3, 16 epochs, batch 32/GPU, lr 2e-4, warmup 2, disc_start 8).
+#
+# stage1.combine.CompressedCombine wraps DepthAttnCombine UNCHANGED (dim=out_dim=1024,
+# same zero-init depth-attention fusion, same warm-start-from-anchor properties) and
+# chains its full-width output through a VAEBottleneck: 1024->512->256->128->64->32->
+# 16->8->4, reparameterized (variational=true), KL(N(mu,sigma^2)||N(0,I)) pulling the
+# 4-dim bottleneck toward N(0,I). This is the "feature extraction first, downsample
+# after" shape modern VAEs use -- NOT compression interleaved into the depth-attention
+# blocks themselves, which would break their residual (q = q + zero-init correction)
+# structure and the identity-at-init / warm-start guarantees that come with it.
+#
+# The ViT-XL decoder is UNCHANGED code; decoder.latent_dim=4 just makes its existing
+# decoder_embed = Linear(hidden_size, decoder_hidden_size) do the "decompression" back
+# up to the decoder's internal width.
+combine:
+  target: stage1.combine.CompressedCombine
+  params:
+    inner:
+      target: stage1.combine.DepthAttnCombine
+      params:
+        layers:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+        - 17
+        - 18
+        - 19
+        - 20
+        - 21
+        - 22
+        - 23
+        p_drop: 0.3
+        cls_surrogate: true
+        dim: 1024
+        out_dim: 1024
+        n_layers: 2
+        n_heads: 8
+        mlp_mult: 2
+    dim: 1024
+    out_dim: 4
+    variational: true
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 4
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  kl:
+    weight: 1.0e-6
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-p0.3-depthattn-vae4
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: omni-randomdrop-plain-k23-nano-p0.3-depthattn-vae4

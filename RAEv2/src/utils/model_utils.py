@@ -33,7 +33,7 @@ def instantiate_from_config(config: ModelConfig) -> object:
     if getattr(config, "ckpt", None) is not None:
         state_dict = torch.load(config.ckpt, map_location="cpu", weights_only=False)
         # prefer EMA weights, but fall back to the raw 'model' weights when EMA is
-        # absent or None (e.g. checkpoints saved with STAGE2_NO_EMA_CKPT).
+        # absent or None (e.g. older checkpoints saved before EMA was persisted).
         if state_dict.get("ema") is not None:
             state_dict = state_dict["ema"]
         elif state_dict.get("model") is not None:
