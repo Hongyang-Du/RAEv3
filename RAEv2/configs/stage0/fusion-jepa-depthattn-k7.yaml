@@ -11,10 +11,10 @@ combine:
   target: stage1.combine.DepthAttnCombine
   params:
     layers: [11, 13, 15, 17, 19, 21, 23]
-    # NOTE: p_drop mirrors k23 (0.75) but K=7 here -> avg kept ~= 7*0.25 = 1.75 layers
-    # in the ctx view (vs ~5.75 at k23). Same >=1-kept guarantee, but a much harder
-    # subset->full task; consider lowering if the LOO/pred-loss signatures look starved.
-    p_drop: 0.75
+    # p_drop=0.5 (same as k23). At K=7 -> avg kept ~= 7*0.5 = 3.5 layers in the ctx view
+    # (vs ~11.5 at k23); >=1-kept guaranteed. Harder subset->full task than k23 per its
+    # smaller K, but no longer down to ~1 layer.
+    p_drop: 0.5
     full_frac: 0.0          # ignored/forced to 0 by the trainer (ctx = pure subset)
     uniform_frac: 0.0       # trainer overrides with training.uniform_frac
     cls_surrogate: false    # grounding head carries CLS (frozen L23 = last layer, same as k23)
@@ -43,7 +43,7 @@ training:
   ckpt_every: 1
   log_every: 50
   seed: 42
-  p_drop: 0.75              # see combine note: aggressive at K=7 (~1.75 kept)
+  p_drop: 0.5               # K=7 -> ~3.5 kept in ctx (see combine note)
   uniform_frac: 0.0         # ctx sampler: pure Bernoulli(1-p_drop) subsets
   detach_target: false      # LeJEPA/LeWM live target; set true only if SIGReg can't hold it
   w_pred: 1.0

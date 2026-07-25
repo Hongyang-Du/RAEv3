@@ -10,7 +10,7 @@
 set -euo pipefail
 
 CONFIG=${1:?usage: run_fusion_jepa.sh config.yaml [NGPU]}
-CONDA_ENV=/opt/conda/envs/rae
+CONDA_ENV=${CONDA_ENV:-/opt/conda/envs/rae}    # override on nodes where the env lives elsewhere
 TORCHRUN=${CONDA_ENV}/bin/torchrun
 PYTHON=${CONDA_ENV}/bin/python
 cd "$(dirname "$(realpath "$0")")"
