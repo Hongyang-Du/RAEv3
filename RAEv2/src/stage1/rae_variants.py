@@ -94,9 +94,15 @@ class _RAEVariantBase(nn.Module):
         if stage1_ckpt_path is not None:
             self._ckpt = torch.load(stage1_ckpt_path, map_location='cpu', weights_only=False)
             dec_key = 'ema_dec' if use_ema else 'decoder'
-            self.decoder.load_state_dict(self._ckpt[dec_key])
-            print(f"{type(self).__name__}: loaded decoder[{dec_key}] from {stage1_ckpt_path}"
-                  f" (stage-1 epoch {self._ckpt.get('epoch')})")
+            if dec_key in self._ckpt:
+                self.decoder.load_state_dict(self._ckpt[dec_key])
+                print(f"{type(self).__name__}: loaded decoder[{dec_key}] from {stage1_ckpt_path}"
+                      f" (stage-1 epoch {self._ckpt.get('epoch')})")
+            else:
+                # Stage-0-only ckpt (JEPA fusion, no decoder). OK for a train-only DiT
+                # with sample-viz/eval disabled: encode() never calls the decoder.
+                print(f"{type(self).__name__}: no '{dec_key}' in {stage1_ckpt_path} -> "
+                      f"decoder left at init (train-only; do NOT decode/sample/eval)")
 
         for p in self.parameters():
             p.requires_grad_(False)

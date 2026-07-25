@@ -69,7 +69,8 @@ case "${1:-}" in
   exp3) CFG=configs/stage2/training/imagenet-dinov3l-encoder-cls-k23.yaml;            BASE=omnirae-dit-encoder-cls-k23 ;;
   exp4) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23.yaml;             BASE=omnirae-dit-depthattn-cls-k23 ;;  # DepthAttnCombine (Variant B), drop:false = full-k23 latent, on-the-fly encode
   exp5) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23-cachedlatent.yaml; BASE=omnirae-dit-depthattn-cls-k23-p03-cachedlatent ;;  # same as exp4 but reads precomputed latents (scripts/stage1/precompute_latents.py) -- needs /mnt/localssd/latents-depthattn-k23-nano-p03 staged on every node first
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5>"; exit 1 ;;
+  jepa-k7) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k7.yaml; BASE=omnirae-dit-jepa-depthattn-k7 ;;  # DiT on the FROZEN Stage-0 JEPA k7 latent, on-the-fly encode, viz OFF (no decoder yet)
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
 

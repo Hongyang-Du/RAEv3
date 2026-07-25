@@ -278,9 +278,26 @@ def main():
         # cpu/cuda device-mismatch ValueError.
         decoder = decoder.to(device)
 
+    # Stage-0 JEPA warm-start: load ONLY the combine from a stage-0 fusion ckpt and
+    # FREEZE it (decoder trains from scratch; the recon->combine gradient is severed,
+    # which is the whole point of the decoupled-fusion plan). Mask sampling still fires
+    # in the loop (combine.train()) since it's gated on self.training, not requires_grad.
+    if os.environ.get("STAGE0_COMBINE"):
+        _ck0 = torch.load(os.environ["STAGE0_COMBINE"], map_location="cpu", weights_only=False)
+        combine.load_state_dict(_ck0["combine"], strict=True)
+        combine.requires_grad_(False)
+        del _ck0
+        if is_main:
+            print(f"[stage-0] loaded + FROZE combine from {os.environ['STAGE0_COMBINE']}", flush=True)
+
+    # has_params: does the combine have ANY params (drives train-mode + sigreg below).
     combine_has_params = combine.has_params if hasattr(combine, "has_params") \
         else any(True for _ in combine.parameters())
-    combine_ddp = DDP(combine, device_ids=[local_rank]) if combine_has_params else combine
+    # DDP-wrap the combine ONLY if it has TRAINABLE params. A frozen-but-has-params
+    # combine (Stage-1 on a frozen JEPA fusion) wrapped in DDP trips the
+    # unused-parameter check every step.
+    combine_trainable = any(p.requires_grad for p in combine.parameters())
+    combine_ddp = DDP(combine, device_ids=[local_rank]) if combine_trainable else combine
     decoder_ddp = DDP(decoder, device_ids=[local_rank])
     ema_combine = deepcopy(combine); ema_combine.requires_grad_(False); ema_combine.eval()
     ema_dec = deepcopy(decoder); ema_dec.requires_grad_(False); ema_dec.eval()
