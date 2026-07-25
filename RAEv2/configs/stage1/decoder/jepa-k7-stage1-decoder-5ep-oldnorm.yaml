@@ -1,0 +1,53 @@
+# Stage-1 decoder on the FROZEN Stage-0 JEPA k7 fusion -- 5-EPOCH variant of
+# jepa-k7-stage1-decoder-oldnorm.yaml, for a quick single-node (8xA100) recon check.
+# Combine is loaded + frozen via STAGE0_COMBINE (ckpt/stage0-fusion-jepa-depthattn-k7);
+# p_drop=0 / cls_surrogate=false match the JEPA stage-0 fusion. 5ep schedule borrows the
+# proven 5ep recipe (warmup 2, disc_start 2 = 2 GAN-free epochs). Distinct out_dir so it
+# does NOT collide with the 16ep run still writing to stage1-decoder-jepa-depthattn-k7.
+# Honest full-feed PSNR expected ~25-26 (much higher => latent still too pixel-like = alarm).
+#
+# REQUIRES: STAGE0_COMBINE=/sensei-fs-3/users/hongyangd/ckpt/stage0-fusion-jepa-depthattn-k7/ckpt_latest.pt
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    p_drop: 0
+    cls_surrogate: false          # matches the JEPA stage-0 fusion
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 2              # 2 GAN-free epochs; enough for the frozen fusion at 5ep budget
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 5
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage1-decoder-jepa-depthattn-k7-5ep
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: stage1-decoder-jepa-depthattn-k7-5ep

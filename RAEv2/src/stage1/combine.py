@@ -47,6 +47,7 @@ ZERO parameters. DDP errors on a param-free module, so the trainer must call it
 directly (not wrap it in DDP) when has_params is False.
 """
 
+import math
 from typing import List, Optional
 
 import torch
@@ -279,19 +280,64 @@ class MLSCombine(nn.Module):
 # Variant B: per-position depth attention (learned token-level fusion)
 # ---------------------------------------------------------------------------
 
+class MultiheadGateAttention(nn.Module):
+    """Sigmoid 'gate' attention over the KEY axis: every key gets an INDEPENDENT gate
+    sigmoid(q.k/sqrt(dh) + b) in [0,1] -- NO softmax normalization, so keys (= layers)
+    do NOT compete (boosting one does not suppress the rest). out = (gates @ V);
+    key_padding_mask zeros dropped layers via a -inf logit. out_proj is zero-init so the
+    enclosing DepthAttnBlock is still an exact no-op at init (identity preserved). Returns
+    the head-averaged gate [B,Lq,Lk] as the probe-facing 'weight' (NOT a simplex)."""
+
+    def __init__(self, dim: int, n_heads: int, bias_init: float = 0.0):
+        super().__init__()
+        assert dim % n_heads == 0, (dim, n_heads)
+        self.h, self.dh = n_heads, dim // n_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        # per-head gate bias; init<0 keeps early gates small (out_proj=0 makes init exact anyway)
+        self.gate_bias = nn.Parameter(torch.full((n_heads,), float(bias_init)))
+
+    def forward(self, q, kv, key_padding_mask=None):   # q [B,Lq,d] kv [B,Lk,d] mask [B,Lk] True=drop
+        B, Lq, d = q.shape
+        Lk = kv.shape[1]
+        Q = self.q_proj(q).view(B, Lq, self.h, self.dh).transpose(1, 2)    # [B,h,Lq,dh]
+        Kk = self.k_proj(kv).view(B, Lk, self.h, self.dh).transpose(1, 2)
+        V = self.v_proj(kv).view(B, Lk, self.h, self.dh).transpose(1, 2)
+        logits = (Q @ Kk.transpose(-2, -1)) / (self.dh ** 0.5)            # [B,h,Lq,Lk]
+        logits = logits + self.gate_bias.view(1, self.h, 1, 1)
+        if key_padding_mask is not None:
+            logits = logits.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+        gate = torch.sigmoid(logits)                                      # independent [0,1] per key
+        out = (gate @ V).transpose(1, 2).reshape(B, Lq, d)
+        return self.out_proj(out), gate.mean(1)                           # [B,Lq,d], gate_headavg [B,Lq,Lk]
+
+
 class DepthAttnBlock(nn.Module):
     """One depth-attention refinement block: the fused query token cross-attends
     over the K per-layer tokens at its own spatial position. The attention
     out-projection AND the FFN output are zero-init -> the block is an exact
-    no-op at init (residual around the query)."""
+    no-op at init (residual around the query).
 
-    def __init__(self, dim: int, n_heads: int, mlp_mult: int):
+    attn_kind='softmax' (default): competitive nn.MultiheadAttention (simplex weights).
+    attn_kind='gate': independent per-layer sigmoid gates (MultiheadGateAttention)."""
+
+    def __init__(self, dim: int, n_heads: int, mlp_mult: int,
+                 attn_kind: str = "softmax", K: int = 23):
         super().__init__()
+        assert attn_kind in ("softmax", "gate"), attn_kind
+        self.attn_kind = attn_kind
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        nn.init.zeros_(self.attn.out_proj.weight)
-        nn.init.zeros_(self.attn.out_proj.bias)
+        if attn_kind == "gate":
+            self.attn = MultiheadGateAttention(dim, n_heads, bias_init=-math.log(K))
+        else:
+            self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+            nn.init.zeros_(self.attn.out_proj.weight)
+            nn.init.zeros_(self.attn.out_proj.bias)
         self.norm_ffn = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(nn.Linear(dim, mlp_mult * dim), nn.GELU(),
                                  nn.Linear(mlp_mult * dim, dim))
@@ -300,11 +346,15 @@ class DepthAttnBlock(nn.Module):
 
     def forward(self, q, kv, pad, return_attn=False):   # q [S,1,d]  kv [S,K,d]  pad [S,K]
         kvn = self.norm_kv(kv)
-        a, w = self.attn(self.norm_q(q), kvn, kvn, key_padding_mask=pad,
-                         need_weights=return_attn, average_attn_weights=True)
+        qn = self.norm_q(q)
+        if self.attn_kind == "gate":
+            a, w = self.attn(qn, kvn, key_padding_mask=pad)              # w = head-avg gate [S,1,K]
+        else:
+            a, w = self.attn(qn, kvn, kvn, key_padding_mask=pad,
+                             need_weights=return_attn, average_attn_weights=True)
         q = q + a
         q = q + self.ffn(self.norm_ffn(q))
-        return (q, w) if return_attn else q             # w [S,1,K] head-avg softmax (probe)
+        return (q, w) if return_attn else q             # w [S,1,K] head-avg weight/gate (probe)
 
 
 class DepthAttnFusion(nn.Module):
@@ -315,11 +365,13 @@ class DepthAttnFusion(nn.Module):
     tells attention WHICH layer each kv token came from (it only reaches the
     output through the zero-init projections, so init identity is preserved)."""
 
-    def __init__(self, dim: int, K: int, n_layers: int, n_heads: int, mlp_mult: int):
+    def __init__(self, dim: int, K: int, n_layers: int, n_heads: int, mlp_mult: int,
+                 attn_kind: str = "softmax"):
         super().__init__()
         self.depth_pos = nn.Parameter(torch.randn(K, dim) * 0.02)
         self.blocks = nn.ModuleList(
-            [DepthAttnBlock(dim, n_heads, mlp_mult) for _ in range(n_layers)])
+            [DepthAttnBlock(dim, n_heads, mlp_mult, attn_kind=attn_kind, K=K)
+             for _ in range(n_layers)])
 
     def forward(self, z0, stk, mask, return_attn=False):     # z0 [B,N,d] stk [K,B,N,d] mask [B,K]
         K, B, N, d = stk.shape
@@ -368,7 +420,8 @@ class DepthAttnCombine(nn.Module):
                  out_dim: int = 1024,
                  n_layers: int = 2,
                  n_heads: int = 8,
-                 mlp_mult: int = 2):
+                 mlp_mult: int = 2,
+                 attn_kind: str = "softmax"):
         super().__init__()
         assert dim == out_dim, "DepthAttnCombine is residual around the mean: dim must equal out_dim"
         self.layers = list(layers)
@@ -377,7 +430,8 @@ class DepthAttnCombine(nn.Module):
         self.full_frac = full_frac
         self.uniform_frac = uniform_frac
         self.cls_surrogate = cls_surrogate
-        self.fusion = DepthAttnFusion(dim, self.K, n_layers, n_heads, mlp_mult)
+        self.fusion = DepthAttnFusion(dim, self.K, n_layers, n_heads, mlp_mult,
+                                      attn_kind=attn_kind)
 
     @property
     def has_params(self) -> bool:

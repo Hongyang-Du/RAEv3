@@ -70,7 +70,8 @@ case "${1:-}" in
   exp4) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23.yaml;             BASE=omnirae-dit-depthattn-cls-k23 ;;  # DepthAttnCombine (Variant B), drop:false = full-k23 latent, on-the-fly encode
   exp5) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23-cachedlatent.yaml; BASE=omnirae-dit-depthattn-cls-k23-p03-cachedlatent ;;  # same as exp4 but reads precomputed latents (scripts/stage1/precompute_latents.py) -- needs /mnt/localssd/latents-depthattn-k23-nano-p03 staged on every node first
   jepa-k7) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k7.yaml; BASE=omnirae-dit-jepa-depthattn-k7 ;;  # DiT on the FROZEN Stage-0 JEPA k7 latent, on-the-fly encode, viz OFF (no decoder yet)
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7>"; exit 1 ;;
+  jepa-k23) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k23.yaml; BASE=omnirae-dit-jepa-depthattn-k23 ;;  # DiT on the FROZEN Stage-0 JEPA k23 latent (full 23-layer stack), on-the-fly encode, viz OFF (no decoder yet)
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7|jepa-k23>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
 
@@ -118,14 +119,43 @@ fi
 WANDB_FLAG=""; [ -n "${WANDB_KEY:-}" ] && WANDB_FLAG="--wandb"
 echo "### $(date '+%F %T')  ${EXPERIMENT_NAME}  nodes=${NUM_NODES} node_rank=${NODE_RANK} nproc=${NPROC} master=${MASTER}:${MPORT} cfg=${CFG} wandb=${WANDB_FLAG:-off}"
 
+# PREFLIGHT: fail fast on an unreachable rendezvous master instead of hanging the full
+# join_timeout. run-2 of jepa-k7 died this way: after auto-recovery replaced the rank-0
+# pod, MASTER_ADDR still pointed at the OLD pod name (e.g. ...-2-0-d3lo17) which no longer
+# resolved ("gai error: -2 - Name or service not known"), so every worker sat at
+# rendezvous for the whole 30-min join_timeout, exited 1, and the job burned its
+# auto-recovery budget without ever re-forming the group. Poll DNS for up to
+# MASTER_WAIT_SECS (default 300) and abort early with a clear message if it never resolves.
+MASTER_WAIT_SECS="${MASTER_WAIT_SECS:-300}"
+if [ "${NODE_RANK}" != "0" ]; then
+  echo "### $(date '+%F %T') waiting up to ${MASTER_WAIT_SECS}s for rendezvous master '${MASTER}' to resolve..."
+  __deadline=$(( $(date +%s) + MASTER_WAIT_SECS ))
+  until getent hosts "${MASTER}" >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "${__deadline}" ]; then
+      echo "### FATAL: rendezvous master '${MASTER}' never resolved in ${MASTER_WAIT_SECS}s"
+      echo "###        (MASTER_ADDR=${MASTER_ADDR:-<unset>}, JOB_NAME=${JOB_NAME:-<unset>}, RANK=${NODE_RANK})."
+      echo "###        The rank-0 pod was likely preempted/replaced and its hostname changed."
+      echo "###        Enable 'Auto Requeue on Preemption' so the whole job requeues together,"
+      echo "###        and/or use a non-spare (quota-backed) allocation to stop rank-0 churn."
+      exit 1
+    fi
+    sleep 5
+  done
+  echo "### $(date '+%F %T') master '${MASTER}' resolved: $(getent hosts "${MASTER}" | awk '{print $1}' | tr '\n' ' ')"
+fi
+
+# join_timeout kept modest (was 1800): a broken rendezvous should surface in minutes, not
+# burn 30 min per auto-recovery incident. max-restarts lets torchrun's agent retry the
+# rendezvous a few times before giving the pod up to the platform.
 exec "$TR" \
   --nnodes="${NUM_NODES}" \
   --node_rank="${NODE_RANK}" \
   --nproc_per_node="${NPROC}" \
+  --max-restarts=3 \
   --rdzv_backend=c10d \
   --rdzv_id="${JOB_NAME:-omnirae}-${BASE}" \
   --rdzv_endpoint="${MASTER}:${MPORT}" \
-  --rdzv_conf=join_timeout=1800 \
+  --rdzv_conf=join_timeout=600 \
   src/train.py \
   --config "$CFG" \
   --results-dir "$ROOT/ckpt" \
