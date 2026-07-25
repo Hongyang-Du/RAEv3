@@ -34,7 +34,7 @@ combine:
     - 21
     - 22
     - 23
-    p_drop: 0.3              # Bernoulli group of the internal stratified sampler
+    p_drop: 0.8              # Bernoulli group of the internal stratified sampler
     cls_surrogate: true
     dim: 1024
     out_dim: 1024

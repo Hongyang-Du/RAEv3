@@ -298,12 +298,13 @@ class DepthAttnBlock(nn.Module):
         nn.init.zeros_(self.ffn[-1].weight)
         nn.init.zeros_(self.ffn[-1].bias)
 
-    def forward(self, q, kv, pad):                   # q [S,1,d]  kv [S,K,d]  pad [S,K]
+    def forward(self, q, kv, pad, return_attn=False):   # q [S,1,d]  kv [S,K,d]  pad [S,K]
         kvn = self.norm_kv(kv)
-        a, _ = self.attn(self.norm_q(q), kvn, kvn,
-                         key_padding_mask=pad, need_weights=False)
+        a, w = self.attn(self.norm_q(q), kvn, kvn, key_padding_mask=pad,
+                         need_weights=return_attn, average_attn_weights=True)
         q = q + a
-        return q + self.ffn(self.norm_ffn(q))
+        q = q + self.ffn(self.norm_ffn(q))
+        return (q, w) if return_attn else q             # w [S,1,K] head-avg softmax (probe)
 
 
 class DepthAttnFusion(nn.Module):
@@ -320,14 +321,20 @@ class DepthAttnFusion(nn.Module):
         self.blocks = nn.ModuleList(
             [DepthAttnBlock(dim, n_heads, mlp_mult) for _ in range(n_layers)])
 
-    def forward(self, z0, stk, mask):                # z0 [B,N,d] stk [K,B,N,d] mask [B,K]
+    def forward(self, z0, stk, mask, return_attn=False):     # z0 [B,N,d] stk [K,B,N,d] mask [B,K]
         K, B, N, d = stk.shape
         kv = stk.permute(1, 2, 0, 3).reshape(B * N, K, d) + self.depth_pos
         q = z0.reshape(B * N, 1, d)
         pad = (~mask.bool()).repeat_interleave(N, dim=0)          # [B*N, K], True = drop
+        attns = []
         for blk in self.blocks:
-            q = blk(q, kv, pad)
-        return q.reshape(B, N, d)
+            if return_attn:
+                q, w = blk(q, kv, pad, return_attn=True)
+                attns.append(w.reshape(B, N, K))                  # per-block [B,N,K] weights
+            else:
+                q = blk(q, kv, pad)
+        out = q.reshape(B, N, d)
+        return (out, attns) if return_attn else out
 
 
 class DepthAttnCombine(nn.Module):
@@ -354,8 +361,8 @@ class DepthAttnCombine(nn.Module):
     def __init__(self,
                  layers,
                  p_drop: float = 0.3,
-                 full_frac: float = 1 / 3,
-                 uniform_frac: float = 1 / 3,
+                 full_frac: float = 0.15,
+                 uniform_frac: float = 0.0,
                  cls_surrogate: bool = False,
                  dim: int = 1024,
                  out_dim: int = 1024,
@@ -376,7 +383,7 @@ class DepthAttnCombine(nn.Module):
     def has_params(self) -> bool:
         return True
 
-    def forward(self, layer_tokens, idx=None, mask=None) -> torch.Tensor:
+    def forward(self, layer_tokens, idx=None, mask=None, return_attn=False) -> torch.Tensor:
         stk = torch.stack(layer_tokens, dim=0)     # [K, B, N, dim]
         K, B = stk.shape[0], stk.shape[1]
         if mask is None:
@@ -393,10 +400,22 @@ class DepthAttnCombine(nn.Module):
         w = mask.to(stk.dtype).t()                 # [K, B]
         w = w / w.sum(0, keepdim=True).clamp_min(1e-6)
         z0 = (w.view(K, B, 1, 1) * stk).sum(0)     # masked equal-weight mean
-        z = self.fusion(z0, stk, mask)
+        if return_attn:
+            z, attns = self.fusion(z0, stk, mask, return_attn=True)
+        else:
+            z = self.fusion(z0, stk, mask)
         if self.cls_surrogate:
-            z = z + stk[-1].mean(dim=1, keepdim=True)   # raev2 L_last token-mean (fixed)
-        return z
+            # mask-GATED L_last token-mean: samples that DROP the last layer must not
+            # get its token-mean added back, else it leaks the deep-layer signal and
+            # (in Stage-0 JEPA) both poisons the grounding target and cancels half the
+            # "predict the missing deep layer" pressure. At full feed (eval, mask
+            # all-ones) gate==1 -> identical to the raev2 add. NOTE: this changes the
+            # train-time behaviour of ANY cls_surrogate=True run under masking (a
+            # dropped-L_last sample no longer gets the surrogate); full-feed eval is
+            # unchanged, so decoder/DiT expectations at inference are unaffected.
+            gate = mask[:, -1].to(z.dtype).view(B, 1, 1)
+            z = z + gate * stk[-1].mean(dim=1, keepdim=True)
+        return (z, attns) if return_attn else z
 
 
 # ---------------------------------------------------------------------------

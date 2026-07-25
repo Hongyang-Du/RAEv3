@@ -71,6 +71,8 @@ case "${1:-}" in
   nano-drop-p03-ganheavy) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-ganheavy-oldnorm.yaml ;;  # k23 p_drop=0.3 w/ disc_weight 4.0 + disc_start=0
   nano-drop-p03-maskcond) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-maskcond-oldnorm.yaml ;;  # Variant A mask conditioning (AdaLN), from scratch, anchor 16ep recipe
   nano-drop-p03-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k23-nano-p03-depthattn-oldnorm.yaml ;;  # Variant B depth-attn fusion, from scratch, anchor 16ep recipe
+  nano-drop-k7-p03-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p03-depthattn-oldnorm.yaml ;;  # k7 (deep-only) depth-attn fusion, from scratch, anchor 16ep recipe
+  nano-drop-k7-p05-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p05-depthattn-oldnorm.yaml ;;  # k7 (deep-only) depth-attn fusion, p_drop=0.5, from scratch, anchor 16ep recipe
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
@@ -137,7 +139,7 @@ PYEOF
 )"
     echo "### 4src-s3: global=$((32*NUM_NODES*NPROC)) BATCH/GPU=32 LR=$LR_OVERRIDE epochs=16(real)"
     ;;
-  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|nano-drop|nano-drop-p005|nano-drop-p01|nano-drop-p05|nano-drop-p07|nano-drop-k7-p03|nano-drop-p03-ganheavy|nano-ft-k23|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
+  *) echo "usage: NUM_NODES=4 bash run_pluto_decoder_4node.sh <ft-plain|drop0-scratch|nano-drop|nano-drop-p005|nano-drop-p01|nano-drop-p05|nano-drop-p07|nano-drop-k7-p03|nano-drop-p03-ganheavy|nano-drop-p03-depthattn|nano-drop-k7-p03-depthattn|nano-drop-k7-p05-depthattn|nano-ft-k23|general-4src|general-4src-local|general-4src-s3>"; exit 1 ;;
 esac
 
 # Stage nanovisionx imagenet-256 from S3 -> node-local SSD (the /sensei-fs shared copy was

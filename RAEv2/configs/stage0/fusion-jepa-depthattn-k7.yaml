@@ -1,0 +1,57 @@
+# Stage-0: JEPA feature-fusion pretraining for DepthAttnCombine (k7 = DEEP layers
+# only), decoupled from the decoder. Derived from fusion-jepa-depthattn-k23.yaml;
+# only the layer set differs (deep [11..23] vs full [1..23]). k7 is the deep-only
+# baseline that already diffused well under the recon objective -- here it gets the
+# same JEPA treatment so k23-vs-k7 Stage-0 is an apples-to-apples comparison.
+# See src/train_fusion_jepa.py.
+#
+#   torchrun --nproc_per_node=8 src/train_fusion_jepa.py \
+#       --config configs/stage0/fusion-jepa-depthattn-k7.yaml
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    # NOTE: p_drop mirrors k23 (0.75) but K=7 here -> avg kept ~= 7*0.25 = 1.75 layers
+    # in the ctx view (vs ~5.75 at k23). Same >=1-kept guarantee, but a much harder
+    # subset->full task; consider lowering if the LOO/pred-loss signatures look starved.
+    p_drop: 0.75
+    full_frac: 0.0          # ignored/forced to 0 by the trainer (ctx = pure subset)
+    uniform_frac: 0.0       # trainer overrides with training.uniform_frac
+    cls_surrogate: false    # grounding head carries CLS (frozen L23 = last layer, same as k23)
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+predictor:
+  n_layers: 2               # throwaway; add depth only if the exit gate shows underfit
+  n_heads: 8
+  mlp_mult: 2
+sigreg:
+  distributed: true         # global all-reduced ECF (LeJEPA calibration)
+  scale_by_n: true
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  num_workers: 8
+training:
+  epochs: 10
+  batch_size: 64            # no decoder/GAN/LPIPS -> much larger batch fits than stage-1
+  lr: 2.0e-4
+  warmup_epochs: 1
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  p_drop: 0.75              # see combine note: aggressive at K=7 (~1.75 kept)
+  uniform_frac: 0.0         # ctx sampler: pure Bernoulli(1-p_drop) subsets
+  detach_target: false      # LeJEPA/LeWM live target; set true only if SIGReg can't hold it
+  w_pred: 1.0
+  w_sig: 0.02               # LeJEPA lambda (transfers across batch via scale_by_n)
+  w_gnd: 1.0
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage0-fusion-jepa-depthattn-k7
+wandb:
+  enabled: true
+  project: LeRAE
+  entity: uscgvl
+  name: stage0-fusion-jepa-depthattn-k7

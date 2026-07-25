@@ -1,0 +1,52 @@
+# k=7 native depth-attn, FULL 16-epoch anchor recipe (not the 5ep smoke sweep).
+# combine.params.layers IS the k7 set [11,13,15,17,19,21,23] (deep layers only) -- the
+# subset the latent-complexity probe showed stays spatially smooth (adj-cos 0.46 vs
+# k23's 0.28) and near-Gaussian (|kurt| 0.09 vs k23's 0.66), i.e. a much easier DiT
+# target than the k23 depth-attn latent. Identical recipe to
+# randomdrop-plain-k23-nano-p03-depthattn-oldnorm.yaml (stratified 1/3 full,
+# 1/3 uniform-|S|, 1/3 Bernoulli p=0.3 mask sampler over the kept set, cls_surrogate on,
+# 16 epochs / 8 GAN-free + 8 GAN epochs) -- only the fed layer-set differs (7 vs 23).
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    p_drop: 0.5              # Bernoulli group of the internal stratified sampler
+    cls_surrogate: true
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2              # 2 depth-attn refinement blocks, ~17M params (combine-level)
+    n_heads: 8
+    mlp_mult: 2
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8            # anchor recipe: 8 GAN-free epochs to let the fusion settle
+data:
+  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16                 # anchor recipe, from scratch (matched training budget)
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k7-nano-p0.5-depthattn
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: omni-randomdrop-plain-k7-nano-p0.5-depthattn

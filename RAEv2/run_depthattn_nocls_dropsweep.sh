@@ -92,7 +92,8 @@ print(ck.get('epoch', 0))
   CKPT="/mnt/localssd/stage/dropsweep_p${PSTR_V}/ckpt_latest.pt"
   [[ -f $CKPT ]] || cp "$OD/ckpt_latest.pt" "$CKPT"
 
-  declare -A IDX=( [k23full]="" [k7]="--idx 0,1,2,3,4,5,6" [l11]="--idx 10" [l23]="--idx 22" )
+  # k7 == RAEv2 official k7 feed: layers 11,13,15,17,19,21,23 (0-based idx into [1..23]).
+  declare -A IDX=( [k23full]="" [k7]="--idx 10,12,14,16,18,20,22" [l11]="--idx 10" [l23]="--idx 22" )
   gpu=0
   for feed in k23full k7 l11 l23; do
     tag="${TAG}_${feed}_50k"

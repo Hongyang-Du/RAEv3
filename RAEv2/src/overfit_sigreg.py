@@ -58,9 +58,9 @@ def all_gather_with_grad(z: torch.Tensor) -> torch.Tensor:
 
 # ─── SIGReg ─────────────────────────────────────────────────────────────────
 
-def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
+def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 17,
                 max_samples: int = 32768, distributed: bool = False,
-                scale_by_n: bool = False) -> torch.Tensor:
+                scale_by_n: bool = False, t_max: float = 3.0) -> torch.Tensor:
     """Sketched Isotropic Gaussian Regularization (SIGReg, LeJEPA-style).
 
     A distribution is N(0, I) iff every 1D projection is N(0, 1) (Cramér-Wold),
@@ -123,10 +123,21 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
     # Epps-Pulley test per slice over a Gaussian-weighted frequency grid:
     #   φ_emp(t) = mean_i exp(i·t·projᵢ);  for N(0,1)  φ(t) = e^{-t²/2}
     #   penalty  = Σ_t w(t) · |φ_emp(t) - e^{-t²/2}|²,   averaged over slices
-    t = torch.linspace(0.1, 4.0, n_freq, device=z.device)           # [n_freq]
-    w = torch.exp(-0.5 * t ** 2)                                     # weight
+    # Official LeJEPA Epps-Pulley quadrature (matches lejepa/univariate/epps_pulley.py:
+    # EppsPulley, integration='trapezoid'): trapezoid integral of
+    # |phi_emp(t) - e^{-t^2/2}|^2 over t in [0, t_max], with the negative-t half folded
+    # in via doubled interior weights (half-weight at the two endpoints), times the
+    # Gaussian weight phi(t)=e^{-t^2/2}. NOT normalized by the weight sum -- it is the
+    # integral itself; * N (scale_by_n) is the paper's calibration so lambda ~ 0.02
+    # transfers across batch sizes. (t=0 contributes 0: phi=1, cos(0)=1 -> err=0.)
+    t = torch.linspace(0.0, t_max, n_freq, device=z.device)         # [n_freq], includes 0
+    phi = torch.exp(-0.5 * t ** 2)
+    dt = t_max / max(1, n_freq - 1)
+    quad = torch.full((n_freq,), 2.0 * dt, device=z.device)
+    quad[0] = quad[-1] = dt                                          # trapezoid endpoints
+    weights = quad * phi                                            # symmetry (2*dt) folded in
     loss = proj.new_zeros(())
-    for tk, wk in zip(t.unbind(), w.unbind()):                       # loop = low peak mem
+    for tk, phik, wk in zip(t.unbind(), phi.unbind(), weights.unbind()):  # loop = low peak mem
         cos_emp = torch.cos(proj * tk).mean(0)                      # [n_proj]
         sin_emp = torch.sin(proj * tk).mean(0)                      # [n_proj]
         if sync:
@@ -134,9 +145,8 @@ def sigreg_loss(z: torch.Tensor, n_proj: int = 1024, n_freq: int = 8,
             # (equal per-rank counts), grads flow back into local samples
             cos_emp = dist_nn.all_reduce(cos_emp) / world
             sin_emp = dist_nn.all_reduce(sin_emp) / world
-        cf2     = (cos_emp - torch.exp(-0.5 * tk ** 2)) ** 2 + sin_emp ** 2
-        loss    = loss + wk * cf2.mean()
-    loss = loss / w.sum()
+        cf2  = (cos_emp - phik) ** 2 + sin_emp ** 2
+        loss = loss + wk * cf2.mean()                               # mean over slices
     if scale_by_n:
         n_total = z.shape[0] * (world if sync else 1)
         loss = loss * n_total

@@ -1,0 +1,55 @@
+# Stage-0: JEPA feature-fusion pretraining for DepthAttnCombine (k23), decoupled
+# from the decoder. Trains the fusion by layer-JEPA (subset->full prediction) +
+# global SIGReg + a frozen-L23 grounding head; NO decoder/GAN/LPIPS. See
+# src/train_fusion_jepa.py. First run: PLAIN DepthAttnCombine (dim-wide, no
+# bottleneck) + cls_surrogate=false (grounding head carries the CLS-level signal;
+# revisit at the exit gate via linear probe). full_frac is FORCED to 0 by the
+# trainer regardless of what is set here (ctx must be a pure subset stream).
+#
+#   torchrun --nproc_per_node=8 src/train_fusion_jepa.py \
+#       --config configs/stage0/fusion-jepa-depthattn-k23.yaml
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    p_drop: 0.75
+    full_frac: 0.0          # ignored/forced to 0 by the trainer (ctx = pure subset)
+    uniform_frac: 0.0       # trainer overrides with training.uniform_frac
+    cls_surrogate: false    # grounding head carries CLS; flip on (mask-gated) if probe says so
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+predictor:
+  n_layers: 2               # throwaway; add depth only if the exit gate shows underfit
+  n_heads: 8
+  mlp_mult: 2
+sigreg:
+  distributed: true         # global all-reduced ECF (LeJEPA calibration)
+  scale_by_n: true
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  num_workers: 8
+training:
+  epochs: 10
+  batch_size: 64            # no decoder/GAN/LPIPS -> much larger batch fits than stage-1
+  lr: 2.0e-4
+  warmup_epochs: 1
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  p_drop: 0.75
+  uniform_frac: 0.0         # ctx sampler: pure Bernoulli(1-p_drop) subsets
+  detach_target: false      # LeJEPA/LeWM live target; set true only if SIGReg can't hold it
+  w_pred: 1.0
+  w_sig: 0.02               # LeJEPA lambda (transfers across batch via scale_by_n)
+  w_gnd: 1.0
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage0-fusion-jepa-depthattn-k23
+wandb:
+  enabled: true
+  project: LeRAE
+  entity: uscgvl
+  name: stage0-fusion-jepa-depthattn-k23
