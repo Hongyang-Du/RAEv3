@@ -74,6 +74,8 @@ case "${1:-}" in
   nano-drop-k7-p03-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p03-depthattn-oldnorm.yaml ;;  # k7 (deep-only) depth-attn fusion, from scratch, anchor 16ep recipe
   jepa-k7-decoder) CFG=configs/stage1/decoder/jepa-k7-stage1-decoder-oldnorm.yaml ;;  # Stage-1: decoder on FROZEN JEPA k7 fusion (needs STAGE0_COMBINE env)
   jepa-k23-decoder) CFG=configs/stage1/decoder/jepa-k23-stage1-decoder-oldnorm.yaml ;;  # Stage-1: decoder on FROZEN JEPA k23 fusion (needs STAGE0_COMBINE env)
+  rent-gandetach) CFG=configs/stage1/decoder/rent-k23-depthattn-softmax-gandetach-2node.yaml ;;  # JOINT fusion+decoder + semantic rent; GAN DETACHED from fusion. TRAINABLE fusion -> do NOT set STAGE0_COMBINE.
+  rent-ganfusion) CFG=configs/stage1/decoder/rent-k23-depthattn-softmax-ganfusion-2node.yaml ;;  # same, but Phase-B GAN reaches fusion (ablation arm). do NOT set STAGE0_COMBINE.
   nano-drop-k7-p05-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p05-depthattn-oldnorm.yaml ;;  # k7 (deep-only) depth-attn fusion, p_drop=0.5, from scratch, anchor 16ep recipe
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
@@ -147,7 +149,7 @@ esac
 # Stage nanovisionx imagenet-256 from S3 -> node-local SSD (the /sensei-fs shared copy was
 # deleted; the nano configs' data_dir points at $LSSD). Runs on EVERY node; skip if already
 # staged. Needs AWS creds / instance-role with s3:GetObject on the bucket.
-if [[ "$CFG" == *nano* || "$CFG" == *oldnorm* ]]; then
+if [[ "$CFG" == *nano* || "$CFG" == *oldnorm* || "$CFG" == *rent* ]]; then
   LSSD=/mnt/localssd/imagenet-256
   if [ ! -f "$LSSD/imagenet-latents-images/dataset_info.json" ]; then
     echo "### $(date '+%F %T') staging nano imagenet -> $LSSD ..."

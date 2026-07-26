@@ -84,6 +84,40 @@ class MaskCondConfig:
 
 
 @dataclass
+class SemanticRentConfig:
+    """Anti-collapse rent + per-loss gradient routing for JOINT fusion+decoder
+    training (stage1.semantic_rent.SemanticRentHeads). Linear heads predict the
+    standardized mean of a strided set of MID/DEEP encoder layers from the fusion
+    latent; a live lambda_sem controller holds R_deep(full) at r_setpoint. Layer
+    indices are positions into combine.layers, negatives count from the end
+    (-1 = last). None on DecoderConfig -> everything unchanged (legacy path)."""
+    # strided band targets (default deep = {last, -3, -5, -7}; mid spread below it)
+    mid_layers: List[int] = field(default_factory=lambda: [-9, -11, -13, -15])   # idx 14,12,10,8
+    deep_layers: List[int] = field(default_factory=lambda: [-1, -3, -5, -7])      # idx 22,20,18,16
+    w_mid: float = 1.0
+    w_deep: float = 2.0
+    head_hidden: int = 0            # 0 = linear (recommended weak rent); >0 = one GELU hidden
+    momentum: float = 0.01          # running-stat momentum for target standardization
+    # live lambda_sem controller (feedback = R_deep on FULL-mask rows, rank-averaged)
+    lambda_init: float = 1.0
+    lambda_min: float = 0.05
+    lambda_max: float = 20.0
+    r_setpoint: float = 0.8         # deep R target the controller holds
+    r_mid_floor: float = 0.6        # logged guardrail only (no auto-action)
+    ctrl_eta: float = 0.5
+    ctrl_every: int = 50            # optimizer steps between lambda updates
+    ctrl_ema: float = 0.9          # EMA on R_deep(full) feeding the controller
+    # gradient routing
+    gan_into_fusion: bool = False   # False: GAN always decode(sg(z)) -> never reaches fusion.
+                                    # True : Phase-B GAN reaches fusion (the ablation arm).
+    recon_phase: str = "B"          # A|B: which phase opens L1+LPIPS into fusion (A = from step 0)
+    # Phase A -> B latch: enter B once R_deep(full)-EMA >= r_setpoint (and past
+    # phase_a_min_frac), hard-capped to force B by phase_a_max_frac of total steps.
+    phase_a_min_frac: float = 0.05
+    phase_a_max_frac: float = 0.4
+
+
+@dataclass
 class PDropScheduleConfig:
     """Anneal MLSCombine.p_drop from `start` to `end` over training. Supports both
     a<b (0.1->0.9) and a>b (0.9->0.1). When p_drop_schedule is None the static
@@ -137,3 +171,4 @@ class DecoderConfig:
     probe: ProbeConfig = field(default_factory=ProbeConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     mask_cond: Optional[MaskCondConfig] = None   # Variant A mask conditioning; None = off
+    semantic_rent: Optional[SemanticRentConfig] = None   # joint fusion+decoder rent; None = off

@@ -302,7 +302,24 @@ def main():
     ema_combine = deepcopy(combine); ema_combine.requires_grad_(False); ema_combine.eval()
     ema_dec = deepcopy(decoder); ema_dec.requires_grad_(False); ema_dec.eval()
 
-    trainable = [p for p in list(combine.parameters()) + list(decoder.parameters()) if p.requires_grad]
+    # -- semantic rent (joint fusion+decoder anti-collapse heads) --------------
+    SR = cfg.semantic_rent
+    sem_heads = sem_heads_ddp = None
+    if SR is not None:
+        from stage1.semantic_rent import SemanticRentHeads
+        sem_heads = SemanticRentHeads(latent_dim, len(layers), list(SR.mid_layers),
+                                      list(SR.deep_layers), hidden=SR.head_hidden,
+                                      momentum=SR.momentum).to(device)
+        sem_heads_ddp = DDP(sem_heads, device_ids=[local_rank])
+        if is_main:
+            print(f"[semantic_rent] heads: mid={sem_heads.mid_idx} deep={sem_heads.deep_idx} "
+                  f"hidden={SR.head_hidden} | gan_into_fusion={SR.gan_into_fusion} "
+                  f"recon_phase={SR.recon_phase} | {sum(p.numel() for p in sem_heads.parameters())/1e6:.2f}M",
+                  flush=True)
+
+    trainable = [p for p in list(combine.parameters()) + list(decoder.parameters())
+                 + (list(sem_heads.parameters()) if sem_heads is not None else [])
+                 if p.requires_grad]
     if is_main:
         print(f"Trainable: {sum(p.numel() for p in trainable)/1e6:.1f}M  "
               f"(combine {sum(p.numel() for p in combine.parameters())/1e6:.2f}M + decoder)")
@@ -385,6 +402,9 @@ def main():
 
     # -- auto-resume -----------------------------------------------------------
     start_epoch = global_step = 0
+    # semantic-rent controller state (survives resume via ckpt["sem_state"])
+    sem_state = {"lambda_sem": (SR.lambda_init if SR is not None else 0.0),
+                 "phaseB": False, "r_deep_ema": 0.0}
     latest = os.path.join(T.out_dir, "ckpt_latest.pt")
     if os.path.exists(latest):
         ck = torch.load(latest, map_location="cpu", weights_only=False)
@@ -392,6 +412,10 @@ def main():
         ema_combine.load_state_dict(ck["ema_combine"]); ema_dec.load_state_dict(ck["ema_dec"])
         disc.load_state_dict(ck["disc"]); optimizer.load_state_dict(ck["optimizer"])
         disc_optimizer.load_state_dict(ck["disc_optimizer"])
+        if sem_heads is not None and ck.get("sem_heads") is not None:
+            sem_heads.load_state_dict(ck["sem_heads"])
+        if ck.get("sem_state") is not None:
+            sem_state.update(ck["sem_state"])
         start_epoch, global_step = ck["epoch"], ck["global_step"]
         if "scheduler" in ck:
             scheduler.load_state_dict(ck["scheduler"])
@@ -609,12 +633,32 @@ def main():
                     imgs.shape[0], len(layers), combine.p_drop,
                     full_frac=MC.full_frac, uniform_frac=MC.uniform_frac, device=device)
                 drop_cond = torch.rand(imgs.shape[0], device=device) < MC.cond_drop
+            elif SR is not None:
+                # semantic rent needs the SAME mask in the fusion and the heads (for the
+                # full/subset R split), so sample it externally here even without decoder
+                # mask-conditioning, using the combine's own stratified-sampler knobs.
+                m_layers = sample_stratified_masks(
+                    imgs.shape[0], len(layers), combine.p_drop,
+                    full_frac=getattr(combine, "full_frac", 1 / 3),
+                    uniform_frac=getattr(combine, "uniform_frac", 1 / 3), device=device)
+                drop_cond = None
             else:
                 m_layers = drop_cond = None
 
+            # per-loss gradient routing into the fusion (semantic-rent joint run):
+            #   recon_open -> L1+LPIPS reach fusion; gan_open -> GAN reaches fusion.
+            # Legacy (SR None): both open == the old joint-fusion behaviour.
+            if SR is not None:
+                recon_open = sem_state["phaseB"] if SR.recon_phase == "B" else True
+                gan_open = SR.gan_into_fusion and sem_state["phaseB"]
+            else:
+                recon_open = gan_open = True
+            dec_mask = m_layers if MC else None   # decoder conditioning only under mask_cond
             with autocast_ctx:
-                z = combine_ddp(layer_tokens, mask=m_layers) if MC else combine_ddp(layer_tokens)
-                x_rec = decode_imgs(decoder_ddp, z, layer_mask=m_layers, cond_drop=drop_cond)
+                z = combine_ddp(layer_tokens, mask=m_layers) if m_layers is not None \
+                    else combine_ddp(layer_tokens)
+                z_pix = z if recon_open else z.detach()
+                x_rec = decode_imgs(decoder_ddp, z_pix, layer_mask=dec_mask, cond_drop=drop_cond)
                 loss_l1 = F.l1_loss(x_rec, imgs)
                 loss_lpips = lpips_all(x_rec * 2 - 1, imgs * 2 - 1).mean()
             loss_rec = loss_l1 + L.lpips_w * loss_lpips
@@ -625,12 +669,30 @@ def main():
             loss_kl = (kl_divergence(combine.last_mu, combine.last_logvar)
                        if use_kl else torch.zeros((), device=device))
 
+            # semantic rent: linear heads read z (grad -> fusion+heads), frozen band targets
+            loss_sem = torch.zeros((), device=device)
+            sem_metrics = {}
+            if SR is not None:
+                stk = torch.stack(layer_tokens, dim=0)          # [K,B,N,d] (no_grad, frozen)
+                sem_losses, sem_metrics = sem_heads_ddp(z, stk, mask=m_layers)
+                loss_sem = SR.w_mid * sem_losses["mid"] + SR.w_deep * sem_losses["deep"]
+
             loss_gan = torch.zeros(1, device=device)
             if use_gan:
                 disc_ddp.eval()
                 half = max(1, x_rec.shape[0] // 2)   # half-batch GAN
+                # generator fake: reuse x_rec unless recon feeds fusion but GAN must NOT
+                # (then a separate half-batch forward on sg(z) keeps GAN out of fusion).
+                if SR is not None and recon_open and not gan_open:
+                    with autocast_ctx:
+                        _mh = dec_mask[:half] if dec_mask is not None else None
+                        _dh = drop_cond[:half] if drop_cond is not None else None
+                        fake_gen = decode_imgs(decoder_ddp, z.detach()[:half],
+                                               layer_mask=_mh, cond_drop=_dh)
+                else:
+                    fake_gen = x_rec[:half]
                 with autocast_ctx:
-                    fake_aug = disc_aug.aug(x_rec[:half] * 2 - 1)
+                    fake_aug = disc_aug.aug(fake_gen * 2 - 1)
                     logits_fake, _ = disc_ddp(fake_aug, None)
                 loss_gan = vanilla_g_loss(logits_fake)
                 # plain last param is frozen under LoRA/freeze finetune modes (grad-less ->
@@ -643,7 +705,9 @@ def main():
 
             sig_w = L.sigreg.weight if use_sig else 0.0
             kl_w = L.kl.weight if use_kl else 0.0
-            loss = loss_rec + sig_w * loss_sig + kl_w * loss_kl + L.gan.disc_weight * adp_w * loss_gan
+            lam_sem = sem_state["lambda_sem"] if SR is not None else 0.0
+            loss = loss_rec + sig_w * loss_sig + kl_w * loss_kl \
+                + L.gan.disc_weight * adp_w * loss_gan + lam_sem * loss_sem
             (loss / accum).backward()
             if is_accum_step:
                 if T.clip_grad > 0:
@@ -670,6 +734,32 @@ def main():
                 update_ema(ema_dec, decoder, T.ema_decay)
             global_step += 1
 
+            # ---- semantic-rent: rank-synced R_deep(full) -> phase latch + lambda ----
+            # every rank runs this every step (collective + deterministic update) so
+            # lambda_sem / phaseB stay identical across ranks.
+            if SR is not None:
+                rdf = sem_metrics.get("R_deep_full")
+                val = rdf.detach().float().reshape(()) if rdf is not None else torch.zeros((), device=device)
+                cnt = torch.ones((), device=device) if rdf is not None else torch.zeros((), device=device)
+                packed = torch.stack([val, cnt])
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                if packed[1] > 0:
+                    r_mean = float(packed[0] / packed[1])
+                    sem_state["r_deep_ema"] = (SR.ctrl_ema * sem_state["r_deep_ema"]
+                                               + (1 - SR.ctrl_ema) * r_mean)
+                if not sem_state["phaseB"]:
+                    frac = global_step / max(1, total_steps)
+                    if (sem_state["r_deep_ema"] >= SR.r_setpoint and frac >= SR.phase_a_min_frac) \
+                            or frac >= SR.phase_a_max_frac:
+                        sem_state["phaseB"] = True
+                        if is_main:
+                            print(f"  [semantic_rent] -> Phase B @ step {global_step} "
+                                  f"(R_deep_ema={sem_state['r_deep_ema']:.3f})", flush=True)
+                if global_step % SR.ctrl_every == 0:
+                    _ls = sem_state["lambda_sem"] * min(1.1, max(0.9,
+                            1 + SR.ctrl_eta * (SR.r_setpoint - sem_state["r_deep_ema"])))
+                    sem_state["lambda_sem"] = float(min(SR.lambda_max, max(SR.lambda_min, _ls)))
+
             if is_main and global_step % T.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 zd = gaussian_diag(z); ps = psnr(x_rec, imgs)
@@ -678,6 +768,19 @@ def main():
                       f"  kl={loss_kl.item():.4e}"
                       f"  gan={loss_gan.item():.4e}  z(mu={zd['mean']:.2f} sd={zd['std']:.2f})"
                       f"  vard(mu={zd['var_mean']:.2f})  lr={lr:.2e}", flush=True)
+                sem_log = {}
+                if SR is not None:
+                    sem_log = {"train/loss_sem": float(loss_sem), "train/lambda_sem": sem_state["lambda_sem"],
+                               "train/phaseB": int(sem_state["phaseB"]),
+                               "train/R_deep_ema": sem_state["r_deep_ema"]}
+                    for k in ("R_mid_full", "R_mid_sub", "R_deep_full", "R_deep_sub"):
+                        if k in sem_metrics:
+                            sem_log[f"train/{k}"] = float(sem_metrics[k])
+                    print(f"     [rent] lam={sem_state['lambda_sem']:.3f} phaseB={int(sem_state['phaseB'])}"
+                          f" R_deep(full={sem_log.get('train/R_deep_full', float('nan')):.3f}"
+                          f" sub={sem_log.get('train/R_deep_sub', float('nan')):.3f})"
+                          f" R_mid(full={sem_log.get('train/R_mid_full', float('nan')):.3f})"
+                          f" loss_sem={float(loss_sem):.4e}", flush=True)
                 if cfg.wandb.enabled:
                     import wandb
                     wandb.log({"train/loss": loss.item(), "train/l1": loss_l1.item(),
@@ -685,7 +788,7 @@ def main():
                                "train/sigreg": loss_sig.item(), "train/kl": loss_kl.item(),
                                "train/gan_g": loss_gan.item(),
                                "train/z_mean": zd["mean"], "train/z_std": zd["std"],
-                               "train/z_var_mean": zd["var_mean"], "train/lr": lr}, step=global_step)
+                               "train/z_var_mean": zd["var_mean"], "train/lr": lr, **sem_log}, step=global_step)
 
             # -- step-based ckpt_latest (preemption resilience) ------------------
             # epoch=`epoch` (not +1) so resume redoes the current epoch from its start
@@ -698,6 +801,8 @@ def main():
                     "combine": combine.state_dict(), "decoder": decoder.state_dict(),
                     "ema_combine": ema_combine.state_dict(), "ema_dec": ema_dec.state_dict(),
                     "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
+                    "sem_heads": sem_heads.state_dict() if sem_heads is not None else None,
+                    "sem_state": dict(sem_state) if SR is not None else None,
                     "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
                 def _save_latest(s):
                     _t = latest + ".tmp.step"; torch.save(s, _t); os.replace(_t, latest)
@@ -722,6 +827,8 @@ def main():
                 "combine": combine.state_dict(), "decoder": decoder.state_dict(),
                 "ema_combine": ema_combine.state_dict(), "ema_dec": ema_dec.state_dict(),
                 "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
+                "sem_heads": sem_heads.state_dict() if sem_heads is not None else None,
+                "sem_state": dict(sem_state) if SR is not None else None,
                 "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
             do_probe = (P.loo_solo == "every") or (P.loo_solo == "final" and epoch + 1 == T.epochs)
             val_thread = threading.Thread(
