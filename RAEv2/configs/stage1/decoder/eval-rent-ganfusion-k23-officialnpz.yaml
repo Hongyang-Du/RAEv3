@@ -1,0 +1,27 @@
+# Recon PSNR/SSIM/rFID (50k official val) for the semantic-rent JOINT fusion+decoder
+# run `rent-k23-depthattn-softmax-ganfusion-2node` @ ep16 (ckpt_latest). EMA weights
+# (ema_combine/ema_dec), denorm decode (*std+mean) -- same regime as the JEPA depthattn
+# decoders. DepthAttnCombine WITH cls surrogate (this run kept it). Full-feed eval
+# (idx=None -> mask all-ones), so p_drop/full_frac/uniform_frac are unused here; kept
+# equal to the training config for provenance. Same val npz as repro_k7/repro_k23 and
+# the JEPA evals for comparability.
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    p_drop: 0.5
+    full_frac: 0.3333333
+    uniform_frac: 0.3333333
+    cls_surrogate: true
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+    attn_kind: softmax
+eval:
+  ckpt: /sensei-fs-3/users/hongyangd/ckpt/rent-k23-depthattn-softmax-ganfusion-2node/ckpt_latest.pt
+  num_images: 50000
+  val_npz: /mnt/localssd/data_eval/rfid.npz
+  seed: 0
+  tag: rent_ganfusion_k23
