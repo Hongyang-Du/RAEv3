@@ -1,0 +1,57 @@
+# Stage-1 (CLS-ON variant) of the decoupled-fusion plan: train a ViT-XL decoder ON TOP
+# OF the FROZEN Stage-0 JEPA k7 fusion (ckpt/stage0-fusion-jepa-depthattn-k7). Combine is
+# loaded + frozen via STAGE0_COMBINE (set by the launcher) -- NOT init_from.
+#
+# DELIBERATE DEVIATION vs the non-cls config: cls_surrogate=true. This is a NON-PARAMETRIC
+# forward-additive term (combine.py:257 adds stk[-1].mean = L23 token-mean), so it STILL
+# strict-loads against the cls-OFF stage-0 weights (reused as-is -- no stage-0 retrain).
+# Net effect: the decoder is trained on latent = combine_output + L23_token_mean. The
+# stage-0 grounding head carried CLS separately; here we re-inject it as an additive term
+# so downstream (this decoder, and later the DiT) see the CLS content in the latent itself.
+# Same 16ep / disc_start 8 anchor recipe as the non-cls k7 counterpart.
+#
+# REQUIRES: STAGE0_COMBINE=/sensei-fs-3/users/hongyangd/ckpt/stage0-fusion-jepa-depthattn-k7/ckpt_latest.pt
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    p_drop: 0
+    cls_surrogate: true           # CLS-ON: forward-additive L23 token-mean (non-param)
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage1-decoder-jepa-depthattn-k7-cls
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: stage1-decoder-jepa-depthattn-k7-cls
