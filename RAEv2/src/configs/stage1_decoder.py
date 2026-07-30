@@ -49,10 +49,24 @@ class GanConfig:
 
 
 @dataclass
+class AlignConfig:
+    """Anchor the FULL-FEED fusion latent to the param-free (mean + cls) baseline.
+    loss_align = ||z_full - (mean + cls)||^2 == the depth-attn residual at full feed.
+    Since stage-2 rae.encode() runs the combine at full feed, this directly pulls the
+    generated-latent geometry toward the raev2 mean+cls (low eff-dim / spatially smooth
+    == what generates best). Replaces sigreg as the anti-drift anchor and also fixes the
+    latent scale. REQUIRES combine.params.cls_surrogate=true so z (and rae.encode) carry
+    cls -> the DiT generates a cls-bearing latent and the closure holds without a decoder
+    to add cls at sample time. `weight` is the tug-of-war knob vs the recon loss."""
+    weight: float = 0.0        # 0 -> align off
+
+
+@dataclass
 class LossConfig:
     lpips_w: float = 1.0
     sigreg: Optional[SigregConfig] = None          # None -> SIGReg off
     kl: Optional[KLConfig] = None                  # None -> KL off (needs combine.variational=true)
+    align: Optional[AlignConfig] = None            # None -> align-to-(mean+cls) off
     gan: GanConfig = field(default_factory=GanConfig)
 
 

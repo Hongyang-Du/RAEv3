@@ -1,0 +1,63 @@
+# Stage-0: DECODER-LESS 3-band depth-JEPA pretraining of DepthAttnCombine (k7 =
+# deep layers 11,13,15,17,19,21,23). k7 analog of bandjepa-depthattn-k23.yaml;
+# only the layer set and the band split differ. The 3 bands are re-strided over
+# the 7 layers (overlapping, stride-2), deep priced heavier (collapse-prone).
+# cls_surrogate=true DEFINES the latent and must match the k7 Stage-1/DiT runs.
+#
+#   torchrun --nproc_per_node=8 src/train_stage0_bandjepa.py \
+#       --config configs/stage0/bandjepa-depthattn-k7.yaml
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    p_drop: 0.5              # ignored: trainer passes an explicit stratified mask
+    full_frac: 0.0           # ignored (trainer overrides -> 0)
+    uniform_frac: 0.0        # ignored (trainer overrides -> 0)
+    cls_surrogate: true      # DEFINES the latent; must match Stage-1/DiT. (k23 used true)
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+    attn_kind: softmax
+bands:
+  # positions into combine.layers; negatives from the end. 3 overlapping strided
+  # bands over the 7 k7 layers [11,13,15,17,19,21,23].
+  bands:
+    shallow: [-7, -6, -5]   # L11, L13, L15
+    mid:     [-5, -4, -3]   # L15, L17, L19
+    deep:    [-3, -2, -1]   # L19, L21, L23
+  weights:
+    shallow: 1.0
+    mid:     1.0
+    deep:    2.0             # deep is the collapse-prone band -> price it heavier
+  head_hidden: 0             # LINEAR heads (weak rent by design; do NOT widen)
+  momentum: 0.01
+sigreg:
+  w: 0.02                    # keep latent isotropic-Gaussian = diffusable; 0 disables
+  distributed: true
+  scale_by_n: true
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  num_workers: 8
+training:
+  epochs: 16
+  batch_size: 64             # no decoder/GAN/LPIPS -> larger batch (global 512 on 8 GPU)
+  lr: 2.0e-4
+  warmup_epochs: 2
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  ema_decay: 0.0             # JEPA lineage = no EMA
+  # stratified layer-drop mask (mirrors the joint DepthAttnCombine recipe):
+  p_drop: 0.5
+  full_frac: 0.334           # full rows = the DiT latent (R_*_full)
+  uniform_frac: 0.334        # |S|~Uniform{1..K}; remainder iid Bernoulli
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage0-bandjepa-depthattn-k7
+wandb:
+  enabled: true
+  project: LeRAE
+  entity: uscgvl
+  name: stage0-bandjepa-depthattn-k7

@@ -70,9 +70,11 @@ case "${1:-}" in
   exp4) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23.yaml;             BASE=omnirae-dit-depthattn-cls-k23 ;;  # DepthAttnCombine (Variant B), drop:false = full-k23 latent, on-the-fly encode
   exp5) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-nano-p03-cls-k23-cachedlatent.yaml; BASE=omnirae-dit-depthattn-cls-k23-p03-cachedlatent ;;  # same as exp4 but reads precomputed latents (scripts/stage1/precompute_latents.py) -- needs /mnt/localssd/latents-depthattn-k23-nano-p03 staged on every node first
   jepa-k7) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k7.yaml; BASE=omnirae-dit-jepa-depthattn-k7 ;;  # DiT on the FROZEN Stage-0 JEPA k7 latent, on-the-fly encode, viz OFF (no decoder yet)
+  jepa-k7-cls) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k7-cls.yaml; BASE=omnirae-dit-jepa-depthattn-k7-cls ;;  # DiT on the CLS-ON JEPA k7 latent (cls_surrogate:true) that ckpt/stage1-decoder-jepa-depthattn-k7-cls inverts; viz ON (ema_dec). NEEDS latent_stats.pt (run run_jepa_k7_cls_stats.sh once)
   jepa-k23) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k23.yaml; BASE=omnirae-dit-jepa-depthattn-k23 ;;  # DiT on the FROZEN Stage-0 JEPA k23 latent (full 23-layer stack), on-the-fly encode, viz OFF (no decoder yet)
+  bandjepa-k23) CFG=configs/stage2/training/imagenet-dinov3l-bandjepa-depthattn-k23.yaml; BASE=omnirae-dit-bandjepa-depthattn-k23 ;;  # DiT on the FROZEN Stage-0 3-band depth-JEPA k23 latent, CLS-ON (cls_surrogate:true, softmax) matching ckpt/stage0-bandjepa-depthattn-k23 + its decoder ckpt/invert-stage0-bandjepa-k23. on-the-fly encode, viz OFF. NEEDS latent_stats.pt precomputed (run_bandjepa_k23_stats.sh)
   rent-ganfusion) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-rent-ganfusion-k23.yaml; BASE=omnirae-dit-rent-ganfusion-k23 ;;  # DiT on the semantic-rent JOINT fusion+decoder DepthAttnCombine (softmax, GAN-into-fusion) latent, drop:false full-k23, on-the-fly encode. NEEDS latent_stats.pt precomputed (see config header)
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7|jepa-k23|rent-ganfusion>"; exit 1 ;;
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7|jepa-k23|bandjepa-k23|rent-ganfusion>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
 

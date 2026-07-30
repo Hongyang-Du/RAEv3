@@ -458,6 +458,10 @@ class DepthAttnCombine(nn.Module):
             z, attns = self.fusion(z0, stk, mask, return_attn=True)
         else:
             z = self.fusion(z0, stk, mask)
+        # pre-cls fusion output (the depth-attn-refined subset readout). Stashed so the
+        # stage-1 align-to-full-sum-mean loss can pull THIS (not the cls-bearing z) toward
+        # the full-layer mean. Mirrors the VAE bottleneck's last_mu/last_logvar pattern.
+        self.last_fusion = z
         if self.cls_surrogate:
             # mask-GATED L_last token-mean: samples that DROP the last layer must not
             # get its token-mean added back, else it leaks the deep-layer signal and

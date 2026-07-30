@@ -1,0 +1,77 @@
+# k7 analog of rent-k23-depthattn-softmax-ganfusion-2node.yaml. Joint fusion+decoder
+# training with the anti-collapse SEMANTIC RENT, ARM B (GAN reaches the fusion in
+# Phase B). Softmax depth-attn fusion over the k7 layers [11,13,15,17,19,21,23].
+# rent mid/deep bands re-strided over the 7 layers (overlapping, stride-2), matching
+# the stage0-bandjepa-depthattn-k7 band split. Single-node 8-GPU with grad_accum=2
+# -> effective global batch 512 (matches the original 2-node run).
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    p_drop: 0.5              # Bernoulli group of the internal/external stratified sampler
+    full_frac: 0.3333333     # sandwich full branch pins z_b(z_full) = the DiT latent
+    uniform_frac: 0.3333333  # |S| ~ Uniform{1..K}; remainder = iid Bernoulli(1-p_drop)
+    cls_surrogate: true      # keep the L23 token-mean surrogate (matches k23 rent)
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+    attn_kind: softmax
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8            # anchor recipe (16ep): 8 GAN-free epochs to let the fusion settle
+semantic_rent:
+  # strided band targets (positions into combine.layers; negatives from the end),
+  # re-strided over the 7 k7 layers. Overlap at L19 (mirrors the 3-band stage0 split).
+  deep_layers: [-3, -2, -1]        # L19, L21, L23
+  mid_layers:  [-5, -4, -3]        # L15, L17, L19
+  w_mid: 1.0
+  w_deep: 2.0
+  head_hidden: 0            # LINEAR heads (weak rent by design; do NOT enlarge)
+  # live lambda_sem controller: hold R_deep(full) at the setpoint
+  lambda_init: 1.0
+  lambda_min: 0.05
+  lambda_max: 20.0
+  r_setpoint: 0.8
+  r_mid_floor: 0.6
+  ctrl_eta: 0.5
+  ctrl_every: 50
+  ctrl_ema: 0.9
+  momentum: 0.01
+  # gradient routing
+  gan_into_fusion: true     # <-- ARM B: Phase-B GAN reaches the fusion
+  recon_phase: B            # L1+LPIPS open into fusion only in Phase B
+  phase_a_min_frac: 0.05
+  phase_a_max_frac: 0.4
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32            # per-GPU micro-batch
+  grad_accum_steps: 2       # 32 x 8 GPU x 2 = global 512 (matches the 2-node original)
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/rent-k7-depthattn-softmax-ganfusion
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: rent-k7-depthattn-softmax-ganfusion

@@ -1,0 +1,57 @@
+# k7 depth-attn fusion + ALIGN-TO-(mean+cls), from scratch, trainable fusion.
+# Design (per probe finding: JEPA fusion lost to mean because it INFLATED eff-dim/PR
+# ~2.3x and roughened the latent -- the opposite of what a DiT wants):
+#   - trainable DepthAttnCombine (recon gradient reaches the fusion; NO STAGE0_COMBINE freeze)
+#   - cls_surrogate: true  -> z carries the global cls; stage-2 rae.encode() stays consistent
+#   - sigreg: null         -> dropped (it was pinning z to isotropic N(0,I) == MAXIMAL PR);
+#                             loss_align now provides anti-drift AND fixes the latent scale
+#   - loss.align.weight    -> anchors the FULL-FEED latent to (mean + cls); == penalizing the
+#                             depth-attn residual. Pulls the DiT latent toward raev2 mean+cls
+#                             (low eff-dim, spatially smooth). THIS is the tug-of-war knob vs recon.
+# Gate before training a DiT: probe z_full's PR/spatial-cos (want PR ~150-250, cos ~0.4, dead 0).
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    p_drop: 0.5
+    cls_surrogate: true      # REQUIRED by loss.align (z must carry cls)
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null               # dropped: recon + align are the anti-collapse / anti-drift signals
+  align:
+    weight: 1.0              # SWEEP {0.3, 1, 3, 10}: higher -> z closer to mean (lower PR). too high -> fusion==mean
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/alignmean-cls-k7-depthattn
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3
+  entity: uscgvl
+  name: alignmean-cls-k7-depthattn

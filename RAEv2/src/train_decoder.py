@@ -485,6 +485,19 @@ def main():
     use_kl = L.kl is not None and getattr(combine, "variational", False)
     if L.kl is not None and not use_kl and is_main:
         print("WARNING: loss.kl is set but combine.variational is not True -> KL ignored", flush=True)
+    # align-to-full-sum-mean: the fusion learns to recover the full-layer sum-mean from the
+    # random-drop subset (loss below aligns the DROPPED z's fusion part -> full_mean; cls is
+    # cancelled in the target so it stays a decoder-side add-on). Needs a trainable combine
+    # (recon+align must reach the fusion) AND cls_surrogate=true so z = fusion + cls (decoder
+    # eats that) and stage-2 rae.encode() re-adds the same cls -> latent stays consistent.
+    use_align = L.align is not None and L.align.weight > 0 and combine_has_params
+    if use_align:
+        assert combine_trainable, \
+            "loss.align is set but the combine is frozen (STAGE0_COMBINE freeze). Align needs " \
+            "recon+align gradients to reach the fusion -> load the combine trainable, not frozen."
+        assert getattr(combine, "cls_surrogate", False), \
+            "loss.align targets (mean+cls); set combine.params.cls_surrogate=true so z carries " \
+            "cls (else align would fight the missing cls and stage-2 rae.encode would drop it)."
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=(T.precision == "bf16"))
 
     def decode_imgs(dec, z, layer_mask=None, cond_drop=None):
@@ -633,10 +646,10 @@ def main():
                     imgs.shape[0], len(layers), combine.p_drop,
                     full_frac=MC.full_frac, uniform_frac=MC.uniform_frac, device=device)
                 drop_cond = torch.rand(imgs.shape[0], device=device) < MC.cond_drop
-            elif SR is not None:
-                # semantic rent needs the SAME mask in the fusion and the heads (for the
-                # full/subset R split), so sample it externally here even without decoder
-                # mask-conditioning, using the combine's own stratified-sampler knobs.
+            elif SR is not None or use_align:
+                # semantic rent / align-to-mean need the mask EXTERNALLY (SR: full/subset R
+                # split; align: the dropped z is what we align + we need mask[:,-1] to cancel
+                # the mask-gated cls). Use the combine's own stratified-sampler knobs.
                 m_layers = sample_stratified_masks(
                     imgs.shape[0], len(layers), combine.p_drop,
                     full_frac=getattr(combine, "full_frac", 1 / 3),
@@ -668,6 +681,18 @@ def main():
                         if use_sig else torch.zeros((), device=device))
             loss_kl = (kl_divergence(combine.last_mu, combine.last_logvar)
                        if use_kl else torch.zeros((), device=device))
+
+            # align-to-full-sum-mean: the fusion's SOLE objective -- recover the full-layer
+            # sum-mean from the random-drop SUBSET. Align the PRE-cls fusion output
+            # (combine.last_fusion, stashed in DepthAttnCombine.forward from the dropped
+            # recon-path forward above) to the bare full-layer mean. cls is NOT here -- it is
+            # the combine's last step (added after the fusion, into z, for the decoder), so it
+            # never enters this loss. Residual is nonzero under drop (fills in the dropped
+            # layers) and ~0 only at full feed.
+            loss_align = torch.zeros((), device=device)
+            if use_align:
+                full_mean = torch.stack(layer_tokens, dim=0).mean(0)         # [B,N,d] all-layer sum-mean (no drop, no cls)
+                loss_align = (combine.last_fusion.float() - full_mean.float()).pow(2).mean()
 
             # semantic rent: linear heads read z (grad -> fusion+heads), frozen band targets
             loss_sem = torch.zeros((), device=device)
@@ -705,8 +730,9 @@ def main():
 
             sig_w = L.sigreg.weight if use_sig else 0.0
             kl_w = L.kl.weight if use_kl else 0.0
+            align_w = L.align.weight if use_align else 0.0
             lam_sem = sem_state["lambda_sem"] if SR is not None else 0.0
-            loss = loss_rec + sig_w * loss_sig + kl_w * loss_kl \
+            loss = loss_rec + sig_w * loss_sig + kl_w * loss_kl + align_w * loss_align \
                 + L.gan.disc_weight * adp_w * loss_gan + lam_sem * loss_sem
             (loss / accum).backward()
             if is_accum_step:
@@ -765,7 +791,7 @@ def main():
                 zd = gaussian_diag(z); ps = psnr(x_rec, imgs)
                 print(f"  ep{epoch+1} s{global_step}  loss={loss.item():.4e}  l1={loss_l1.item():.4e}"
                       f"  lpips={loss_lpips.item():.4e}  psnr={ps:.2f}  sig={loss_sig.item():.4e}"
-                      f"  kl={loss_kl.item():.4e}"
+                      f"  kl={loss_kl.item():.4e}  align={loss_align.item():.4e}"
                       f"  gan={loss_gan.item():.4e}  z(mu={zd['mean']:.2f} sd={zd['std']:.2f})"
                       f"  vard(mu={zd['var_mean']:.2f})  lr={lr:.2e}", flush=True)
                 sem_log = {}
@@ -786,7 +812,7 @@ def main():
                     wandb.log({"train/loss": loss.item(), "train/l1": loss_l1.item(),
                                "train/lpips": loss_lpips.item(), "train/psnr": ps,
                                "train/sigreg": loss_sig.item(), "train/kl": loss_kl.item(),
-                               "train/gan_g": loss_gan.item(),
+                               "train/align": loss_align.item(), "train/gan_g": loss_gan.item(),
                                "train/z_mean": zd["mean"], "train/z_std": zd["std"],
                                "train/z_var_mean": zd["var_mean"], "train/lr": lr, **sem_log}, step=global_step)
 

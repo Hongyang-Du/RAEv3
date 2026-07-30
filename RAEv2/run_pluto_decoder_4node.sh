@@ -77,6 +77,8 @@ case "${1:-}" in
   rent-gandetach) CFG=configs/stage1/decoder/rent-k23-depthattn-softmax-gandetach-2node.yaml ;;  # JOINT fusion+decoder + semantic rent; GAN DETACHED from fusion. TRAINABLE fusion -> do NOT set STAGE0_COMBINE.
   rent-ganfusion) CFG=configs/stage1/decoder/rent-k23-depthattn-softmax-ganfusion-2node.yaml ;;  # same, but Phase-B GAN reaches fusion (ablation arm). do NOT set STAGE0_COMBINE.
   nano-drop-k7-p05-depthattn) CFG=configs/stage1/decoder/randomdrop-plain-k7-nano-p05-depthattn-oldnorm.yaml ;;  # k7 (deep-only) depth-attn fusion, p_drop=0.5, from scratch, anchor 16ep recipe
+  alignmean-k7) CFG=configs/stage1/decoder/alignmean-cls-k7-depthattn-oldnorm.yaml ;;  # k7 depth-attn + align-to-(mean+cls), TRAINABLE fusion (do NOT set STAGE0_COMBINE), sigreg off, w_align=1
+  alignmean-k23) CFG=configs/stage1/decoder/alignmean-cls-k23-depthattn-oldnorm.yaml ;;  # k23 sibling of alignmean-k7 (23 layers, p_drop 0.3), TRAINABLE fusion (no STAGE0_COMBINE)
   general-4src)
     CFG=configs/stage1/decoder/omnirae-randomdrop-k23-general-4src.yaml
     # Node-count-agnostic: fix per-GPU batch=32 (OOM-safe with GAN, proven by drop0);
