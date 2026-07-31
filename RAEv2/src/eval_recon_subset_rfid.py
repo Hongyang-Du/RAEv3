@@ -102,7 +102,19 @@ def main():
                 toks = list(enc.model.get_intermediate_layers(
                     (imgs - mean) / std, n=layers, reshape=False,
                     return_class_token=False, norm=True))
-                z = combine(toks, idx=idx)
+                if os.environ.get("NO_FUSION"):
+                    # ABLATION: bypass the depth-attn fusion network entirely and feed the
+                    # raev2-style latent (equal-weight mean over the kept k layers + the
+                    # L_last token-mean CLS surrogate) straight into the decoder. At full
+                    # feed this is exactly DepthAttnCombine's output MINUS the fusion residual.
+                    sel = idx if idx is not None else range(len(toks))
+                    kept = [toks[i] for i in sel]
+                    z0 = torch.stack(kept, 0).mean(0)               # masked equal-weight mean
+                    if getattr(combine, "cls_surrogate", False):
+                        z0 = z0 + toks[-1].mean(dim=1, keepdim=True)  # + CLS surrogate (gate=1)
+                    z = z0
+                else:
+                    z = combine(toks, idx=idx)
                 out = dec(z, drop_cls_token=False).logits
                 rec = dec.unpatchify(out) * std + mean
             rec = rec.clamp(0, 1).float()
