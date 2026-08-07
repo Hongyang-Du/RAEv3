@@ -1,0 +1,48 @@
+# Stage-0 JEPA denoising-AE feature-fusion (k7), BOTTLENECK d=256 (4x compression), p_drop=0.75.
+# Harder corruption: K=7 @ p_drop=0.75 -> avg ~1.75 kept in the ctx subset. 10 epochs.
+# Predict E(pool(full)) from E(pool(dropped)); per-view SIGReg (right-side z_full holds
+# the live target). predictor (no mask/no KV) + grounding are throwaway; only E is kept
+# for Stage-1/DiT. See src/train_jepa_denoise.py.
+#
+#   bash run_denoise_ae.sh jepa configs/stage0/jepa-denoise-k7-d1024-p075.yaml
+encoder:
+  layers: [11, 13, 15, 17, 19, 21, 23]
+  dim: 1024
+  d: 256                    # bottleneck width (dim 1024 -> d 256, 4x)
+  depth: 6
+  n_heads: 8
+  mlp_mult: 4
+  proj: mlp
+predictor:
+  depth: 2
+  n_heads: 8
+  mlp_mult: 2
+sigreg:
+  distributed: true
+  scale_by_n: true
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  num_workers: 8
+training:
+  epochs: 10
+  batch_size: 128
+  lr: 2.0e-4
+  warmup_epochs: 1
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  p_drop: 0.75             # K=7 -> ~1.75 kept in the ctx subset
+  uniform_frac: 0.0
+  cls_surrogate: true
+  detach_target: false
+  w_pred: 1.0
+  w_sig: 0.02
+  w_gnd: 1.0
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage0-jepa-denoise-k7-d256-p075
+wandb:
+  enabled: true
+  project: LeRAE
+  entity: uscgvl
+  name: stage0-jepa-denoise-k7-d256-p075

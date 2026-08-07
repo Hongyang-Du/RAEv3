@@ -293,3 +293,24 @@ class RAECombine(_RAEVariantBase):
             return_class_token=False, norm=True))
         z = self.combine(layer_tokens)                    # per-sample random drop if self.drop
         return self._tokens_to_latent(z)
+
+    @torch.no_grad()
+    def encode_cond_target(self, x: torch.Tensor):
+        """Decoupled-target encode (transport.decoupled_full_target). ONE frozen DINOv3
+        forward, TWO combines over the SAME layer tokens:
+          z_cond   : random-LAYER-drop latent (self.drop must be True) -> builds x_t (the
+                     noised INPUT the DiT sees; identical distribution to the drop run).
+          z_target : DETERMINISTIC full-mean latent over ALL K layers -> the FM regression
+                     target (what eval-combine feeds the decoder at inference).
+        Both are normalized by the SAME latent_stats so x_t and target share one space; the
+        cls_surrogate term is added identically in both (unconditional in MLSCombine)."""
+        assert self.drop, "encode_cond_target needs drop=True (z_cond is the random-drop latent)"
+        x = self._imgs_to_norm(x)
+        layer_tokens = list(self.encoder.model.get_intermediate_layers(
+            x, n=self.encoder.layer_indices, reshape=False,
+            return_class_token=False, norm=True))
+        z_cond = self.combine(layer_tokens)               # combine in train() -> random drop
+        self.combine.eval()                               # force deterministic full mean
+        z_target = self.combine(layer_tokens)
+        self._apply_combine_mode()                        # restore drop mode (+ BN eval)
+        return self._tokens_to_latent(z_cond), self._tokens_to_latent(z_target)

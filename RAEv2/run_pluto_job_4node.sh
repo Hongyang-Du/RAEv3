@@ -74,7 +74,8 @@ case "${1:-}" in
   jepa-k23) CFG=configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k23.yaml; BASE=omnirae-dit-jepa-depthattn-k23 ;;  # DiT on the FROZEN Stage-0 JEPA k23 latent (full 23-layer stack), on-the-fly encode, viz OFF (no decoder yet)
   bandjepa-k23) CFG=configs/stage2/training/imagenet-dinov3l-bandjepa-depthattn-k23.yaml; BASE=omnirae-dit-bandjepa-depthattn-k23 ;;  # DiT on the FROZEN Stage-0 3-band depth-JEPA k23 latent, CLS-ON (cls_surrogate:true, softmax) matching ckpt/stage0-bandjepa-depthattn-k23 + its decoder ckpt/invert-stage0-bandjepa-k23. on-the-fly encode, viz OFF. NEEDS latent_stats.pt precomputed (run_bandjepa_k23_stats.sh)
   rent-ganfusion) CFG=configs/stage2/training/imagenet-dinov3l-depthattn-rent-ganfusion-k23.yaml; BASE=omnirae-dit-rent-ganfusion-k23 ;;  # DiT on the semantic-rent JOINT fusion+decoder DepthAttnCombine (softmax, GAN-into-fusion) latent, drop:false full-k23, on-the-fly encode. NEEDS latent_stats.pt precomputed (see config header)
-  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7|jepa-k23|bandjepa-k23|rent-ganfusion>"; exit 1 ;;
+  alignmean-k23) CFG=configs/stage2/training/imagenet-dinov3l-alignmean-cls-depthattn-k23.yaml; BASE=omnirae-dit-alignmean-cls-depthattn-k23 ;;  # DiT on the ALIGN-TO-(mean+cls) k23 depth-attn latent from the TRAINED decoder ckpt/alignmean-cls-k23-depthattn (use_ema:true, drop:false full-feed). cls_surrogate:true shifts the latent off N(0,I) -> NEEDS latent_stats.pt precomputed (run run_alignmean_k23_stats.sh once). viz ON (ema_dec decodes samples).
+  *) echo "usage: NUM_NODES=4 bash run_pluto_job_4node.sh <exp1|exp2|exp3|exp4|exp5|jepa-k7|jepa-k23|bandjepa-k23|rent-ganfusion|alignmean-k23>"; exit 1 ;;
 esac
 export EXPERIMENT_NAME="${BASE}-${NUM_NODES}node"   # SEPARATE folder from the single-node run
 

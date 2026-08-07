@@ -24,6 +24,10 @@ class TransportConfig:
     prediction: str = "velocity"  # "velocity" or "x"
     time_dist_type: str = "logit-normal_0_1"
     t_eps: float = 0.05
+    # Decoupled full-mean target: build x_t from the random-drop latent but regress the
+    # x-pred loss to the deterministic full-mean latent (needs stage_1.drop=true). See
+    # engine.py / rae_variants.encode_cond_target / transport.training_losses(x1_target=).
+    decoupled_full_target: bool = False
 
 
 @dataclass

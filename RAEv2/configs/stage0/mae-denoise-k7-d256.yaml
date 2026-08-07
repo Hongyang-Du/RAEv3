@@ -1,0 +1,48 @@
+# Stage-0 MAE denoising-AE feature-fusion (k7), decoupled from the decoder.
+# Reconstruct the FULL-layer pool from a layer-dropout-corrupted pool through a
+# bottleneck encoder E (dim 1024 -> d 256). D_mae is throwaway; only E is kept for
+# Stage-1/DiT. cls_surrogate=false. full_frac>0 keeps the clean full-input path (what
+# Stage-1/eval feed) in-distribution. k7 = the recon-baseline layer set that already
+# diffused well. See src/train_mae_denoise.py.
+#
+#   bash run_denoise_ae.sh mae configs/stage0/mae-denoise-k7-d256.yaml
+encoder:
+  layers: [11, 13, 15, 17, 19, 21, 23]
+  dim: 1024
+  d: 256                    # bottleneck width; sweep down to 16 (64x) once the pipe is confirmed
+  depth: 6
+  n_heads: 8
+  mlp_mult: 4
+  proj: linear              # clean latent readout (MAE default)
+decoder:
+  depth: 6                  # keep D_mae >= E: the reconstruction work lives here
+  n_heads: 8
+  mlp_mult: 4
+sigreg:
+  distributed: true
+  scale_by_n: true
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  num_workers: 8
+training:
+  epochs: 10
+  batch_size: 64
+  lr: 2.0e-4
+  warmup_epochs: 1
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  p_drop: 0.5               # K=7 -> ~3.5 kept in the corrupted input
+  full_frac: 0.15           # clean full-input path in-distribution (Stage-1/eval feed full)
+  uniform_frac: 0.0
+  cls_surrogate: true
+  w_recon: 1.0
+  w_sig: 0.02               # shape the bottleneck toward N(0,I) for DiT; set 0 for pure MAE
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage0-mae-denoise-k7-d256
+wandb:
+  enabled: true
+  project: LeRAE
+  entity: uscgvl
+  name: stage0-mae-denoise-k7-d256

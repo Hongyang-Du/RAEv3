@@ -1,0 +1,47 @@
+# k=7 native random-drop training (NOT a k23 model fed a k7 subset at eval time):
+# combine.params.layers IS the k7 set [11,13,15,17,19,21,23], random_drop over those
+# 7 layers at p_drop=0.9. Same recipe/hparams as randomdrop-plain-k23-nano-p03-oldnorm.yaml
+# so the two are directly comparable (only the fed layer-set differs).
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [11, 13, 15, 17, 19, 21, 23]
+    weighting: random_drop
+    p_drop: 0.9
+    cls_surrogate: true
+    projector: none
+    dim: 1024
+    out_dim: 1024
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256   # node-local SSD; staged from s3://hongyangd-raev2-backup/raev2-data/imagenet-256/
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k7-nano-p0.9
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: omni-randomdrop-plain-k7-nano-p0.9
