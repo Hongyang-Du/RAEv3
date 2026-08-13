@@ -12,8 +12,8 @@
 # is the drop latent). normalization_stat_path REUSES the dit-b p0.5 latent_stats.pt: latent stats
 # are DiT-size-independent (same decoder + same combine), so no recompute is needed.
 #
-# 20 epochs, no LR decay (final_lr == base_lr), global_batch_size=2048 (matches the dit-b ref;
-# warmup scaled 6/40 -> 3/20 to preserve the LR-curve shape).
+# 40 epochs, raev2 k23 schedule (warmup 25 / decay_end 50 / base_lr 2e-4 -> final 2e-5), global_batch_size=1024.
+# Matches imagenet-dinov3l-k23.yaml training EXCEPT checkpoint_interval=2 and no in-training eval block.
 stage_1:
   target: stage1.RAECombine
   params:
@@ -80,8 +80,8 @@ dataset:
   condition_type: label
   shared_tmpdir: ~/tmp
 training:
-  epochs: 20
-  global_batch_size: 2048
+  epochs: 40
+  global_batch_size: 1024
   grad_accum_steps: 1
   ema_decay: 0.9995
   num_workers: 4
@@ -100,10 +100,10 @@ training:
     weight_decay: 0.0
   scheduler:
     type: linear
-    warmup_epochs: 3
-    decay_end_epoch: 20
+    warmup_epochs: 25
+    decay_end_epoch: 50
     base_lr: 0.0002
-    final_lr: 0.0002
+    final_lr: 2.0e-05
     warmup_from_zero: false
   image_size: 256
 misc:
