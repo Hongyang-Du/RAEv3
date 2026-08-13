@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from .jepa_predictor import SpatialBlock
+from .mask_cond import sample_stratified_masks
 
 
 def pool_layers(layer_tokens, mask, cls_surrogate: bool):
@@ -145,3 +146,129 @@ class GroundingHead(nn.Module):
 
     def forward(self, z):                                # z [B, N, in_dim] -> [B, out_dim]
         return self.net(z.mean(1))
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 combine adapter: expose a FROZEN Stage-0 denoise-AE encoder E as a
+# `combine` for train_decoder.py (decouples this from the fusion combines).
+# ---------------------------------------------------------------------------
+
+class DenoiseAECombine(nn.Module):
+    """Wrap a Stage-0 denoise-AE encoder E as a Stage-1 `combine` so train_decoder.py
+    can train a pixel decoder ON TOP of the FROZEN E. Mirrors the DepthAttnCombine
+    interface (forward(layer_tokens, idx=, mask=), has_params, p_drop, layers, K).
+
+    forward = E(pool_layers(layer_tokens, mask, cls_surrogate)):
+      1. param-free depth pool (renormalized masked-mean + mask-gated cls-surrogate)
+         -- IDENTICAL to what E was trained on (train_mae/jepa_denoise use pool_layers
+         with the same cls_surrogate), so the frozen E always sees in-distribution z0.
+      2. the frozen DenoiseEncoder E compresses/denoises z0 -> latent z [B, N, d].
+
+    Decoder training runs at p_drop=0 (full feed) -> mask is all-ones -> z0 is the clean
+    full-layer pool, exactly the latent Stage-2 / DiT will generate at inference. The
+    cls surrogate is baked INTO z0 here (E consumes it), so -- unlike DepthAttnCombine's
+    cls_surrogate -- nothing is re-added on top of E's output.
+
+    Only E has params; its state_dict lives under `E.*`, so STAGE0_COMBINE must point at
+    a ckpt whose `combine` entry is the Stage-0 `encoder` weights reprefixed with `E.`
+    (see tools/denoise_encoder_to_combine.py). requires_grad is handled by the trainer
+    (it freezes the combine after load)."""
+
+    def __init__(self,
+                 layers,
+                 dim: int = 1024,
+                 d: int = 1024,
+                 depth: int = 6,
+                 n_heads: int = 8,
+                 mlp_mult: int = 4,
+                 proj: str = "linear",
+                 num_tokens: int = 256,
+                 cls_surrogate: bool = True,
+                 p_drop: float = 0.0,
+                 full_frac: float = 0.0,
+                 uniform_frac: float = 0.0):
+        super().__init__()
+        self.layers = list(layers)
+        self.K = len(self.layers)
+        self.cls_surrogate = cls_surrogate
+        self.p_drop = p_drop                 # trainer's p_drop-schedule hook mutates this
+        self.full_frac = full_frac
+        self.uniform_frac = uniform_frac
+        self.E = DenoiseEncoder(dim=dim, d=d, depth=depth, n_heads=n_heads,
+                                mlp_mult=mlp_mult, num_tokens=num_tokens, proj=proj)
+
+    @property
+    def has_params(self) -> bool:
+        return True
+
+    def forward(self, layer_tokens, idx=None, mask=None) -> torch.Tensor:
+        B = layer_tokens[0].shape[0]
+        device = layer_tokens[0].device
+        if mask is None:
+            if idx is not None:                            # probe/eval subset -> k-hot
+                mask = torch.zeros(B, self.K, dtype=torch.bool, device=device)
+                mask[:, list(idx)] = True
+            elif self.training and self.p_drop > 0:
+                mask = sample_stratified_masks(B, self.K, self.p_drop,
+                                                full_frac=self.full_frac,
+                                                uniform_frac=self.uniform_frac,
+                                                device=device)
+            else:                                          # full feed (decoder default)
+                mask = torch.ones(B, self.K, dtype=torch.bool, device=device)
+        z0 = pool_layers(layer_tokens, mask, self.cls_surrogate)   # [B, N, dim]
+        return self.E(z0)                                          # [B, N, d]
+
+
+class DenoiseCombine(nn.Module):
+    """Stage-1 combine wrapper around a FROZEN Stage-0 denoise-AE bottleneck encoder E.
+
+    Reproduces the exact 'full-input' latent that Stage-0 kept in-distribution (full_frac)
+    and that Stage-1/eval/DiT are meant to feed:
+        z0 = pool_layers(layer_tokens, mask, cls_surrogate)   # [B, N, dim]  param-free
+        z  = E(z0)                                            # [B, N, d]    frozen
+
+    E is the DenoiseEncoder from train_mae_denoise.py / train_jepa_denoise.py; its weights
+    are loaded (from the stage-0 ckpt's `encoder` state_dict, via the standard
+    STAGE0_COMBINE strict-load in train_decoder.py after this combine is re-saved under a
+    `combine` key) and FROZEN. Only E lives here; the throwaway MAE decoder / JEPA
+    predictor / grounding head are not needed for pixel decoding.
+
+    Mirrors the DepthAttnCombine interface (forward(tokens, idx=, mask=), has_params,
+    p_drop, layers, K) so train_decoder.py and the eval/probe paths work unchanged.
+    p_drop defaults to 0: the decoder is trained on the CLEAN full pool (the stage-0
+    full-input path), exactly like the frozen-fusion Stage-1 decoders. An idx (probe/LOO
+    subset) or an explicit mask is honoured so the val LOO/solo probe still runs.
+    """
+
+    def __init__(self, layers, dim: int = 1024, d: int = 512, depth: int = 6,
+                 n_heads: int = 8, mlp_mult: int = 4, proj: str = "linear",
+                 cls_surrogate: bool = True, p_drop: float = 0.0, num_tokens: int = 256):
+        super().__init__()
+        self.layers = list(layers)
+        self.K = len(self.layers)
+        self.p_drop = p_drop                    # 0 -> full feed; trainer's p_drop hook may set it
+        self.cls_surrogate = bool(cls_surrogate)
+        self.d = d
+        self.encoder = DenoiseEncoder(dim=dim, d=d, depth=depth, n_heads=n_heads,
+                                      mlp_mult=mlp_mult, num_tokens=num_tokens, proj=proj)
+
+    @property
+    def has_params(self) -> bool:
+        return True
+
+    def forward(self, layer_tokens, idx=None, mask=None) -> torch.Tensor:
+        layer_tokens = list(layer_tokens)
+        stk = torch.stack(layer_tokens, dim=0)          # [K, B, N, dim]
+        K, B = stk.shape[0], stk.shape[1]
+        if mask is None:
+            if idx is not None:                         # probe/eval subset -> k-hot
+                mask = torch.zeros(B, K, dtype=torch.bool, device=stk.device)
+                mask[:, list(idx)] = True
+            elif self.training and self.p_drop > 0:     # normally OFF (p_drop=0): clean full feed
+                from stage1.combine import sample_stratified_masks
+                mask = sample_stratified_masks(B, K, self.p_drop, full_frac=0.0,
+                                               uniform_frac=0.0, device=stk.device)
+            else:
+                mask = torch.ones(B, K, dtype=torch.bool, device=stk.device)
+        z0 = pool_layers(layer_tokens, mask, self.cls_surrogate)   # [B, N, dim]
+        return self.encoder(z0)                                    # [B, N, d]

@@ -221,9 +221,15 @@ class RAECombine(_RAEVariantBase):
             # learned_gate adds a fresh gate_logits param absent from the pretrained
             # combine ckpt -> load non-strict so it keeps its uniform init.
             strict = cc["params"].get("weighting") != "learned_gate"
-            missing, unexpected = self.combine.load_state_dict(self._ckpt[key], strict=strict)
-            print(f"RAECombine: loaded combine[{key}]  (drop={drop}, strict={strict}, "
-                  f"missing={list(missing)}, unexpected={list(unexpected)})")
+            if key in self._ckpt:
+                missing, unexpected = self.combine.load_state_dict(self._ckpt[key], strict=strict)
+                print(f"RAECombine: loaded combine[{key}]  (drop={drop}, strict={strict}, "
+                      f"missing={list(missing)}, unexpected={list(unexpected)})")
+            else:
+                # decoder-only EMA ckpts (e.g. raecombine_dec_*_ema.pt) omit the combine state;
+                # fine here because weighting in {mean,random_drop} + projector=none has NO params.
+                print(f"RAECombine: no '{key}' in ckpt -> combine kept at init "
+                      f"(ok: paramless combine, drop={drop})")
         for p in self.combine.parameters():
             p.requires_grad_(False)
         # learned_gate: the K-dim softmax over layers stays TRAINABLE (learned by the

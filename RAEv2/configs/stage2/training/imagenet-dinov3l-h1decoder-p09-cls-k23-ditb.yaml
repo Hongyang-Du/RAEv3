@@ -1,0 +1,115 @@
+# Stage-2 DiT-B h1 config (BLOCK-AGNOSTIC), omni-randomdrop-plain k=23 decoder trained at
+# layer-drop p=0.9. h1 = decoder hidden state AFTER decoder block `block_idx`; decode resumes
+# the frozen decoder from block_idx+1 (+ dataset-mean CLS). Sampling/eval need no extra code.
+#
+# >>> block_idx is the ONLY knob: set any integer in [0, 27] (or override at launch with
+#     `stage_1.params.block_idx=N`). h1_stats_path auto-follows via interpolation. <<<
+#
+# The drop-rate is the frozen DECODER checkpoint (stage1_ckpt_path); combine runs deterministic
+# full-mean (drop=false, weighting=mean). Precompute per-block h1 stats once before training:
+#   torchrun --nproc_per_node=1 src/compute_h1_stats.py --config <this> \
+#       --num-samples 50000 --batch 256 --out <same path as h1_stats_path> \
+#       stage_1.params.block_idx=<N>
+#
+# 40 epochs, no LR decay (final_lr == base_lr), global_batch_size=2048 (dit-b drop-family recipe).
+stage_1:
+  target: stage1.rae_decoder_h1.RAEDecoderH1
+  params:
+    encoder_name: dinov3mls-vit-l16[layers=1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23]
+    resolution: 256
+    decoder_config_path: configs/decoder/ViTXL
+    stage1_ckpt_path: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-k23-nano-p0.9/ckpt_ep016.pt
+    use_ema: true
+    latent_dim: 1024
+    drop: false
+    block_idx: 0                 # <-- the single knob (any int in [0,27])
+    h1_stats_path: /sensei-fs-3/users/hongyangd/ckpt/dit-b-h1-p09-k23-block${stage_1.params.block_idx}/h1_stats.pt
+    combine_config:
+      target: stage1.combine.MLSCombine
+      params:
+        layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+        weighting: mean
+        p_drop: 0.0
+        p_full: 0.0
+        cls_surrogate: true
+        projector: none
+        dim: 1024
+        out_dim: 1024
+stage_2:
+  target: stage2.models.DDT.DiTwDDTHeadIG
+  params:
+    input_size: 16
+    patch_size:
+    - 1
+    - 1
+    in_channels: 1152          # decoder_hidden_size (h1) for ViT-XL decoder
+    hidden_size:
+    - 768
+    - 1024
+    depth:
+    - 12
+    - 2
+    num_heads:
+    - 12
+    - 16
+    mlp_ratio: 4.0
+    base_model_depth: 4
+conditioning:
+  type: label
+  cfg_dropout_prob: 0.1
+  arch:
+    num_t_tokens: 4
+    num_c_tokens: 8
+transport:
+  prediction: x
+  time_dist_type: logit-normal_0_1
+sampler:
+  num_steps: 50
+guidance:
+  cfg:
+    scale: 1.0
+    t_min: 0.0
+    t_max: 1.0
+dataset:
+  target: imagenet
+  type: hf
+  data_dir: /mnt/localssd/imagenet-256
+  split: train
+  condition_type: label
+  shared_tmpdir: ~/tmp
+training:
+  epochs: 40
+  global_batch_size: 2048
+  grad_accum_steps: 1
+  ema_decay: 0.9995
+  num_workers: 4
+  log_interval: 100
+  checkpoint_interval: 2
+  sample_every: 5000
+  clip_grad: 1.0
+  global_seed: 42
+  optimizer:
+    type: gmuon
+    lr: 0.0002
+    momentum: 0.95
+    nesterov: true
+    ns_coefficients_preset: POLAR_EXPRESS_COEFFICIENTS
+    ns_use_kernels: false
+    weight_decay: 0.0
+  scheduler:
+    type: linear
+    warmup_epochs: 6
+    decay_end_epoch: 13
+    base_lr: 0.0002
+    final_lr: 0.0002
+    warmup_from_zero: false
+  image_size: 256
+eval: null
+misc:
+  latent_size:
+  - 1152
+  - 16
+  - 16
+  num_classes: 1000
+  time_dist_shift_dim: 294912   # 256 * 1152 (N * Cdec)
+  time_dist_shift_base: 4096

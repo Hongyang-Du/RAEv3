@@ -1,0 +1,57 @@
+# Stage-1 ViT-XL decoder ON TOP OF the FROZEN Stage-0 MAE denoise-AE bottleneck encoder E
+# (ckpt/stage0-mae-denoise-k23-d512, d=512, proj=linear). The combine reproduces the
+# stage-0 clean full-input latent: z = E(pool_layers(full, cls_surrogate=True)) [B,N,512].
+# E is loaded + FROZEN via STAGE0_COMBINE (set by the launcher to the prepped combine ckpt)
+# -- NOT init_from. Decoder trains from scratch; the recon->E gradient is severed.
+#
+# Same 16ep / disc_start 8 / ViT-XL / lpips 1.0 anchor recipe as the frozen-fusion
+# jepa-k23-stage1-decoder-cls-oldnorm.yaml; only the combine (denoise E, latent_dim 512)
+# and out_dir/name differ.
+#
+# REQUIRES: STAGE0_COMBINE=/sensei-fs-3/users/hongyangd/ckpt/stage0-mae-denoise-k23-d512/combine_for_decoder.pt
+combine:
+  target: stage1.denoise_ae.DenoiseAECombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    dim: 1024
+    d: 512
+    depth: 6
+    n_heads: 8
+    mlp_mult: 4
+    proj: linear
+    cls_surrogate: true
+    p_drop: 0
+    num_tokens: 256
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 512
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage1-decoder-mae-denoise-k23-d512
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: stage1-decoder-mae-denoise-k23-d512

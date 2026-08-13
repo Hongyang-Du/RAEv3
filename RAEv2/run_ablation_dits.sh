@@ -61,12 +61,18 @@ cfg_of ()  { case "$1" in
   jepa-k7-cls)   echo configs/stage2/training/imagenet-dinov3l-jepa-depthattn-k7-cls-ablB.yaml ;;
   alignmean-k23) echo configs/stage2/training/imagenet-dinov3l-alignmean-cls-depthattn-k23-ablB.yaml ;;
   alignmean-k7)  echo configs/stage2/training/imagenet-dinov3l-alignmean-cls-depthattn-k7-ablB.yaml ;;
+  jepa-denoise-d1024) echo configs/stage2/training/imagenet-dinov3l-jepa-denoise-k23-d1024-ablB.yaml ;;
+  mae-denoise-d1024)  echo configs/stage2/training/imagenet-dinov3l-mae-denoise-k23-d1024-ablB.yaml ;;
+  mae-denoise-d512)   echo configs/stage2/training/imagenet-dinov3l-mae-denoise-k23-d512-ablB.yaml ;;
 esac; }
 stats_of () { case "$1" in
   jepa-k23-cls)  echo "$CKPT_ROOT/stage1-decoder-jepa-depthattn-k23-cls/latent_stats.pt" ;;
   jepa-k7-cls)   echo "$CKPT_ROOT/stage1-decoder-jepa-depthattn-k7-cls/latent_stats.pt" ;;
   alignmean-k23) echo "$CKPT_ROOT/alignmean-cls-k23-depthattn/latent_stats.pt" ;;
   alignmean-k7)  echo "$CKPT_ROOT/alignmean-cls-k7-depthattn/latent_stats.pt" ;;
+  jepa-denoise-d1024) echo "$CKPT_ROOT/stage1-decoder-jepa-denoise-k23-d1024/latent_stats.pt" ;;
+  mae-denoise-d1024)  echo "$CKPT_ROOT/stage1-decoder-mae-denoise-k23-d1024/latent_stats.pt" ;;
+  mae-denoise-d512)   echo "$CKPT_ROOT/stage1-decoder-mae-denoise-k23-d512/latent_stats.pt" ;;
 esac; }
 
 run_one () {

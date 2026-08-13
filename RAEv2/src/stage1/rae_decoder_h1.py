@@ -91,4 +91,8 @@ class RAEDecoderH1(RAECombine):
             hs = layer(hs, head_mask=None)[0]
         hs = d.decoder_norm(hs)
         logits = d.decoder_pred(hs)[:, 1:, :]          # drop CLS -> [B, N, p*p*3]
-        return d.unpatchify(logits) * self.img_std + self.img_mean
+        # plain / stage1.RAE-lineage decoder predicts [0,1] pixels DIRECTLY (its decode
+        # is a bare unpatchify, see stage1/rae.py). Do NOT re-apply img_std/img_mean here
+        # (that affine is only correct for sigreg-lineage decoders) -- it caused a uniform
+        # ImageNet-mean 'beige veil' (~13 dB) over otherwise-correct recons.
+        return d.unpatchify(logits)

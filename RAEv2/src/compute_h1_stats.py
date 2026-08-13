@@ -27,11 +27,15 @@ def main():
     ap.add_argument("--num-samples", type=int, default=50000)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--out", required=True)
+    ap.add_argument("opts", nargs="*", default=[],
+                    help="optional dotlist config overrides, e.g. stage_1.params.block_idx=7")
     args = ap.parse_args()
 
     rank, world_size, device = setup_distributed()
-    config: Stage2Config = OmegaConf.to_object(
-        OmegaConf.merge(OmegaConf.structured(Stage2Config), OmegaConf.load(args.config)))
+    _merged = OmegaConf.merge(OmegaConf.structured(Stage2Config), OmegaConf.load(args.config))
+    if args.opts:
+        _merged = OmegaConf.merge(_merged, OmegaConf.from_dotlist(list(args.opts)))
+    config: Stage2Config = OmegaConf.to_object(_merged)
     config.post_process()
 
     rae = instantiate_from_config(config.stage_1).to(device).eval()

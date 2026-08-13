@@ -1,0 +1,55 @@
+# Stage-1 pixel decoder (ViT-XL, 16ep) on the FROZEN Stage-0 JEPA denoise-AE encoder E
+# (ckpt/stage0-jepa-denoise-k23-d1024, d==dim=1024, uncompressed). E is loaded + frozen
+# via STAGE0_COMBINE (a `combine`-keyed ckpt built by tools/denoise_encoder_to_combine.py
+# from the Stage-0 `encoder` weights) -- NOT init_from.
+#
+# Identical to the mae-denoise decoder except proj=mlp (the JEPA encoder used a nonlinear
+# projector, so DenoiseEncoder must be rebuilt with proj=mlp for the state_dict to align).
+#
+# REQUIRES: STAGE0_COMBINE=<combine-keyed ckpt from stage0-jepa-denoise-k23-d1024>
+combine:
+  target: stage1.denoise_ae.DenoiseAECombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    dim: 1024
+    d: 1024
+    depth: 6
+    n_heads: 8
+    mlp_mult: 4
+    proj: mlp                     # JEPA nonlinear projector (matches stage0 jepa config)
+    num_tokens: 256
+    cls_surrogate: true
+    p_drop: 0
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 2.0e-4
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/stage1-decoder-jepa-denoise-k23-d1024
+probe:
+  loo_solo: final
+  val_image: assets/samples/sample_1.png
+wandb:
+  enabled: true
+  project: raev3-full
+  entity: uscgvl
+  name: stage1-decoder-jepa-denoise-k23-d1024

@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--sync-checkpoints", action="store_true")
     parser.add_argument("--compile", action="store_true", help="torch.compile the training loss function")
+    parser.add_argument("opts", nargs="*", default=[],
+                        help="optional dotlist config overrides, e.g. stage_1.params.block_idx=7")
     return parser.parse_args()
 
 
@@ -55,7 +57,10 @@ def main():
     # Distributed + config setup
     #########################################################
     rank, world_size, device = setup_distributed()
-    config: Stage2Config = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(Stage2Config), OmegaConf.load(args.config)))
+    _merged = OmegaConf.merge(OmegaConf.structured(Stage2Config), OmegaConf.load(args.config))
+    if args.opts:
+        _merged = OmegaConf.merge(_merged, OmegaConf.from_dotlist(list(args.opts)))
+    config: Stage2Config = OmegaConf.to_object(_merged)
     config.post_process()
     # GRAD_ACCUM_OVERRIDE lets a launch script set grad_accum_steps without editing the
     # shared config (e.g. accum=1 at 32 GPUs vs accum=2 at 8 GPUs); global_batch is unchanged.

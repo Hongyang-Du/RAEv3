@@ -6,7 +6,7 @@
 # DETERMINISTIC full-mean latent over all K=23 layers (z_target = eval-combine output). Only the
 # regression target differs vs the plain drop run -> clean 1-var ablation (z_drop -> z_full).
 #
-# Backbone: DiT-XL encoder (hidden 1152 / depth 28 / heads 16) + DDT head (hidden 2048 / depth 2).
+# Backbone: DiT-XL encoder (hidden 1440 / depth 28 / heads 20) + DDT head (hidden 2048 / depth 2).
 # Decoder is the SHARED p0.3 stage-1 k23 plain decoder (stage1_ckpt_path); across the p-sweep ONLY
 # combine.p_drop (+ the ckpt out_dir set by EXPERIMENT_NAME) change. drop=true is REQUIRED (z_cond
 # is the drop latent). normalization_stat_path REUSES the dit-b p0.9 latent_stats.pt: latent stats
@@ -45,13 +45,13 @@ stage_2:
     - 1
     in_channels: 1024
     hidden_size:
-    - 1152
+    - 1440
     - 2048
     depth:
     - 28
     - 2
     num_heads:
-    - 16
+    - 20
     - 16
     mlp_ratio: 4.0
     base_model_depth: 8
