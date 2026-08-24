@@ -139,10 +139,20 @@ def train_one_epoch(
         # Encode images to latents and compute REPA targets.
         # learned_gate: the gate-weighted latent must carry gradient (grad-enabled
         # encode_train); otherwise the latent is the frozen, detached diffusion target.
+        # Decoupled full-mean target: x_t is built from the random-drop latent (z), but the
+        # FM loss regresses to the deterministic full-mean latent (z_target). Needs the
+        # per-step raw-image encode -> incompatible with the learned gate.
+        decoupled_full_target = getattr(config.transport, "decoupled_full_target", False)
         use_gate = gate_optimizer is not None and getattr(rae, "has_learnable_gate", False)
         z_tokens = None
+        z_target = None
         if use_gate:
+            assert not decoupled_full_target, \
+                "transport.decoupled_full_target is incompatible with learned_gate."
             z, z_tokens = rae.encode_train(images)
+        elif decoupled_full_target:
+            with torch.no_grad():
+                z, z_target = rae.encode_cond_target(images)
         else:
             with torch.no_grad():
                 z = rae.encode(images)
@@ -187,6 +197,7 @@ def train_one_epoch(
                 repa_coeff=config.repa.repa_coeff if config.repa.use_repa else None,
                 base_model_coeff=config.internal_guidance.base_model_coeff,
                 cfg_dropout_prob=config.conditioning.cfg_dropout_prob,
+                x1_target=z_target,
             )
             loss_diff = loss_dict["loss"].mean()
             loss_repa = loss_dict.get("loss_repa", torch.tensor(0.0, device=device)).mean()

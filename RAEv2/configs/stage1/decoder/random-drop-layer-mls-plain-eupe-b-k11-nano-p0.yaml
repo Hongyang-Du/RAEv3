@@ -1,0 +1,43 @@
+# Random-drop-layer MLS decoder for eupe-b-k11, p_drop=0.0, cls ON.
+# encoder hardcode note: src/train_decoder_mls_dropmean_plain.py currently hardcodes
+#   create_encoder("dinov3mls-vit-l16[layers=...]"). To use this config, generalize it to read
+#   `encoder_name` below (or pass --encoder / --layers / --latent-dim on the CLI).
+encoder_name: eupemls-vit-b16
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    weighting: random_drop
+    p_drop: 0.0
+    p_full: 0.0
+    cls_surrogate: true          # cls ON
+    projector: none
+    dim: 768
+    out_dim: 768
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 768
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256    # stage ImageNet-256 to localssd first
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 0.0002
+  warmup_epochs: 1
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-eupe-b-k11-nano-p0.0
+probe:
+  loo_solo: final

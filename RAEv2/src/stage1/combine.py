@@ -261,3 +261,220 @@ class MLSCombine(nn.Module):
         h = self.fc1(z0)
         h = self.bn(h.reshape(b * n, -1).float()).reshape(b, n, -1).to(h.dtype)
         return self._noise(self.skip(z0) + self.fc2(F.gelu(h)), idx)
+
+
+# ---------------------------------------------------------------------------
+# DepthAttnCombine: depth-attention fusion (re-added from the ckpt src snapshot).
+#
+# The latent = masked equal-weight mean over the kept DINOv3 layers PLUS a learned
+# per-position depth-attention correction that cross-attends the fused query token
+# over the K per-layer tokens at its own spatial position. Trained jointly with the
+# ViT decoder (train_decoder.py) under the anti-collapse semantic rent. Mirrors the
+# MLSCombine interface (forward(tokens, idx=, mask=), has_params, p_drop) so
+# train_decoder.py / eval / stage-2 (RAECombine) work unchanged.
+#
+# self-contained: `sample_stratified_masks` (originally stage1.mask_cond) is inlined
+# below so the module imports with no extra deps. Only used when training with
+# drop=True; the stage-2 DiT runs drop=False (deterministic full-feed mean+fusion).
+# ---------------------------------------------------------------------------
+
+
+def sample_stratified_masks(B: int, K: int, p_drop: float,
+                            full_frac: float = 1 / 3, uniform_frac: float = 1 / 3,
+                            device=None) -> torch.Tensor:
+    """Stratified per-sample layer masks [B, K] bool (True = layer kept).
+
+    Per-sample group assignment (random, so every rank/micro-batch mixes):
+      full_frac     m = all-ones (the sandwich full branch)
+      uniform_frac  |S| ~ Uniform{1..K}, then a uniform subset of that size
+                    -> extreme sizes (1, K) get real training mass
+      remainder     i.i.d. Bernoulli(keep = 1-p_drop), >=1 kept
+    """
+    u = torch.rand(B, device=device)
+    is_full = u < full_frac
+    is_unif = (~is_full) & (u < full_frac + uniform_frac)
+
+    keep = torch.rand(B, K, device=device) > p_drop
+    dead = ~keep.any(1)
+    if dead.any():                                   # always keep >= 1 layer
+        keep[dead, torch.randint(K, (int(dead.sum()),), device=device)] = True
+
+    if is_unif.any():                                # uniform-|S| group: keep top-s
+        n = int(is_unif.sum())
+        s = torch.randint(1, K + 1, (n,), device=device)              # [n] in {1..K}
+        scores = torch.rand(n, K, device=device)
+        rank = scores.argsort(dim=1).argsort(dim=1)                   # 0..K-1 per row
+        keep[is_unif] = rank < s[:, None]                             # top-s kept
+
+    keep[is_full] = True
+    return keep
+
+
+class MultiheadGateAttention(nn.Module):
+    """Sigmoid 'gate' attention over the KEY axis: every key gets an INDEPENDENT gate
+    sigmoid(q.k/sqrt(dh) + b) in [0,1] -- NO softmax normalization, so keys (= layers)
+    do NOT compete. out = (gates @ V); key_padding_mask zeros dropped layers via a -inf
+    logit. out_proj is zero-init so the enclosing DepthAttnBlock is an exact no-op at
+    init. Returns the head-averaged gate [B,Lq,Lk] as the probe-facing 'weight'."""
+
+    def __init__(self, dim: int, n_heads: int, bias_init: float = 0.0):
+        super().__init__()
+        assert dim % n_heads == 0, (dim, n_heads)
+        self.h, self.dh = n_heads, dim // n_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        self.gate_bias = nn.Parameter(torch.full((n_heads,), float(bias_init)))
+
+    def forward(self, q, kv, key_padding_mask=None):   # q [B,Lq,d] kv [B,Lk,d] mask [B,Lk] True=drop
+        B, Lq, d = q.shape
+        Lk = kv.shape[1]
+        Q = self.q_proj(q).view(B, Lq, self.h, self.dh).transpose(1, 2)    # [B,h,Lq,dh]
+        Kk = self.k_proj(kv).view(B, Lk, self.h, self.dh).transpose(1, 2)
+        V = self.v_proj(kv).view(B, Lk, self.h, self.dh).transpose(1, 2)
+        logits = (Q @ Kk.transpose(-2, -1)) / (self.dh ** 0.5)            # [B,h,Lq,Lk]
+        logits = logits + self.gate_bias.view(1, self.h, 1, 1)
+        if key_padding_mask is not None:
+            logits = logits.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+        gate = torch.sigmoid(logits)                                      # independent [0,1] per key
+        out = (gate @ V).transpose(1, 2).reshape(B, Lq, d)
+        return self.out_proj(out), gate.mean(1)                           # [B,Lq,d], gate_headavg [B,Lq,Lk]
+
+
+class DepthAttnBlock(nn.Module):
+    """One depth-attention refinement block: the fused query token cross-attends over
+    the K per-layer tokens at its own spatial position. attn out-projection AND the FFN
+    output are zero-init -> exact no-op at init (residual around the query).
+
+    attn_kind='softmax' (default): competitive nn.MultiheadAttention (simplex weights).
+    attn_kind='gate': independent per-layer sigmoid gates (MultiheadGateAttention)."""
+
+    def __init__(self, dim: int, n_heads: int, mlp_mult: int,
+                 attn_kind: str = "softmax", K: int = 23):
+        super().__init__()
+        assert attn_kind in ("softmax", "gate"), attn_kind
+        self.attn_kind = attn_kind
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        if attn_kind == "gate":
+            self.attn = MultiheadGateAttention(dim, n_heads, bias_init=-math.log(K))
+        else:
+            self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+            nn.init.zeros_(self.attn.out_proj.weight)
+            nn.init.zeros_(self.attn.out_proj.bias)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, mlp_mult * dim), nn.GELU(),
+                                 nn.Linear(mlp_mult * dim, dim))
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+
+    def forward(self, q, kv, pad, return_attn=False):   # q [S,1,d]  kv [S,K,d]  pad [S,K]
+        kvn = self.norm_kv(kv)
+        qn = self.norm_q(q)
+        if self.attn_kind == "gate":
+            a, w = self.attn(qn, kvn, key_padding_mask=pad)              # w = head-avg gate [S,1,K]
+        else:
+            a, w = self.attn(qn, kvn, kvn, key_padding_mask=pad,
+                             need_weights=return_attn, average_attn_weights=True)
+        q = q + a
+        q = q + self.ffn(self.norm_ffn(q))
+        return (q, w) if return_attn else q             # w [S,1,K] head-avg weight/gate (probe)
+
+
+class DepthAttnFusion(nn.Module):
+    """fused = masked_mean + AttnBlocks(query=masked_mean, kv=per-layer tokens).
+
+    Pure reshape: (K, B, N, d) -> (B*N, K, d) sequences on the DEPTH axis; dropped
+    layers are key_padding_mask'ed out per sample. A learnable depth embedding tells
+    attention WHICH layer each kv token came from (reaches the output only through the
+    zero-init projections, so init identity is preserved)."""
+
+    def __init__(self, dim: int, K: int, n_layers: int, n_heads: int, mlp_mult: int,
+                 attn_kind: str = "softmax"):
+        super().__init__()
+        self.depth_pos = nn.Parameter(torch.randn(K, dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [DepthAttnBlock(dim, n_heads, mlp_mult, attn_kind=attn_kind, K=K)
+             for _ in range(n_layers)])
+
+    def forward(self, z0, stk, mask, return_attn=False):     # z0 [B,N,d] stk [K,B,N,d] mask [B,K]
+        K, B, N, d = stk.shape
+        kv = stk.permute(1, 2, 0, 3).reshape(B * N, K, d) + self.depth_pos
+        q = z0.reshape(B * N, 1, d)
+        pad = (~mask.bool()).repeat_interleave(N, dim=0)          # [B*N, K], True = drop
+        attns = []
+        for blk in self.blocks:
+            if return_attn:
+                q, w = blk(q, kv, pad, return_attn=True)
+                attns.append(w.reshape(B, N, K))                  # per-block [B,N,K] weights
+            else:
+                q = blk(q, kv, pad)
+        out = q.reshape(B, N, d)
+        return (out, attns) if return_attn else out
+
+
+class DepthAttnCombine(nn.Module):
+    """Depth-attention combine: the decoder-facing latent is the masked equal-weight
+    mean over the kept layers PLUS a learned per-position depth-attention correction
+    over those layers' tokens. Mirrors the MLSCombine interface so train_decoder.py /
+    eval / stage-2 RAECombine work unchanged. Training masks are sampled INTERNALLY
+    (stratified full / uniform-|S| / Bernoulli) unless an external `mask` is passed;
+    at eval (or drop=False) the mask is all-ones -> deterministic full-feed latent."""
+
+    def __init__(self,
+                 layers,
+                 p_drop: float = 0.3,
+                 full_frac: float = 0.15,
+                 uniform_frac: float = 0.0,
+                 cls_surrogate: bool = False,
+                 dim: int = 1024,
+                 out_dim: int = 1024,
+                 n_layers: int = 2,
+                 n_heads: int = 8,
+                 mlp_mult: int = 2,
+                 attn_kind: str = "softmax"):
+        super().__init__()
+        assert dim == out_dim, "DepthAttnCombine is residual around the mean: dim must equal out_dim"
+        self.layers = list(layers)
+        self.K = len(self.layers)
+        self.p_drop = p_drop                       # trainer's p_drop schedule hooks this
+        self.full_frac = full_frac
+        self.uniform_frac = uniform_frac
+        self.cls_surrogate = cls_surrogate
+        self.fusion = DepthAttnFusion(dim, self.K, n_layers, n_heads, mlp_mult,
+                                      attn_kind=attn_kind)
+
+    @property
+    def has_params(self) -> bool:
+        return True
+
+    def forward(self, layer_tokens, idx=None, mask=None, return_attn=False) -> torch.Tensor:
+        stk = torch.stack(layer_tokens, dim=0)     # [K, B, N, dim]
+        K, B = stk.shape[0], stk.shape[1]
+        if mask is None:
+            if idx is not None:                    # probe/eval subset -> k-hot
+                mask = torch.zeros(B, K, dtype=torch.bool, device=stk.device)
+                mask[:, list(idx)] = True
+            elif self.training and self.p_drop > 0:
+                mask = sample_stratified_masks(B, K, self.p_drop,
+                                               full_frac=self.full_frac,
+                                               uniform_frac=self.uniform_frac,
+                                               device=stk.device)
+            else:                                  # eval, full feed
+                mask = torch.ones(B, K, dtype=torch.bool, device=stk.device)
+        w = mask.to(stk.dtype).t()                 # [K, B]
+        w = w / w.sum(0, keepdim=True).clamp_min(1e-6)
+        z0 = (w.view(K, B, 1, 1) * stk).sum(0)     # masked equal-weight mean
+        if return_attn:
+            z, attns = self.fusion(z0, stk, mask, return_attn=True)
+        else:
+            z = self.fusion(z0, stk, mask)
+        if self.cls_surrogate:
+            # mask-GATED L_last token-mean: samples that DROP the last layer must not
+            # get its token-mean added back. At full feed (eval) gate==1 -> raev2 add.
+            gate = mask[:, -1].to(z.dtype).view(B, 1, 1)
+            z = z + gate * stk[-1].mean(dim=1, keepdim=True)
+        return (z, attns) if return_attn else z

@@ -1,0 +1,21 @@
+# Recon rFID (50k official val) for the JEPA depth-attn k23 decoder @ ep16 (last).
+# DepthAttnCombine, no cls surrogate. Same val npz as repro_k7/repro_k23 for comparability.
+combine:
+  target: stage1.combine.DepthAttnCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    p_drop: 0.75
+    full_frac: 0.0
+    uniform_frac: 0.0
+    cls_surrogate: false
+    dim: 1024
+    out_dim: 1024
+    n_layers: 2
+    n_heads: 8
+    mlp_mult: 2
+eval:
+  ckpt: /sensei-fs-3/users/hongyangd/ckpt/stage1-decoder-jepa-depthattn-k23/ckpt_ep016.pt
+  num_images: 50000
+  val_npz: /mnt/localssd/data_eval/rfid.npz
+  seed: 0
+  tag: jepa_depthattn_k23

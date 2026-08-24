@@ -145,19 +145,41 @@ def main():
         if is_main:
             print(f"Train: {len(train_loader.dataset)} images")
 
-    # -- frozen DINOv3 encoder -------------------------------------------------
+    # -- frozen encoder (config-selectable: dinov3 / siglip2 / eupe / ...) ------
+    # dinov2/dinov3/eupe expose model.get_intermediate_layers(); SigLIP2 (HF
+    # SiglipVisionModel) has no such method -> read output_hidden_states directly.
+    # Normalize on [0,1] imgs at D.image_size (NO /255, NO interpolation) so the token
+    # grid stays 16x16 (256/patch16), matching the ViT-XL decoder. (encoder.preprocess()
+    # would /255 + interpolate to 224 -> wrong grid, so we don't use it here.)
     layers = list(C.params["layers"])
     layers_str = ".".join(str(x) for x in layers)
-    encoder = create_encoder(f"dinov3mls-vit-l16[layers={layers_str}]",
+    enc_prefix = cfg.encoder_name.split('[')[0]          # tolerate a stray [layers=...]; layers come from combine.params
+    encoder = create_encoder(f"{enc_prefix}[layers={layers_str}]",
                              device=device, resolution=D.image_size)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
-    enc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    enc_std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    _enc_family = enc_prefix.split('-')[0]               # dinov3mls / siglip2mls / eupemls / ...
+    _is_siglip = _enc_family.startswith("siglip")
+    _m, _s = ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) if _is_siglip \
+             else ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))   # siglip -> [-1,1]; else ImageNet
+    enc_mean = torch.tensor(_m, device=device).view(1, 3, 1, 1)
+    enc_std  = torch.tensor(_s, device=device).view(1, 3, 1, 1)
+    if is_main:
+        print(f"encoder: {cfg.encoder_name}[layers={layers_str}] (family={_enc_family}, "
+              f"dim={encoder.hidden_size}, norm={'siglip0.5' if _is_siglip else 'imagenet'})", flush=True)
 
     def encode_layers(imgs01):
+        """imgs01 in [0,1] -> list of K frozen per-layer patch tokens [B, N, dim] (pre-combine)."""
         imgs_norm = (imgs01 - enc_mean) / enc_std
+        if _is_siglip:
+            # HF SigLIP2 hidden_states: tuple len N+1; hs[k]=output of block k-1,
+            # hs[N]=post_layernorm(last). post_layernorm the non-final selected blocks to
+            # match norm=True (hs[N] already normed). Mirrors SigLIP2MLS.forward_features.
+            hs = encoder.model(imgs_norm, output_hidden_states=True).hidden_states
+            post_ln = encoder.model.vision_model.post_layernorm
+            N = encoder._num_hidden_layers
+            return [hs[N] if li == N - 1 else post_ln(hs[li + 1]) for li in encoder.layer_indices]
         return list(encoder.model.get_intermediate_layers(
             imgs_norm, n=encoder.layer_indices, reshape=False,
             return_class_token=False, norm=True))
@@ -553,11 +575,19 @@ def main():
                 "disc": disc.state_dict(), "optimizer": optimizer.state_dict(),
                 "disc_optimizer": disc_optimizer.state_dict(), "scheduler": scheduler.state_dict()})
             do_probe = (P.loo_solo == "every") or (P.loo_solo == "final" and epoch + 1 == T.epochs)
-            val_thread = threading.Thread(
-                target=_async_val_save,
-                args=(sn_combine, sn_dec, ckpt_cpu, epoch + 1, global_step, do_probe),
-                daemon=True)
-            val_thread.start()
+            if _is_siglip:
+                # HF SigLIP2 forward is NOT thread-safe: running val (bs<32) in a daemon
+                # thread concurrently with the next epoch's training forward (bs=32) on the
+                # SAME frozen encoder collides -> "stack expects each tensor equal size
+                # [4,256,1024] vs [32,256,1024]" -> SIGABRT. Run val synchronously here.
+                # (dinov3/eupe use get_intermediate_layers, which tolerates the concurrency.)
+                _async_val_save(sn_combine, sn_dec, ckpt_cpu, epoch + 1, global_step, do_probe)
+            else:
+                val_thread = threading.Thread(
+                    target=_async_val_save,
+                    args=(sn_combine, sn_dec, ckpt_cpu, epoch + 1, global_step, do_probe),
+                    daemon=True)
+                val_thread.start()
 
         # cheap sync point (rank 0 only snapshotted, no slow work) so no rank drifts
         dist.barrier()

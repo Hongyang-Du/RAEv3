@@ -109,6 +109,10 @@ class WandbConfig:
 
 @dataclass
 class DecoderConfig:
+    # Encoder prefix WITHOUT the [layers=...] flag (layers come from combine.params.layers).
+    # dinov3mls-vit-l16 (default, dim 1024) | siglip2mls-vit-l (dim 1024) | eupemls-vit-b16 (dim 768).
+    # Set decoder.latent_dim and combine.params.dim/out_dim to the encoder hidden dim.
+    encoder_name: str = "dinov3mls-vit-l16"
     combine: ModelConfig = field(default_factory=ModelConfig)
     decoder: DecoderModuleConfig = field(default_factory=DecoderModuleConfig)
     loss: LossConfig = field(default_factory=LossConfig)

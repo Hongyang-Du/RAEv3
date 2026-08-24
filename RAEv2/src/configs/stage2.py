@@ -24,6 +24,10 @@ class TransportConfig:
     prediction: str = "velocity"  # "velocity" or "x"
     time_dist_type: str = "logit-normal_0_1"
     t_eps: float = 0.05
+    # x_t is built from the random-drop latent, but the FM loss regresses to the
+    # deterministic full-mean latent (RAECombine.encode_cond_target). Needs stage_1
+    # drop=True; incompatible with learned_gate.
+    decoupled_full_target: bool = False
 
 
 @dataclass

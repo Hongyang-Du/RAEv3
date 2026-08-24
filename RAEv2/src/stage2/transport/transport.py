@@ -37,12 +37,18 @@ class Transport:
     #######################################################
     #               Forward Pass and Loss                 #
     #######################################################
-    def training_losses(self, model, x1, model_kwargs={}, model_kwargs_null={}, z_clean=None, repa_coeff=None, base_model_coeff=1.0, cfg_dropout_prob=0.1):
+    def training_losses(self, model, x1, model_kwargs={}, model_kwargs_null={}, z_clean=None, repa_coeff=None, base_model_coeff=1.0, cfg_dropout_prob=0.1, x1_target=None):
         model_kwargs, _ = apply_cfg_dropout(model_kwargs, model_kwargs_null, cfg_dropout_prob)
 
+        # Decoupled target (transport.decoupled_full_target): x_t is built from x1 (the
+        # random-drop latent -> the noised INPUT), but the loss regresses to x1_target (the
+        # deterministic full-mean latent). vt is defined w.r.t. the target so the x-pred
+        # model learns E[z_full | x_t]. x1_target=None => standard coupled FM (target==x1).
+        if x1_target is None:
+            x1_target = x1
         t, x0, x1 = self.sample(x1)
         xt = (1 - _expand_t(t, x1)) * x1 + _expand_t(t, x1) * x0
-        vt = (xt - x1) / _expand_t(t, xt).clamp_min(self.t_eps)
+        vt = (xt - x1_target) / _expand_t(t, xt).clamp_min(self.t_eps)
 
         enable_repa = z_clean is not None and repa_coeff is not None
         zt_pred = None
