@@ -177,6 +177,9 @@ class WandbConfig:
 
 @dataclass
 class DecoderConfig:
+    # frozen encoder family, e.g. dinov3mls-vit-l16 / siglip2mls-vit-l / eupemls-vit-b16.
+    # Layers come from combine.params.layers; None keeps the historical dinov3 default.
+    encoder_name: Optional[str] = None
     combine: ModelConfig = field(default_factory=ModelConfig)
     decoder: DecoderModuleConfig = field(default_factory=DecoderModuleConfig)
     loss: LossConfig = field(default_factory=LossConfig)

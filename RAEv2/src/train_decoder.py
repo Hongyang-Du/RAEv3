@@ -231,22 +231,43 @@ def main():
         if is_main:
             print(f"Train: {len(train_loader.dataset)} images")
 
-    # -- frozen DINOv3 encoder -------------------------------------------------
+    # -- frozen encoder --------------------------------------------------------
     # MLSCombine/DepthAttnCombine keep `layers` at the top level; CompressedCombine
     # nests the actual fusion combine (and its `layers`) under params.inner.params.
     layers = list(C.params["layers"] if "layers" in C.params
                   else C.params["inner"]["params"]["layers"])
     layers_str = ".".join(str(x) for x in layers)
-    encoder = create_encoder(f"dinov3mls-vit-l16[layers={layers_str}]",
+    # encoder family comes from the config (dinov3mls / siglip2mls / eupemls / ...);
+    # falls back to the historical dinov3 hardcode when the config omits it.
+    enc_prefix = getattr(cfg, "encoder_name", None) or "dinov3mls-vit-l16"
+    enc_prefix = str(enc_prefix).split('[')[0]     # tolerate a stray [layers=...]
+    encoder = create_encoder(f"{enc_prefix}[layers={layers_str}]",
                              device=device, resolution=D.image_size)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
-    enc_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    enc_std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    _enc_family = enc_prefix.split('-')[0]               # dinov3mls / siglip2mls / eupemls
+    _is_siglip = _enc_family.startswith("siglip")
+    _m, _s = ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) if _is_siglip \
+             else ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))   # siglip -> [-1,1]
+    enc_mean = torch.tensor(_m, device=device).view(1, 3, 1, 1)
+    enc_std  = torch.tensor(_s, device=device).view(1, 3, 1, 1)
+    if is_main:
+        print(f"encoder: {enc_prefix}[layers={layers_str}] (family={_enc_family}, "
+              f"dim={encoder.hidden_size}, norm={'siglip0.5' if _is_siglip else 'imagenet'})",
+              flush=True)
 
     def encode_layers(imgs01):
         imgs_norm = (imgs01 - enc_mean) / enc_std
+        if _is_siglip:
+            # HF SigLIP2 exposes no get_intermediate_layers. hidden_states: tuple len N+1;
+            # hs[k]=output of block k-1, hs[N]=post_layernorm(last). post_layernorm the
+            # non-final selected blocks to match norm=True (hs[N] is already normed).
+            hs = encoder.model(imgs_norm, output_hidden_states=True).hidden_states
+            post_ln = encoder.model.vision_model.post_layernorm
+            N = encoder._num_hidden_layers
+            return [hs[N] if li == N - 1 else post_ln(hs[li + 1])
+                    for li in encoder.layer_indices]
         return list(encoder.model.get_intermediate_layers(
             imgs_norm, n=encoder.layer_indices, reshape=False,
             return_class_token=False, norm=True))

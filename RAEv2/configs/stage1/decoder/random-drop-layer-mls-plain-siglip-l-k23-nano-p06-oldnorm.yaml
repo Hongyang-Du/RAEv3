@@ -1,0 +1,45 @@
+# Random-drop-layer MLS decoder for siglip-l-k23, p_drop=0.6, cls ON.  [RAEv3_oldnorm]
+# OLD output convention: the decoder predicts NORMALIZED pixels and train_decoder.py
+# de-normalizes with (*enc_std + enc_mean). Not interchangeable with the RAEv3 ckpts
+# of the same name (those predict [0,1] directly) -- hence the -oldnorm out_dir.
+encoder_name: siglip2mls-vit-l      # layers come from combine.params.layers
+combine:
+  target: stage1.combine.MLSCombine
+  params:
+    layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    weighting: random_drop
+    p_drop: 0.6
+    p_full: 0.0
+    cls_surrogate: true          # cls ON
+    projector: none
+    dim: 1024
+    out_dim: 1024
+decoder:
+  config_path: configs/decoder/ViTXL
+  latent_dim: 1024
+loss:
+  lpips_w: 1.0
+  sigreg: null
+  gan:
+    disc_weight: 0.75
+    disc_start: 8
+data:
+  data_dir: /mnt/localssd/imagenet-256    # stage ImageNet-256 to localssd first
+  image_size: 256
+  val_npz: data_eval/imagenet-256-val.npz
+  val_n: 100
+training:
+  epochs: 16
+  batch_size: 32
+  lr: 0.0002
+  warmup_epochs: 1
+  ema_decay: 0.9995
+  precision: bf16
+  ckpt_every: 1
+  log_every: 50
+  seed: 42
+  out_dir: /sensei-fs-3/users/hongyangd/ckpt/omni-randomdrop-plain-siglip-l-k23-nano-p0.6-oldnorm
+probe:
+  loo_solo: final
+wandb:
+  enabled: false

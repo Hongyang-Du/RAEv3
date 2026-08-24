@@ -87,8 +87,17 @@ class _RAEVariantBase(nn.Module):
         self.latent_mean, self.latent_var, self.do_normalization = \
             _load_normalization_stats(normalization_stat_path)
 
-        self.register_buffer('img_mean', torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1))
-        self.register_buffer('img_std',  torch.tensor(IMAGENET_STD).view(1, 3, 1, 1))
+        # Normalization is encoder-family dependent: HF SigLIP2 expects [-1,1] (0.5/0.5),
+        # DINOv3/EUPE expect ImageNet stats. These buffers carry BOTH the encoder-input
+        # norm (_imgs_to_norm) and the decode-time de-norm (*img_std + img_mean), matching
+        # train_decoder.py, which normalizes the input and de-normalizes the decoder output
+        # with the same enc_mean/enc_std pair.
+        self._enc_family = encoder_name.split('[')[0].split('-')[0]
+        self._is_siglip = self._enc_family.startswith('siglip')
+        _m, _s = ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) if self._is_siglip \
+                 else (IMAGENET_MEAN, IMAGENET_STD)
+        self.register_buffer('img_mean', torch.tensor(_m).view(1, 3, 1, 1))
+        self.register_buffer('img_std',  torch.tensor(_s).view(1, 3, 1, 1))
 
         self._ckpt = None
         if stage1_ckpt_path is not None:
@@ -108,7 +117,7 @@ class _RAEVariantBase(nn.Module):
             p.requires_grad_(False)
 
     def _imgs_to_norm(self, x: torch.Tensor) -> torch.Tensor:
-        """[0,1] (or [0,255]) images at any size -> ImageNet-normalized at self.resolution."""
+        """[0,1] (or [0,255]) images at any size -> encoder-normalized at self.resolution."""
         if x.max() > 1.0:
             x = x / 255.0
         _, _, h, w = x.shape
@@ -116,6 +125,21 @@ class _RAEVariantBase(nn.Module):
             x = nn.functional.interpolate(x, size=(self.resolution, self.resolution),
                                           mode='bicubic', align_corners=False)
         return (x - self.img_mean) / self.img_std
+
+    def _layer_tokens(self, x_norm: torch.Tensor) -> list:
+        """Frozen per-layer patch tokens [B,N,C] for self.encoder.layer_indices.
+        DINOv3/EUPE expose DINO's get_intermediate_layers; HF SigLIP2 does not, so
+        take hidden_states directly and post_layernorm the non-final blocks to match
+        norm=True (hs[N] is already normed). Mirrors train_decoder.py's siglip branch."""
+        if self._is_siglip:
+            hs = self.encoder.model(x_norm, output_hidden_states=True).hidden_states
+            post_ln = self.encoder.model.vision_model.post_layernorm
+            N = self.encoder._num_hidden_layers
+            return [hs[N] if li == N - 1 else post_ln(hs[li + 1])
+                    for li in self.encoder.layer_indices]
+        return list(self.encoder.model.get_intermediate_layers(
+            x_norm, n=self.encoder.layer_indices, reshape=False,
+            return_class_token=False, norm=True))
 
     def _tokens_to_latent(self, z: torch.Tensor) -> torch.Tensor:
         """[B, N, C] tokens -> [B, C, H, W] stats-normalized latent."""
@@ -192,9 +216,7 @@ class RAEProjected(_RAEVariantBase):
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self._imgs_to_norm(x)
-        layer_tokens = list(self.encoder.model.get_intermediate_layers(
-            x, n=self.encoder.layer_indices, reshape=False,
-            return_class_token=False, norm=True))
+        layer_tokens = self._layer_tokens(x)
         z = self.projector(layer_tokens)                              # [B, N, latent]
         return self._tokens_to_latent(z)
 
@@ -259,9 +281,7 @@ class RAECombine(_RAEVariantBase):
           z_tok  : RAW gate-weighted combine tokens [B,N,C] -> frozen-decoder recon anchor."""
         x = self._imgs_to_norm(x)
         with torch.no_grad():
-            layer_tokens = list(self.encoder.model.get_intermediate_layers(
-                x, n=self.encoder.layer_indices, reshape=False,
-                return_class_token=False, norm=True))
+            layer_tokens = self._layer_tokens(x)
         z_tok = self.combine(layer_tokens)                # gate_logits has grad
         return self._tokens_to_latent_train(z_tok), z_tok
 
@@ -294,9 +314,7 @@ class RAECombine(_RAEVariantBase):
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self._imgs_to_norm(x)
-        layer_tokens = list(self.encoder.model.get_intermediate_layers(
-            x, n=self.encoder.layer_indices, reshape=False,
-            return_class_token=False, norm=True))
+        layer_tokens = self._layer_tokens(x)
         z = self.combine(layer_tokens)                    # per-sample random drop if self.drop
         return self._tokens_to_latent(z)
 
@@ -312,9 +330,7 @@ class RAECombine(_RAEVariantBase):
         cls_surrogate term is added identically in both (unconditional in MLSCombine)."""
         assert self.drop, "encode_cond_target needs drop=True (z_cond is the random-drop latent)"
         x = self._imgs_to_norm(x)
-        layer_tokens = list(self.encoder.model.get_intermediate_layers(
-            x, n=self.encoder.layer_indices, reshape=False,
-            return_class_token=False, norm=True))
+        layer_tokens = self._layer_tokens(x)
         z_cond = self.combine(layer_tokens)               # combine in train() -> random drop
         self.combine.eval()                               # force deterministic full mean
         z_target = self.combine(layer_tokens)
