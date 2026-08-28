@@ -50,9 +50,16 @@
 #    bash run_sweep_eupe_siglip_s3.sh s3://my-bucket/imagenet-256/
 #    # just stage the data
 #    bash run_sweep_eupe_siglip_s3.sh s3://my-bucket/imagenet-256/ data
-#    # shard across nodes: decoders here, DiTs there
+#    # 4 nodes, 16 jobs dealt 4-per-node (run this on each node, only SHARD differs)
+#    SHARD=0 NUM_SHARDS=4 bash run_sweep_eupe_siglip_s3.sh s3://my-bucket/imagenet-256/
+#    SHARD=1 NUM_SHARDS=4 bash run_sweep_eupe_siglip_s3.sh s3://my-bucket/imagenet-256/
+#    SHARD=2 ... SHARD=3 ...
+#    # or hand-pick what runs where
 #    bash run_sweep_eupe_siglip_s3.sh dec  eupe_p03 eupe_p0
 #    bash run_sweep_eupe_siglip_s3.sh dit  siglip_p03
+#    # ONE job across 4 nodes (32 GPUs) instead: same command on every node
+#    NNODES=4 NODE_RANK=$RANK MASTER_ADDR=<rank0-host> \
+#      bash run_sweep_eupe_siglip_s3.sh s3://my-bucket/imagenet-256/ dit siglip_p03
 #    # see the plan without running anything
 #    DRY=1 bash run_sweep_eupe_siglip_s3.sh s3://my-bucket/imagenet-256/
 #
@@ -63,6 +70,11 @@
 #    CONDA=<env>                        use <env>/bin/{python,torchrun} (else: PATH)
 #    PY= TR=                            explicit python / torchrun binaries
 #    NGPU / CUDA_VISIBLE_DEVICES        default: all visible GPUs (recipe assumes 8)
+#    SHARD=0 NUM_SHARDS=1               deal the 16-job queue across N independent nodes
+#    NNODES=1 NODE_RANK=$RANK           or put ONE job on N nodes (torchrun rendezvous)
+#    MASTER_ADDR=127.0.0.1 MASTER_PORT=29500
+#    DEC_GLOBAL_BATCH=256               8x32, the reference the decoder is kept at when
+#                                       NNODES>1 (auto BATCH_SIZE_OVERRIDE)
 #    S3_EVAL=s3://.../data_eval/         optional: val npz for the stage-1 val PSNR
 #    VAL_NPZ=0                           1 = pull that npz (9.8G) from RAEv2-data instead
 #    S3_ENC=s3://.../encoders/           optional: encoder weights (else RAEv2-models)
@@ -92,6 +104,14 @@
 #      stage1_ckpt_path is set to null and only the sample images are meaningless.
 #    * The recipe is 8x80GB (dec 32 img/GPU, DiT global batch 2048 / accum 1). On fewer
 #      GPUs pass GRAD_ACCUM_OVERRIDE=<n> (DiT) / BATCH_SIZE_OVERRIDE=<n> (dec).
+#    * 4 nodes: prefer SHARD/NUM_SHARDS (4 independent 8-GPU jobs per node -- no cross-node
+#      traffic and the recipe is bit-identical to the DINOv3 runs) over NNODES=4. With
+#      NUM_SHARDS=4 the deal is: node0 = both p0.3 (dec+dit), node1 = p0, node2 = p0.6,
+#      node3 = p0.9 -- i.e. 2 decoders then 2 DiTs each. NNODES=4 is for finishing ONE
+#      run 4x sooner: the DiT keeps its 2048 global batch (64/GPU), and the decoder gets
+#      BATCH_SIZE_OVERRIDE=8 so its global batch stays 256. With NNODES>1 every rank
+#      stages its own DATA (right for node-local SSD); on a shared FS run the `data`
+#      stage once first, then launch with the data already in place.
 #    * If the DiT dies in the first minute with
 #        torch._dynamo.exc.FailOnRecompileLimitHit ... gram_newton_schulz/muon
 #      the gmuon build on that box compiles its Newton-Schulz with fullgraph=True over
@@ -156,6 +176,34 @@ EOF
 )}
 export NGPU=${NGPU:-$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F, '{print NF}')}
 
+# ---- multi-node -------------------------------------------------------------
+# Two ways to use N nodes, pick one:
+#  (a) SHARD/NUM_SHARDS  -- N independent single-node jobs, each 8 GPUs. The 16-job
+#      queue is dealt round-robin, so with NUM_SHARDS=4 every node gets 2 dec + 2 dit
+#      and node 0 owns both p0.3 decoders. Recipe untouched -> comparable to DINOv3.
+#  (b) NNODES/NODE_RANK  -- ONE job across all nodes (torchrun rendezvous). The DiT
+#      recipe is node-count agnostic (training.global_batch_size=2048 is absolute, it
+#      just splits: 256/GPU on 8 GPUs -> 64/GPU on 32). The DECODER's batch_size is
+#      PER-GPU (32), so on >8 GPUs BATCH_SIZE_OVERRIDE is auto-set to keep the same
+#      256 global batch as the 8-GPU reference; export it yourself to opt out.
+export NNODES=${NNODES:-1}
+export NODE_RANK=${NODE_RANK:-${RANK:-0}}
+export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+export MASTER_PORT=${MASTER_PORT:-29500}
+export SHARD=${SHARD:-0}
+export NUM_SHARDS=${NUM_SHARDS:-1}
+export DEC_GLOBAL_BATCH=${DEC_GLOBAL_BATCH:-256}     # 8 GPUs x 32 img, the reference
+if [[ "${NNODES}" -gt 1 ]]; then
+  TR_ARGS="--nnodes=${NNODES} --node_rank=${NODE_RANK} --nproc_per_node=${NGPU} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT}"
+  _world=$((NNODES * NGPU))
+  if [[ -z "${BATCH_SIZE_OVERRIDE:-}" && $((DEC_GLOBAL_BATCH % _world)) -eq 0 && $((DEC_GLOBAL_BATCH / _world)) -ge 1 ]]; then
+    export BATCH_SIZE_OVERRIDE=$((DEC_GLOBAL_BATCH / _world))
+  fi
+else
+  TR_ARGS=""
+fi
+export TR_ARGS
+
 # SMOKE: shrink every knob the trainers expose so one job is a few minutes of real
 # forward/backward instead of a 16/40-epoch run. Nothing here is a training recipe.
 if [[ "${SMOKE}" == "1" ]]; then
@@ -190,6 +238,8 @@ mkdir -p "${LOGDIR}" "${GEN_DIR}"
 
 log () { echo "##### $(date '+%F %T')  $*"; }
 freeport () { ${PY} -c 'import socket;s=socket.socket();s.bind(("",0));print(s.getsockname()[1]);s.close()'; }
+# single node: any free port. multi node: every rank must agree -> fixed MASTER_PORT.
+tr_args () { if [[ -n "${TR_ARGS}" ]]; then echo "${TR_ARGS}"; else echo "--nproc_per_node=${NGPU} --master-port=$(freeport)"; fi; }
 
 # ---- 0. asset locations + fetch helpers -------------------------------------
 export ASSET_DIR=${ASSET_DIR:-${REPO}/pretrained_models}
@@ -383,10 +433,9 @@ run_dec () {
   gen_cfg "configs/stage1/decoder/random-drop-layer-mls-plain-${enc}-nano-${pcode}-oldnorm.yaml" "${cfg}" || return 1
   mkdir -p "${out}"
   log "START dec ${tag}  p_drop=${pval}  ngpu=${NGPU}  -> ${out}"
-  [[ "${DRY}" == "1" ]] && { echo "  DRY: ${TR} --nproc_per_node=${NGPU} src/train_decoder.py --config ${cfg}"; return 0; }
+  [[ "${DRY}" == "1" ]] && { echo "  DRY: ${TR} $(tr_args) src/train_decoder.py --config ${cfg}"; return 0; }
   [[ -f "${out}/ckpt_latest.pt" ]] && log "resuming from ${out}/ckpt_latest.pt"
-  ${RUNNER} ${TR} --nproc_per_node="${NGPU}" --master-port="$(freeport)" \
-      src/train_decoder.py --config "${cfg}"
+  ${RUNNER} ${TR} $(tr_args) src/train_decoder.py --config "${cfg}"
 }
 
 run_dit () {
@@ -415,9 +464,9 @@ run_dit () {
     else
       log "latent stats (${NUM_STATS_SAMPLES} imgs) -> ${stats}"
       if [[ "${DRY}" == "1" ]]; then
-        echo "  DRY: ${TR} --nproc_per_node=${NGPU} scripts/stage1/compute_latent_stats.py --config ${cfg} ..."
+        echo "  DRY: ${TR} $(tr_args) scripts/stage1/compute_latent_stats.py --config ${cfg} ..."
       else
-        ${RUNNER} ${TR} --nproc_per_node="${NGPU}" --master-port="$(freeport)" \
+        ${RUNNER} ${TR} $(tr_args) \
           scripts/stage1/compute_latent_stats.py --config "${cfg}" --data-dir "${DATA}" \
           --output-path "${stats}" --num-samples "${NUM_STATS_SAMPLES}" \
           || { echo "### latent stats failed for ${tag}"; return 1; }
@@ -428,8 +477,8 @@ run_dit () {
   fi
 
   log "START dit ${tag}  p_drop=${pval}  ngpu=${NGPU}  -> ${CKPT_ROOT}/${exp}"
-  [[ "${DRY}" == "1" ]] && { echo "  DRY: EXPERIMENT_NAME=${exp} ${TR} --nproc_per_node=${NGPU} src/train.py --config ${cfg} --results-dir ${CKPT_ROOT} --precision bf16 ${WANDB_FLAG} ${DIT_OPTS}"; return 0; }
-  EXPERIMENT_NAME=${exp} ${RUNNER} ${TR} --nproc_per_node="${NGPU}" --master-port="$(freeport)" \
+  [[ "${DRY}" == "1" ]] && { echo "  DRY: EXPERIMENT_NAME=${exp} ${TR} $(tr_args) src/train.py --config ${cfg} --results-dir ${CKPT_ROOT} --precision bf16 ${WANDB_FLAG} ${DIT_OPTS}"; return 0; }
+  EXPERIMENT_NAME=${exp} ${RUNNER} ${TR} $(tr_args) \
       src/train.py --config "${cfg}" --results-dir "${CKPT_ROOT}" \
       --precision bf16 ${WANDB_FLAG} ${DIT_OPTS}
 }
@@ -437,16 +486,20 @@ run_dit () {
 # ---- 5. queue ---------------------------------------------------------------
 main () {
   log "sweep ${STAGE}  tags=[${TAGS[*]}]  ngpu=${NGPU}  data=${DATA}  ckpt=${CKPT_ROOT}"
-  [[ "${NGPU}" != "8" ]] && log "WARNING: recipe is tuned for 8x80GB; on ${NGPU} GPUs consider GRAD_ACCUM_OVERRIDE / BATCH_SIZE_OVERRIDE"
+  [[ "${NUM_SHARDS}" -gt 1 ]] && log "shard ${SHARD}/${NUM_SHARDS} (this node runs its slice of the queue)"
+  [[ "${NNODES}" -gt 1 ]] && log "multi-node: ${NNODES} nodes x ${NGPU} gpu, node_rank=${NODE_RANK}, master=${MASTER_ADDR}:${MASTER_PORT}${BATCH_SIZE_OVERRIDE:+, dec batch/GPU=${BATCH_SIZE_OVERRIDE} (global ${DEC_GLOBAL_BATCH})}"
+  [[ "${NGPU}" != "8" && "${NNODES}" == "1" ]] && log "WARNING: recipe is tuned for 8x80GB; on ${NGPU} GPUs consider GRAD_ACCUM_OVERRIDE / BATCH_SIZE_OVERRIDE"
   stage_data
   [[ "${STAGE}" == "data" ]] && { log "data stage done"; return 0; }
   prep_encoders
   [[ "${STAGE}" == "all" || "${STAGE}" == "dec" ]] && prep_assets
   [[ "${STAGE}" == "all" || "${STAGE}" == "dit" ]] && prep_gmuon
 
-  local jobs=() tag st rc t0 note
-  for tag in "${TAGS[@]}"; do [[ "${STAGE}" == "all" || "${STAGE}" == "dec" ]] && jobs+=("dec:${tag}"); done
-  for tag in "${TAGS[@]}"; do [[ "${STAGE}" == "all" || "${STAGE}" == "dit" ]] && jobs+=("dit:${tag}"); done
+  local jobs=() all=() tag st rc t0 note i
+  for tag in "${TAGS[@]}"; do [[ "${STAGE}" == "all" || "${STAGE}" == "dec" ]] && all+=("dec:${tag}"); done
+  for tag in "${TAGS[@]}"; do [[ "${STAGE}" == "all" || "${STAGE}" == "dit" ]] && all+=("dit:${tag}"); done
+  # round-robin deal: node k takes jobs k, k+NUM_SHARDS, ... (NUM_SHARDS=1 -> all of them)
+  for i in "${!all[@]}"; do [[ $((i % NUM_SHARDS)) -eq "${SHARD}" ]] && jobs+=("${all[$i]}"); done
 
   local summary=()
   for job in "${jobs[@]}"; do
@@ -474,7 +527,7 @@ if [[ "${FG:-0}" == "1" || "${DRY}" == "1" ]]; then
   main 2>&1 | tee "${LOG}"
 else
   # setsid: survive SIGHUP when the launching ssh/VSCode session ends
-  setsid nohup bash -c "$(declare -f main stage_data prep_encoders prep_assets prep_gmuon hf_download s3_enc_sync gen_cfg run_dec run_dit log freeport tag_enc tag_pcode tag_pval)
+  setsid nohup bash -c "$(declare -f main stage_data prep_encoders prep_assets prep_gmuon hf_download s3_enc_sync gen_cfg run_dec run_dit log freeport tr_args tag_enc tag_pcode tag_pval)
                         STAGE=${STAGE}; S3_DATA='${S3_DATA}'; TAGS=(${TAGS[*]}); main" \
       < /dev/null > "${LOG}" 2>&1 &
   disown
