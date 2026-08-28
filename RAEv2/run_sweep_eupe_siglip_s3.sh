@@ -75,6 +75,9 @@
 #    MASTER_ADDR=127.0.0.1 MASTER_PORT=29500
 #    DEC_GLOBAL_BATCH=256               8x32, the reference the decoder is kept at when
 #                                       NNODES>1 (auto BATCH_SIZE_OVERRIDE)
+#    DEC_GRAD_ACCUM=<n>                 decoder grad accumulation -- on a node with fewer
+#                                       than 8 GPUs, n = 8/NGPU restores that 256 global
+#                                       batch at unchanged per-GPU memory
 #    S3_EVAL=s3://.../data_eval/         optional: val npz for the stage-1 val PSNR
 #    VAL_NPZ=0                           1 = pull that npz (9.8G) from RAEv2-data instead
 #    S3_ENC=s3://.../encoders/           optional: encoder weights (else RAEv2-models)
@@ -431,6 +434,12 @@ run_dec () {
   cfg=${GEN_DIR}/dec-${enc}-${pcode}-oldnorm.yaml
   out=${CKPT_ROOT}/omni-randomdrop-plain-${enc}-nano-p${pval}-oldnorm
   gen_cfg "configs/stage1/decoder/random-drop-layer-mls-plain-${enc}-nano-${pcode}-oldnorm.yaml" "${cfg}" || return 1
+  # fewer GPUs than the 8x32 reference: accumulate to keep the 256-image global batch
+  # (same per-GPU memory as the reference, unlike raising batch_size).
+  if [[ -n "${DEC_GRAD_ACCUM:-}" ]] && ! grep -q "grad_accum_steps:" "${cfg}"; then
+    sed -i "s|^\([[:space:]]*\)batch_size:\(.*\)|\1batch_size:\2\n\1grad_accum_steps: ${DEC_GRAD_ACCUM}|" "${cfg}"
+    log "dec grad_accum_steps=${DEC_GRAD_ACCUM} (global batch = 32 x ${NGPU} x ${DEC_GRAD_ACCUM})"
+  fi
   mkdir -p "${out}"
   log "START dec ${tag}  p_drop=${pval}  ngpu=${NGPU}  -> ${out}"
   [[ "${DRY}" == "1" ]] && { echo "  DRY: ${TR} $(tr_args) src/train_decoder.py --config ${cfg}"; return 0; }
